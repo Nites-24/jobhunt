@@ -664,7 +664,7 @@ def _handle_draft(bot_token: str, chat_id: str, index: int = 1) -> None:
         _send_telegram(bot_token, chat_id, f"Could not generate draft preview: {str(e)}")
 
 
-def _handle_send(bot_token: str, chat_id: str, index: int = 1) -> None:
+def _handle_send(bot_token: str, chat_id: str, index: int = 1, confirmed: bool = False) -> None:
     """Send outreach for a reviewable job after explicit Telegram command."""
     jobs = _get_pending_jobs(limit=20)
     if not jobs:
@@ -701,12 +701,25 @@ def _handle_send(bot_token: str, chat_id: str, index: int = 1) -> None:
             f"For now, use draft {index} then send manually.",
         )
         return
+    if not confirmed:
+        _send_telegram(
+            bot_token,
+            chat_id,
+            f"Send confirmation required.\n\n"
+            f"Role: {job.get('title', 'Unknown')}\n"
+            f"Company: {job.get('company', 'Unknown')}\n"
+            f"To: {recruiter}\n"
+            f"Source link: {source_url}\n\n"
+            f"Type exactly: confirm send {index}\n\n"
+            "No email was sent.",
+        )
+        return
 
     try:
         response = lambda_client.invoke(
             FunctionName=SENDER_LAMBDA,
             InvocationType="RequestResponse",
-            Payload=_safe_json_dumps({"send_email": True, "job": job}),
+            Payload=_safe_json_dumps({"send_email": True, "send_confirmed": True, "job": job}),
         )
         payload = _read_lambda_payload(response)
         status = payload.get("status", "")
@@ -837,7 +850,7 @@ def _handle_help(bot_token: str, chat_id: str) -> None:
         else
         "  apply 1 - Show contact/source and move to manual follow-up. No auto-send\n"
     )
-    send_line = "  send 1 - Send email for a sourced match with recruiter email\n" if ALLOW_TELEGRAM_EMAIL_SEND else ""
+    send_line = "  send 1 - Stage email send confirmation for a sourced match\n" if ALLOW_TELEGRAM_EMAIL_SEND else ""
     msg = (
         "JobAlert commands\n"
         "-----------------\n\n"
@@ -861,6 +874,7 @@ REJECT_PATTERN = re.compile(r"^reject\s*(\d+)?$", re.IGNORECASE)
 EXPLAIN_PATTERN = re.compile(r"^explain\s*(\d+)?$", re.IGNORECASE)
 DRAFT_PATTERN = re.compile(r"^draft\s*(\d+)?$", re.IGNORECASE)
 SEND_PATTERN = re.compile(r"^send\s*(\d+)?$", re.IGNORECASE)
+CONFIRM_SEND_PATTERN = re.compile(r"^confirm\s+send\s+(\d+)$", re.IGNORECASE)
 
 
 def _route_command(command: str, bot_token: str, chat_id: str) -> None:
@@ -925,10 +939,15 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
         _send_telegram(bot_token, chat_id, "Use a match number, for example: draft 1")
         return
 
+    match = CONFIRM_SEND_PATTERN.match(cmd)
+    if match:
+        _handle_send(bot_token, chat_id, int(match.group(1)), confirmed=True)
+        return
+
     match = SEND_PATTERN.match(cmd)
     if match:
         index = int(match.group(1)) if match.group(1) else 1
-        _handle_send(bot_token, chat_id, index)
+        _handle_send(bot_token, chat_id, index, confirmed=False)
         return
     if cmd.startswith("send"):
         _send_telegram(bot_token, chat_id, "Use a match number, for example: send 1")

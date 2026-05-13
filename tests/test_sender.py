@@ -79,10 +79,12 @@ class TestSender:
         if body is None:
             body = (
                 "Hi Sarah,\n\n"
-                "Anthropic is building the safety layer for frontier AI models. "
-                "At Empower, I achieved a 33% GPU cost reduction and resolved "
-                "87% of support tickets autonomously using agentic RAG.\n\n"
-                "You can see my production systems live at RetireIQ and Rivulet.\n\n"
+                "Anthropic's role points at reliable RAG evaluation and agent workflows. "
+                "My recent agent work is close to that: retrieve evidence, score results, "
+                "and keep a human approval step before action.\n\n"
+                "RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ) handles "
+                "multi-step financial reasoning, and Rivulet (https://rivulet.info) "
+                "handles tool orchestration with human oversight.\n\n"
                 "I am fully open to all locations and am ready to relocate or be onsite.\n\n"
                 "Would 20 minutes this week work to connect?\n\n"
                 "Best,\nTeja Gopal Reddy Vaka\nSenior AI Engineer"
@@ -229,9 +231,38 @@ class TestSender:
         import job_sender.lambda_function as mod
         mod, _ = self._setup_infra()
 
-        job = {**SAMPLE_JOB, "recruiter_name": ""}
+        job = {**SAMPLE_JOB, "recruiter_name": "", "recruiter_email": ""}
         msg = mod._build_user_message(job)
         assert "Hi Anthropic Team," in msg
+
+    def test_greeting_uses_recipient_email_name(self):
+        """When recruiter_name is missing, infer a safe first name from the email."""
+        import job_sender.lambda_function as mod
+        mod, _ = self._setup_infra()
+
+        job = {
+            **SAMPLE_JOB,
+            "company": "Engineering Square",
+            "recruiter_name": "",
+            "recruiter_email": "saikumar@engineeringsquare.us",
+        }
+        msg = mod._build_user_message(job)
+        assert "GREETING TO USE: Hi Sai," in msg
+        assert "Hi Engineering Square Team," not in msg
+
+    def test_greeting_ignores_generic_recipient_email(self):
+        """Generic inboxes should still fall back to company team."""
+        import job_sender.lambda_function as mod
+        mod, _ = self._setup_infra()
+
+        job = {
+            **SAMPLE_JOB,
+            "company": "Engineering Square",
+            "recruiter_name": "",
+            "recruiter_email": "careers@engineeringsquare.us",
+        }
+        msg = mod._build_user_message(job)
+        assert "GREETING TO USE: Hi Engineering Square Team," in msg
 
     def test_greeting_generic_fallback(self):
         """Greeting should use 'Hi there' when no name or company."""
@@ -251,6 +282,51 @@ class TestSender:
         msg = mod._build_user_message(job)
         # Should fall back to company, not use "Hi Hiring,"
         assert "Hi Anthropic Team," in msg
+
+    @patch("job_sender.lambda_function.bedrock_client")
+    def test_generated_body_greeting_is_enforced_from_email(self, mock_bedrock):
+        """Even if the model returns a team greeting, code enforces the recipient name."""
+        import job_sender.lambda_function as mod
+        mod, _ = self._setup_infra()
+        mock_bedrock.converse.return_value = self._mock_bedrock_email_response(
+            subject="AI Engineer role",
+            body="Hi Engineering Square Team,\n\nI saw the role.\n\nBest,\nTeja",
+        )
+        job = {
+            **SAMPLE_JOB,
+            "company": "Engineering Square",
+            "recruiter_name": "",
+            "recruiter_email": "saikumar@engineeringsquare.us",
+        }
+
+        email = mod._generate_email(job)
+
+        assert email["body"].startswith("Hi Sai,")
+        assert "Hi Engineering Square Team," not in email["body"]
+
+    @patch("job_sender.lambda_function.bedrock_client")
+    def test_generated_body_rejects_robotic_or_unsupported_claims(self, mock_bedrock):
+        """Robotic cover-letter language should fail before SMTP can send it."""
+        import job_sender.lambda_function as mod
+        mod, _ = self._setup_infra()
+        mock_bedrock.converse.return_value = self._mock_bedrock_email_response(
+            subject="AI Engineer for Production RAG Systems",
+            body=(
+                "Hi Engineering Square Team,\n\n"
+                "I've been building production AI systems at Empower for the past few years, "
+                "and your focus on shipping fast with ownership resonates with how I work.\n\n"
+                "Best,\nTeja"
+            ),
+        )
+        job = {
+            **SAMPLE_JOB,
+            "company": "Engineering Square",
+            "recruiter_name": "",
+            "recruiter_email": "saikumar@engineeringsquare.us",
+        }
+
+        with pytest.raises(ValueError, match="quality gate"):
+            mod._generate_email(job)
 
     def test_decimal_deserialization(self):
         """DynamoDB Decimal values in job payload should not crash."""

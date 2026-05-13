@@ -392,8 +392,28 @@ class TestRouter:
 
     @patch("job_router.lambda_function._send_telegram")
     @patch("job_router.lambda_function.lambda_client")
-    def test_send_enabled_invokes_sender(self, mock_lambda, mock_tg):
-        """'send N' should invoke sender with an explicit send payload when enabled."""
+    def test_send_enabled_requires_confirmation(self, mock_lambda, mock_tg):
+        """'send N' should show a confirmation step before invoking sender."""
+        mod, table = self._setup_infra()
+        mod.ALLOW_TELEGRAM_EMAIL_SEND = True
+        mock_tg.return_value = True
+        self._insert_pending_jobs(table, 1, with_email=True)
+
+        event = _make_telegram_event("send 1")
+        mod.lambda_handler(event, MockContext())
+
+        mock_lambda.invoke.assert_not_called()
+        item = table.get_item(Key={"job_id": "pending-001"})["Item"]
+        assert item["status"] == "PENDING_APPROVAL"
+        msg = mock_tg.call_args[0][2]
+        assert "Send confirmation required" in msg
+        assert "Type exactly: confirm send 1" in msg
+        assert "No email was sent" in msg
+
+    @patch("job_router.lambda_function._send_telegram")
+    @patch("job_router.lambda_function.lambda_client")
+    def test_confirm_send_invokes_sender(self, mock_lambda, mock_tg):
+        """'confirm send N' should invoke sender with an explicit confirmed payload."""
         mod, table = self._setup_infra()
         mod.ALLOW_TELEGRAM_EMAIL_SEND = True
         mock_tg.return_value = True
@@ -402,12 +422,13 @@ class TestRouter:
             "Payload": io.BytesIO(json.dumps({"status": "sent", "sent": 1}).encode("utf-8"))
         }
 
-        event = _make_telegram_event("send 1")
+        event = _make_telegram_event("confirm send 1")
         mod.lambda_handler(event, MockContext())
 
         mock_lambda.invoke.assert_called_once()
         payload = json.loads(mock_lambda.invoke.call_args.kwargs["Payload"])
         assert payload["send_email"] is True
+        assert payload["send_confirmed"] is True
         assert payload["job"]["job_id"] == "pending-001"
         msg = mock_tg.call_args[0][2]
         assert "Email sent" in msg

@@ -74,20 +74,20 @@ CANDIDATE_GRAPH_CONTEXT = render_candidate_graph(
 SYSTEM_PROMPT = (
     "You are Teja Gopal Reddy Vaka, a Senior AI Engineer. You're writing a short, warm "
     "cold email to a hiring manager or recruiter. This person skims 50 emails a day. "
-    "Your goal is to sound like a real human who spent 5 minutes writing this, not an AI.\n\n"
+    "Your goal is to sound like a real human who read the role and wrote a useful note, not an AI.\n\n"
 
     "GREETING:\n"
     "The very first line of your email MUST be EXACTLY the text provided in the GREETING TO USE field. "
     "Do not add anything before it. Never change it.\n\n"
 
     "TONE & STYLE:\n"
-    "Write like you're texting a colleague you respect, not writing a cover letter. "
-    "Short sentences. Casual but smart. No corporate buzzwords. No filler. "
-    "Vary your sentence length. Start some sentences with 'I' and others differently. "
-    "A recruiter should read this and think 'this person actually looked at our company.'\n\n"
+    "Write like a direct note to a colleague you respect, not a cover letter. "
+    "Short sentences. Plain English. No hype. No fake warmth. No corporate buzzwords. "
+    "The line after the greeting should immediately mention the role, company, or specific work they need. "
+    "A recruiter should read this and think this person actually looked at the job.\n\n"
 
     "BODY (2 short paragraphs + ask):\n"
-    "Paragraph 1: Start with a short, warm pleasantry. Then read the provided job description carefully. Identify the single biggest core challenge, specific product, or main technology stack they are hiring for (e.g., LLM evaluation, agentic workflows, data pipelines, etc.). Write ONE highly specific sentence mapping their exact need to Teja's demonstrated AI-agent project work. Do not say 'I saw your posting' or use generic filler. Do not claim employers, dates, customer outcomes, or metrics unless they are explicitly present in the job payload.\n\n"
+    "Paragraph 1: Read the provided job description carefully. Identify the single biggest core challenge, specific product, or main technology stack they are hiring for, for example LLM evaluation, agentic workflows, or data pipelines. Write one specific sentence mapping that need to Teja's AI-agent project work. Do not say 'I saw your posting', 'hope you're well', or use generic filler. Do not claim employers, dates, customer outcomes, or metrics unless they are explicitly present in the job payload.\n\n"
 
     "Paragraph 2: Mention your two live projects naturally, explicitly connecting them to the challenge you identified in Paragraph 1. "
     "You MUST include the raw URLs in parentheses exactly as provided: "
@@ -106,7 +106,9 @@ SYSTEM_PROMPT = (
     "- Under 130 words total\n"
     "- No exclamation points, no em dashes, no ellipsis\n"
     "- No words: leverage, passionate, cutting-edge, synergy, seamlessly, excited, thrilled, "
-    "innovative, delighted, keen\n"
+    "innovative, delighted, keen, resonate, resonated\n"
+    "- Do not write cover-letter phrases like 'for the past few years', 'from the ground up', "
+    "'exactly what I have been doing', or 'shipping fast with ownership'.\n"
     "- No bullet points or markdown\n"
     "- Do not invent numbers, employer names, customer claims, or production metrics.\n"
     "- Commas and periods only\n"
@@ -145,6 +147,22 @@ EMAIL_TOOL_CONFIG = {
 }
 
 INVALID_FIRST_NAMES = {"hiring", "manager", "recruiter", "team", "hr", "talent", "hello", "dear", ""}
+GENERIC_EMAIL_NAMES = {
+    "admin", "apply", "careers", "contact", "hello", "hi", "hiring", "hr", "info", "jobs",
+    "no-reply", "noreply", "recruiting", "support", "talent", "team",
+}
+ROBOTIC_OR_UNSUPPORTED_PHRASES = {
+    "at empower",
+    "exactly what i've been doing",
+    "exactly what i have been doing",
+    "for the past few years",
+    "from ground up",
+    "from the ground up",
+    "i care about both",
+    "resonate",
+    "resonates",
+    "shipping fast with ownership",
+}
 
 # ---------------------------------------------------------------------------
 # 5. WARM-START CACHES
@@ -185,24 +203,76 @@ def _get_credentials() -> dict:
 # ---------------------------------------------------------------------------
 # 6. EMAIL GENERATION
 # ---------------------------------------------------------------------------
-def _build_user_message(job: dict) -> str:
-    """Construct the user message for Bedrock with greeting logic."""
+def _format_first_name(value: str) -> str:
+    value = re.sub(r"[^A-Za-z]", "", value or "").strip()
+    if not value:
+        return ""
+    return value[:1].upper() + value[1:].lower()
+
+
+def _first_name_from_email(email: str) -> str:
+    local = str(email or "").split("@", 1)[0].split("+", 1)[0].strip().lower()
+    if not local or local in GENERIC_EMAIL_NAMES:
+        return ""
+
+    tokens = [token for token in re.split(r"[._\-\d]+", local) if token]
+    token = tokens[0] if tokens else local
+    if token in GENERIC_EMAIL_NAMES or len(token) < 2:
+        return ""
+    if token.startswith("sai") and len(token) > 3:
+        return "Sai"
+    return _format_first_name(token)
+
+
+def _resolve_greeting(job: dict) -> str:
     full_name = str(job.get("recruiter_name", "")).strip()
-    first_name = full_name.split()[0] if full_name else ""
+    first_name = _format_first_name(full_name.split()[0] if full_name else "")
     if first_name.lower() in INVALID_FIRST_NAMES:
         first_name = ""
 
+    if not first_name:
+        first_name = _first_name_from_email(str(job.get("recruiter_email", "")).strip())
+
+    company = str(job.get("company", "")).strip()
+
+    if first_name:
+        return f"Hi {first_name},"
+    if company:
+        return f"Hi {company} Team,"
+    return "Hi there,"
+
+
+def _enforce_greeting(body: str, greeting: str) -> str:
+    lines = (body or "").strip().splitlines()
+    if not lines:
+        return greeting
+    if lines[0].strip() == greeting:
+        return "\n".join(lines).strip()
+    if re.match(r"^\s*hi\b.*,\s*$", lines[0], re.IGNORECASE):
+        lines[0] = greeting
+        return "\n".join(lines).strip()
+    return f"{greeting}\n\n" + "\n".join(lines).strip()
+
+
+def _validate_email_quality(subject: str, body: str) -> None:
+    text = f"{subject}\n{body}".lower()
+    for phrase in ROBOTIC_OR_UNSUPPORTED_PHRASES:
+        if phrase in text:
+            raise ValueError(f"Generated email failed quality gate: blocked phrase '{phrase}'")
+    if not re.match(r"^\s*hi\b.+,\s*", body, re.IGNORECASE):
+        raise ValueError("Generated email failed quality gate: missing greeting")
+    word_count = len(re.findall(r"\b[\w']+\b", body))
+    if word_count > 160:
+        raise ValueError(f"Generated email failed quality gate: too long ({word_count} words)")
+
+
+def _build_user_message(job: dict) -> str:
+    """Construct the user message for Bedrock with greeting logic."""
+    greeting = _resolve_greeting(job)
     company = str(job.get("company", "")).strip()
     title = job.get("title", "the role")
     description = job.get("description", "Not provided")
     keywords = job.get("keywords", [])
-
-    if first_name:
-        greeting = f"Hi {first_name},"
-    elif company:
-        greeting = f"Hi {company} Team,"
-    else:
-        greeting = "Hi there,"
 
     logger.info("GREETING: %s | company: %s", greeting, company)
 
@@ -267,12 +337,13 @@ def _generate_email(job: dict) -> dict:
             if "toolUse" in block:
                 result = block["toolUse"]["input"]
                 subject = str(result.get("subject", "")).strip()
-                body = _sanitize_body(str(result.get("body", "")))
+                body = _enforce_greeting(_sanitize_body(str(result.get("body", ""))), _resolve_greeting(job))
 
                 if not subject:
                     raise ValueError("Model returned empty subject")
                 if not body:
                     raise ValueError("Model returned empty body")
+                _validate_email_quality(subject, body)
 
                 return {"subject": subject, "body": body}
 
