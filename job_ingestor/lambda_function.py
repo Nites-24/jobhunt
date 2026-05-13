@@ -76,6 +76,11 @@ NON_ROLE_SEGMENTS = re.compile(
 
 _cached_jsearch_key = None
 _cached_secret_payloads: dict[str, dict] = {}
+SOURCE_ERRORS: list[dict[str, str]] = []
+
+
+def _record_source_error(source: str, detail: str) -> None:
+    SOURCE_ERRORS.append({"source": source, "detail": detail[:300]})
 
 def _get_secret_payload(secret_name: str) -> dict:
     if not secret_name:
@@ -90,6 +95,7 @@ def _get_secret_payload(secret_name: str) -> dict:
         payload = {str(key).strip(): value for key, value in payload.items()}
     except Exception as e:
         logger.warning("SECRET_READ_SKIP | secret=%s | error=%s", secret_name, str(e))
+        _record_source_error(f"secret:{secret_name}", str(e))
         payload = {}
     _cached_secret_payloads[secret_name] = payload
     return payload
@@ -380,10 +386,13 @@ def fetch_jsearch_jobs() -> list:
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 logger.warning("JSEARCH_RATE_LIMITED | query=%s", query)
+                _record_source_error("jsearch", f"HTTP 429 rate limited for query={query}")
                 break
             logger.warning("JSEARCH_QUERY_ERROR | query=%s | error=%s", query, str(e))
+            _record_source_error("jsearch", f"HTTP {e.code} for query={query}")
         except Exception as e:
             logger.warning("JSEARCH_QUERY_ERROR | query=%s | error=%s", query, str(e))
+            _record_source_error("jsearch", f"{type(e).__name__}: {e}")
 
     return jobs
 
@@ -459,9 +468,12 @@ def fetch_google_cse_jobs() -> list:
                     jobs.append(job)
             logger.info("GOOGLE_CSE_QUERY | raw=%d | accepted_so_far=%d", len(raw_items), len(jobs))
         except urllib.error.HTTPError as e:
-            logger.warning("GOOGLE_CSE_QUERY_ERROR | status=%s | error=%s", e.code, str(e))
+            body = e.read().decode("utf-8", errors="ignore")[:200]
+            logger.warning("GOOGLE_CSE_QUERY_ERROR | status=%s | error=%s | body=%s", e.code, str(e), body)
+            _record_source_error("google_cse", f"HTTP {e.code}: {body}")
         except Exception as e:
             logger.warning("GOOGLE_CSE_QUERY_ERROR | error=%s", str(e))
+            _record_source_error("google_cse", f"{type(e).__name__}: {e}")
     return jobs
 
 
@@ -545,8 +557,10 @@ def fetch_adzuna_jobs() -> list:
             )
         except urllib.error.HTTPError as e:
             logger.warning("ADZUNA_QUERY_ERROR | query=%s | status=%s | error=%s", query, e.code, str(e))
+            _record_source_error("adzuna", f"HTTP {e.code} for query={query}")
         except Exception as e:
             logger.warning("ADZUNA_QUERY_ERROR | query=%s | error=%s", query, str(e))
+            _record_source_error("adzuna", f"{type(e).__name__}: {e}")
     return jobs
 
 
@@ -583,6 +597,8 @@ def _send_to_sqs(jobs: list) -> int:
     return sent
 
 def lambda_handler(event, context):
+    global SOURCE_ERRORS
+    SOURCE_ERRORS = []
     logger.info("INGESTOR_START | Using HN + Google CSE + Adzuna + JSearch")
     hn_jobs = fetch_hacker_news_jobs()
     google_cse_jobs = fetch_google_cse_jobs()
@@ -602,6 +618,7 @@ def lambda_handler(event, context):
         "status": "success",
         "jobs_fetched": len(all_jobs),
         "jobs_queued": sent_count,
+        "source_errors": SOURCE_ERRORS[:10],
         "sources": {
             "hackernews": len(hn_jobs),
             "google_cse": len(google_cse_jobs),

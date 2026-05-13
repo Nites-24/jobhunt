@@ -1,0 +1,107 @@
+[
+  {
+    "id": "good_local_agent_role",
+    "label": "good_match",
+    "expected_status": "PENDING_APPROVAL",
+    "expected_score_min": 85,
+    "expected_score_max": 100,
+    "mock_model_score": 92,
+    "job": {
+      "job_id": "eval-good-local-agent-role",
+      "title": "Sr Applied LLM Engineer",
+      "company": "Simple Solutions",
+      "location": "Hayes Valley, San Francisco",
+      "description": "Build production LLM applications, agentic RAG workflows, Python services, APIs, and evaluation pipelines for enterprise AI agents.",
+      "url": "https://www.adzuna.com/details/eval-good-local-agent-role",
+      "apply_url": "https://www.adzuna.com/details/eval-good-local-agent-role",
+      "source": "adzuna",
+      "is_remote": false,
+      "employment_type": "FULL_TIME",
+      "posted_at": "2026-05-13T12:00:00Z"
+    }
+  },
+  {
+    "id": "weak_frontend_role",
+    "label": "weak_match",
+    "expected_status": "REJECTED",
+    "expected_score_min": 0,
+    "expected_score_max": 50,
+    "mock_model_score": 78,
+    "job": {
+      "job_id": "eval-weak-frontend-role",
+      "title": "Frontend Developer",
+      "company": "Marketing Pages Co",
+      "location": "San Francisco, CA",
+      "description": "Build React landing pages, CMS templates, and marketing components. No AI or ML work.",
+      "url": "https://jobs.example.com/frontend",
+      "apply_url": "https://jobs.example.com/frontend",
+      "source": "google_cse",
+      "is_remote": false,
+      "employment_type": "FULL_TIME",
+      "posted_at": "2026-05-13T12:00:00Z"
+    }
+  },
+  {
+    "id": "stale_ai_role",
+    "label": "stale_job",
+    "expected_status": "REJECTED",
+    "expected_score_min": 0,
+    "expected_score_max": 55,
+    "mock_model_score": 94,
+    "job": {
+      "job_id": "eval-stale-ai-role",
+      "title": "AI Engineer",
+      "company": "Old Startup AI",
+      "location": "San Francisco, CA",
+      "description": "Build RAG systems, LLM orchestration, and Python AI services.",
+      "url": "https://jobs.example.com/stale-ai",
+      "apply_url": "https://jobs.example.com/stale-ai",
+      "source": "hackernews",
+      "is_remote": false,
+      "employment_type": "FULL_TIME",
+      "posted_at": "2026-04-01T12:00:00Z"
+    }
+  },
+  {
+    "id": "remote_nonlocal_role",
+    "label": "remote_nonlocal",
+    "expected_status": "REJECTED",
+    "expected_score_min": 0,
+    "expected_score_max": 80,
+    "mock_model_score": 93,
+    "job": {
+      "job_id": "eval-remote-nonlocal-role",
+      "title": "LLM Engineer",
+      "company": "Remote Global AI",
+      "location": "Remote, Brazil",
+      "description": "Build LLM inference APIs, RAG services, and Python AI tooling.",
+      "url": "https://jobs.example.com/remote-llm",
+      "apply_url": "https://jobs.example.com/remote-llm",
+      "source": "adzuna",
+      "is_remote": true,
+      "employment_type": "FULL_TIME",
+      "posted_at": "2026-05-13T12:00:00Z"
+    }
+  },
+  {
+    "id": "fake_no_source_role",
+    "label": "missing_source",
+    "expected_status": "REJECTED",
+    "expected_score_min": 0,
+    "expected_score_max": 40,
+    "mock_model_score": 96,
+    "job": {
+      "job_id": "eval-fake-no-source-role",
+      "title": "AI Agent Engineer",
+      "company": "Unknown AI",
+      "location": "San Francisco, CA",
+      "description": "Build agentic RAG workflows with Python, LLMs, and AWS.",
+      "url": "",
+      "apply_url": "",
+      "source": "unknown",
+      "is_remote": false,
+      "employment_type": "FULL_TIME",
+      "posted_at": "2026-05-13T12:00:00Z"
+    }
+  }
+]

@@ -231,6 +231,52 @@ class TestProcessor:
         mock_bedrock.converse.assert_not_called()
         mod.SCORE_THRESHOLD = 90
 
+    @patch("job_processor.lambda_function.bedrock")
+    def test_missing_source_link_is_rejected_before_llm(self, mock_bedrock):
+        """Jobs without a verifiable source URL should never enter the review queue."""
+        mod, table, s3, sns = self._setup_infra()
+        no_source = {
+            **SAMPLE_JOB,
+            "job_id": "no-source",
+            "url": "",
+            "apply_url": "",
+            "posted_at": "2026-05-12T12:00:00Z",
+        }
+        table.put_item(Item={"job_id": "no-source", "status": "NEW"})
+
+        result = mod.lambda_handler(make_sqs_event([no_source]), MockContext())
+
+        assert result["batchItemFailures"] == []
+        item = table.get_item(Key={"job_id": "no-source"})["Item"]
+        assert item["status"] == "REJECTED"
+        assert int(item["match_score"]) <= 40
+        assert "missing verifiable source link" in item["match_reason"]
+        mock_bedrock.converse.assert_not_called()
+
+    @patch("job_processor.lambda_function.bedrock")
+    def test_negated_ai_signal_is_rejected_before_llm(self, mock_bedrock):
+        """A job saying it has no AI work should not pass keyword matching."""
+        mod, table, s3, sns = self._setup_infra()
+        frontend_role = {
+            **SAMPLE_JOB,
+            "job_id": "frontend-no-ai",
+            "title": "Frontend Developer",
+            "description": "Build React marketing pages and CMS templates. No AI or ML work.",
+            "url": "https://jobs.example.com/frontend-no-ai",
+            "apply_url": "https://jobs.example.com/frontend-no-ai",
+            "posted_at": "2026-05-12T12:00:00Z",
+        }
+        table.put_item(Item={"job_id": "frontend-no-ai", "status": "NEW"})
+
+        result = mod.lambda_handler(make_sqs_event([frontend_role]), MockContext())
+
+        assert result["batchItemFailures"] == []
+        item = table.get_item(Key={"job_id": "frontend-no-ai"})["Item"]
+        assert item["status"] == "REJECTED"
+        assert int(item["match_score"]) <= 50
+        assert "insufficient AI/ML signal" in item["match_reason"]
+        mock_bedrock.converse.assert_not_called()
+
     def test_s3_context_building(self):
         """Context should be built from S3 files."""
         mod, table, s3, sns = self._setup_infra()

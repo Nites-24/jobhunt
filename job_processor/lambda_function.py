@@ -52,6 +52,7 @@ STALE_SCORE_CAP = int(os.environ.get("STALE_SCORE_CAP", "55"))
 MISSING_DATE_SCORE_CAP = int(os.environ.get("MISSING_DATE_SCORE_CAP", "70"))
 REMOTE_SCORE_CAP = int(os.environ.get("REMOTE_SCORE_CAP", "80"))
 LOW_AI_SIGNAL_SCORE_CAP = int(os.environ.get("LOW_AI_SIGNAL_SCORE_CAP", "50"))
+MISSING_SOURCE_SCORE_CAP = int(os.environ.get("MISSING_SOURCE_SCORE_CAP", "40"))
 
 # Context folders in S3 to assemble the full candidate profile
 CONTEXT_FOLDERS = os.environ.get("CONTEXT_FOLDERS", "config/,data/,prompts/").split(",")
@@ -63,6 +64,14 @@ AI_SIGNAL_PATTERN = re.compile(
     r"\b(ai|ml|llm|rag|nlp|machine learning|deep learning|generative ai|"
     r"transformer|pytorch|tensorflow|hugging face|vector database|agentic|"
     r"autonomous agent|model evaluation|language model)\b",
+    re.IGNORECASE,
+)
+
+NEGATED_AI_SIGNAL_PATTERN = re.compile(
+    r"\b(no|not|without)\s+(?:\w+\s+){0,3}"
+    r"(ai|ml|llm|rag|nlp|machine learning|deep learning|generative ai|"
+    r"machine-learning|language model|modeling)\b|"
+    r"\bnon[-\s](ai|ml|llm|rag|nlp|machine learning|language model)\b",
     re.IGNORECASE,
 )
 
@@ -329,7 +338,14 @@ def _has_ai_signal(job: Dict[str, Any]) -> bool:
         str(job.get(field, ""))
         for field in ("title", "description", "keywords", "employment_type")
     )
+    if NEGATED_AI_SIGNAL_PATTERN.search(text):
+        return False
     return bool(AI_SIGNAL_PATTERN.search(text))
+
+
+def _has_source_link(job: Dict[str, Any]) -> bool:
+    source_url = str(job.get("url") or job.get("apply_url") or "").strip()
+    return source_url.startswith("http://") or source_url.startswith("https://")
 
 
 def _blocking_score_cap(cap: int) -> int:
@@ -357,6 +373,9 @@ def _apply_deterministic_guardrails(job: Dict[str, Any], score: int, reason: str
 
     if not _has_ai_signal(job):
         caps.append((_blocking_score_cap(LOW_AI_SIGNAL_SCORE_CAP), "insufficient AI/ML signal"))
+
+    if not _has_source_link(job):
+        caps.append((_blocking_score_cap(MISSING_SOURCE_SCORE_CAP), "missing verifiable source link"))
 
     if not caps:
         return score, reason
@@ -395,6 +414,9 @@ def _pre_llm_rejection(job: Dict[str, Any]) -> Optional[Tuple[int, str]]:
 
     if not _has_ai_signal(job):
         rejection_caps.append((_blocking_score_cap(LOW_AI_SIGNAL_SCORE_CAP), "insufficient AI/ML signal"))
+
+    if not _has_source_link(job):
+        rejection_caps.append((_blocking_score_cap(MISSING_SOURCE_SCORE_CAP), "missing verifiable source link"))
 
     if not rejection_caps:
         return None

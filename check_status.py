@@ -1,5 +1,8 @@
-import os, json, boto3
+import os, json, sys, boto3
 from decimal import Decimal
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 with open(".env") as f:
     for l in f:
@@ -14,8 +17,12 @@ s = boto3.Session(
     region_name="us-east-1",
 )
 table = s.resource("dynamodb").Table("Jobsearch")
+items = []
 scan = table.scan()
-items = scan["Items"]
+items.extend(scan["Items"])
+while "LastEvaluatedKey" in scan:
+    scan = table.scan(ExclusiveStartKey=scan["LastEvaluatedKey"])
+    items.extend(scan["Items"])
 print(f"Total jobs: {len(items)}\n")
 
 by_status = {}
