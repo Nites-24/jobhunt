@@ -1,0 +1,240 @@
+"""
+Tests for job-processor Lambda (Unified Scorer).
+
+Tests:
+  1. High-scoring job gets PENDING_APPROVAL + SNS notification
+  2. Low-scoring job gets REJECTED
+  3. Batch processing with partial failures
+  4. S3 context caching works
+  5. Bedrock tool-call response parsing
+  6. Bedrock error handling (graceful degradation)
+"""
+
+import json
+import pytest
+import boto3
+from moto import mock_aws
+from unittest.mock import patch, MagicMock
+from conftest import SAMPLE_JOB, MockContext, make_sqs_event
+
+
+@mock_aws
+class TestProcessor:
+    """End-to-end tests for job-processor (unified scorer)."""
+
+    def _setup_infra(self):
+        """Create DynamoDB, S3, and SNS resources."""
+        import os
+        os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+        os.environ["SCORE_THRESHOLD"] = "90"
+
+        dynamo = boto3.resource("dynamodb", region_name="us-east-1")
+        table = dynamo.create_table(
+            TableName="Jobsearch",
+            KeySchema=[{"AttributeName": "job_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[{"AttributeName": "job_id", "AttributeType": "S"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        table.meta.client.get_waiter("table_exists").wait(TableName="Jobsearch")
+
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket="job-search-pipeline-memory")
+        s3.put_object(
+            Bucket="job-search-pipeline-memory",
+            Key="data/resume/Teja_Vaka.txt",
+            Body=b"Teja Vaka - Senior AI Engineer, Python, PyTorch, RAG, LLMs",
+        )
+
+        sns = boto3.client("sns", region_name="us-east-1")
+        topic = sns.create_topic(Name="jobsearch-approvals")
+
+        os.environ["SNS_TOPIC_ARN"] = topic["TopicArn"]
+
+        import importlib
+        import job_processor.lambda_function as mod
+        mod.dynamodb = dynamo
+        mod.s3 = s3
+        mod.sns = sns
+        mod.table = dynamo.Table("Jobsearch")
+        mod.SNS_TOPIC_ARN = topic["TopicArn"]
+        mod._cached_context = None  # Reset cache
+
+        # Pre-insert the job so update_item works
+        table.put_item(Item={"job_id": SAMPLE_JOB["job_id"], "status": "NEW"})
+
+        return mod, table, s3, sns
+
+    def _mock_bedrock_response(self, score, reason):
+        """Create a mock Bedrock Converse API response with tool-call."""
+        return {
+            "output": {
+                "message": {
+                    "content": [
+                        {
+                            "toolUse": {
+                                "toolUseId": "test-tool-use-id",
+                                "name": "submit_evaluation",
+                                "input": {
+                                    "match_score": score,
+                                    "match_reason": reason,
+                                },
+                            }
+                        }
+                    ]
+                }
+            },
+            "usage": {"inputTokens": 500, "outputTokens": 50},
+        }
+
+    @patch("job_processor.lambda_function.bedrock")
+    def test_high_score_pending_approval(self, mock_bedrock):
+        """Job scoring ≥90 should be set to PENDING_APPROVAL with SNS alert."""
+        mod, table, s3, sns = self._setup_infra()
+        mock_bedrock.converse.return_value = self._mock_bedrock_response(
+            95, "Strong match: Python, PyTorch, RAG experience aligns perfectly."
+        )
+
+        event = make_sqs_event([SAMPLE_JOB])
+        result = mod.lambda_handler(event, MockContext())
+
+        assert result["batchItemFailures"] == []
+
+        # Check DynamoDB
+        item = table.get_item(Key={"job_id": "test-job-001"})["Item"]
+        assert item["status"] == "PENDING_APPROVAL"
+        assert int(item["match_score"]) == 95
+        assert "Strong match" in item["match_reason"]
+
+    @patch("job_processor.lambda_function.bedrock")
+    def test_low_score_rejected(self, mock_bedrock):
+        """Job scoring <90 should be set to REJECTED."""
+        mod, table, s3, sns = self._setup_infra()
+        mock_bedrock.converse.return_value = self._mock_bedrock_response(
+            45, "Weak match: role is primarily data analysis, not AI engineering."
+        )
+
+        event = make_sqs_event([SAMPLE_JOB])
+        result = mod.lambda_handler(event, MockContext())
+
+        assert result["batchItemFailures"] == []
+
+        item = table.get_item(Key={"job_id": "test-job-001"})["Item"]
+        assert item["status"] == "REJECTED"
+        assert int(item["match_score"]) == 45
+
+    @patch("job_processor.lambda_function.bedrock")
+    def test_batch_mixed_scores(self, mock_bedrock):
+        """Batch with high and low scoring jobs should be processed independently."""
+        mod, table, s3, sns = self._setup_infra()
+
+        job_high = {**SAMPLE_JOB, "job_id": "job-high"}
+        job_low = {**SAMPLE_JOB, "job_id": "job-low", "title": "Data Analyst"}
+
+        # Pre-insert both
+        table.put_item(Item={"job_id": "job-high", "status": "NEW"})
+        table.put_item(Item={"job_id": "job-low", "status": "NEW"})
+
+        # Mock returns different scores based on call order
+        mock_bedrock.converse.side_effect = [
+            self._mock_bedrock_response(95, "Great match"),
+            self._mock_bedrock_response(30, "Poor match"),
+        ]
+
+        event = make_sqs_event([job_high, job_low])
+        result = mod.lambda_handler(event, MockContext())
+
+        assert result["batchItemFailures"] == []
+
+        assert table.get_item(Key={"job_id": "job-high"})["Item"]["status"] == "PENDING_APPROVAL"
+        assert table.get_item(Key={"job_id": "job-low"})["Item"]["status"] == "REJECTED"
+
+    @patch("job_processor.lambda_function.bedrock")
+    def test_bedrock_error_graceful_degradation(self, mock_bedrock):
+        """Non-retryable Bedrock errors should score 0 and REJECT, not crash the batch."""
+        mod, table, s3, sns = self._setup_infra()
+        mock_bedrock.converse.side_effect = Exception("Bedrock internal error")
+
+        event = make_sqs_event([SAMPLE_JOB])
+        result = mod.lambda_handler(event, MockContext())
+
+        # Should NOT be in failures — the error was handled gracefully
+        assert result["batchItemFailures"] == []
+
+        # Job should be REJECTED with score 0
+        item = table.get_item(Key={"job_id": "test-job-001"})["Item"]
+        assert item["status"] == "REJECTED"
+        assert int(item["match_score"]) == 0
+
+    @patch("job_processor.lambda_function.bedrock")
+    def test_score_clamped_to_valid_range(self, mock_bedrock):
+        """Scores outside 0-100 should be clamped."""
+        mod, table, s3, sns = self._setup_infra()
+        mock_bedrock.converse.return_value = self._mock_bedrock_response(
+            150, "Model hallucinated a score above 100"
+        )
+
+        event = make_sqs_event([SAMPLE_JOB])
+        result = mod.lambda_handler(event, MockContext())
+
+        item = table.get_item(Key={"job_id": "test-job-001"})["Item"]
+        assert int(item["match_score"]) == 100  # Clamped
+
+    @patch("job_processor.lambda_function.bedrock")
+    def test_stale_remote_job_is_guardrailed(self, mock_bedrock):
+        """A stale remote keyword match should not reach the approval queue."""
+        mod, table, s3, sns = self._setup_infra()
+        stale_remote = {
+            **SAMPLE_JOB,
+            "job_id": "stale-remote",
+            "company": "Dry Ground AI",
+            "location": "Brazil, Colombia, Philippines",
+            "source": "remotive",
+            "is_remote": True,
+            "posted_at": "2026-04-16T12:00:00Z",
+        }
+        table.put_item(Item={"job_id": "stale-remote", "status": "NEW"})
+
+        mock_bedrock.converse.return_value = self._mock_bedrock_response(
+            95, "Strong AI keyword overlap."
+        )
+
+        result = mod.lambda_handler(make_sqs_event([stale_remote]), MockContext())
+
+        assert result["batchItemFailures"] == []
+        item = table.get_item(Key={"job_id": "stale-remote"})["Item"]
+        assert item["status"] == "REJECTED"
+        assert int(item["match_score"]) <= 55
+        assert "Rejected before LLM scoring" in item["match_reason"]
+        mock_bedrock.converse.assert_not_called()
+
+    @patch("job_processor.lambda_function.bedrock")
+    def test_hard_guardrails_stay_below_lower_threshold(self, mock_bedrock):
+        """Hard rejections must not become pending when production threshold is lower."""
+        mod, table, s3, sns = self._setup_infra()
+        mod.SCORE_THRESHOLD = 72
+        remote_nonlocal = {
+            **SAMPLE_JOB,
+            "job_id": "remote-nonlocal",
+            "location": "Remote, Brazil",
+            "is_remote": True,
+            "posted_at": "2026-05-12T12:00:00Z",
+        }
+        table.put_item(Item={"job_id": "remote-nonlocal", "status": "NEW"})
+
+        result = mod.lambda_handler(make_sqs_event([remote_nonlocal]), MockContext())
+
+        assert result["batchItemFailures"] == []
+        item = table.get_item(Key={"job_id": "remote-nonlocal"})["Item"]
+        assert item["status"] == "REJECTED"
+        assert int(item["match_score"]) == 71
+        assert "remote-only or non-local role" in item["match_reason"]
+        mock_bedrock.converse.assert_not_called()
+        mod.SCORE_THRESHOLD = 90
+
+    def test_s3_context_building(self):
+        """Context should be built from S3 files."""
+        mod, table, s3, sns = self._setup_infra()
+
+        context = mod._build_context_from_s3()
+        assert "Teja Vaka" in context
+        assert "<candidate_resume>" in context
