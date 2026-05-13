@@ -278,9 +278,11 @@ class TestProcessor:
         mock_bedrock.converse.assert_not_called()
 
     def test_s3_context_building(self):
-        """Context should be built from S3 files."""
+        """Processor context should be compacted into a candidate graph."""
         mod, table, s3, sns = self._setup_infra()
 
-        context = mod._build_context_from_s3()
-        assert "Teja Vaka" in context
-        assert "<candidate_resume>" in context
+        context = mod._build_candidate_graph_context()
+        assert "<candidate_graph>" in context
+        assert "candidate:" in context
+        assert "skills:" in context
+        assert "RetireIQ" in context

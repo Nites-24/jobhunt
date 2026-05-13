@@ -9,7 +9,7 @@ This document breaks down the multi-agent architecture of the JobHunt pipeline: 
 * **Live AWS path:** Telegram -> API Gateway/Lambda router -> Lambda ingestion -> SQS -> deduplication -> SQS -> processor -> DynamoDB.
 * **Active live sources:** Hacker News Who is Hiring and Adzuna are returning real jobs.
 * **Configured but blocked sources:** Google CSE credentials exist, but Google returns HTTP 403 until Custom Search JSON API is enabled for that Google Cloud project. JSearch is configured but currently rate-limited with HTTP 429.
-* **Safety controls:** Telegram `apply` does not send email. Real SMTP sending is disabled unless `ALLOW_REAL_EMAIL_SEND=true`.
+* **Safety controls:** Telegram `draft 1` previews outreach, `apply 1` moves a role to manual follow-up, and `send 1` is the only command that can send email. Real SMTP still requires `ALLOW_REAL_EMAIL_SEND=true` on the sender Lambda and `ALLOW_TELEGRAM_EMAIL_SEND=true` on the router Lambda.
 * **Operational controls:** Both SQS queues have DLQs. CloudWatch alarms cover Lambda errors/throttles, queue backlog, and DLQ messages.
 * **Current review policy:** only fresh, sourced, 90%+ matches enter the visible review queue.
 
@@ -33,6 +33,7 @@ For an outbound-sales analogy, LinkedIn is a lead database. This system is close
 * Missing dates, stale jobs, remote-only/non-local roles, and weak AI/ML signal are rejected or capped before the LLM.
 * The scorer now has a labeled regression eval set: good match, weak match, stale job, remote/non-local job, and missing-source job.
 * `status` and `list` expose source labels and links so the user can inspect evidence instead of trusting model text.
+* Resume and project files are compacted into a candidate knowledge graph before scoring, reducing repeated Bedrock input tokens while keeping the strongest evidence.
 
 ## High-Level Architecture Diagram
 
@@ -100,4 +101,4 @@ graph TD
 *Equivalent to generating a human-reviewed outbound step, with dispatch behind a safety gate.*
 * **Component:** `job-sender` (AWS Lambda), Gmail API
 * **Function:** When the user issues `draft 1`, the sender generates a preview-only draft. It does not fetch SMTP credentials or send email in preview mode.
-* **Execution safety:** Real SMTP delivery is disabled by default through `ALLOW_REAL_EMAIL_SEND=false`. This keeps the interview demo honest: the AI can research, score, cite, and draft, but a human decides whether to actually contact anyone.
+* **Execution safety:** Real SMTP delivery is behind two switches: `ALLOW_TELEGRAM_EMAIL_SEND=true` on the router and `ALLOW_REAL_EMAIL_SEND=true` on the sender. This keeps the workflow useful without allowing `apply` or a background job to send email accidentally.

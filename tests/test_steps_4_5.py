@@ -46,7 +46,7 @@ if not pending:
     pending = high_scores
 
 if not pending:
-    print("No jobs to preview. Run test_live_e2e.py first.")
+    print("No jobs to preview. Run pytest tests/live/test_live_e2e.py first.")
     sys.exit(0)
 
 # === STEP 4: TELEGRAM PREVIEW ===

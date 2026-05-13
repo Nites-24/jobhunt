@@ -34,6 +34,8 @@ LAMBDAS = {
     "job_sender": "job-sender",
 }
 
+SHARED_DIR = "shared"
+
 
 def zip_lambda(directory):
     """Create a zip buffer of a Lambda directory."""
@@ -45,6 +47,13 @@ def zip_lambda(directory):
                     filepath = os.path.join(root, file)
                     arcname = os.path.relpath(filepath, directory)
                     zf.write(filepath, arcname)
+        if os.path.exists(SHARED_DIR):
+            for root, dirs, files in os.walk(SHARED_DIR):
+                for file in files:
+                    if file.endswith(".py"):
+                        filepath = os.path.join(root, file)
+                        arcname = os.path.relpath(filepath, ".")
+                        zf.write(filepath, arcname)
     buf.seek(0)
     return buf.read()
 

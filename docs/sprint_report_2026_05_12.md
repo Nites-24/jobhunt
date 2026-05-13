@@ -18,7 +18,7 @@ To resolve this, the ingestion layer (`job-ingestor` Lambda) was entirely re-arc
 *   **Implemented Google CSE Integration:** Rewrote `job_ingestor/lambda_function.py` to utilize the Google Custom Search JSON API.
 *   **Secured Infrastructure:** Provisioned a new AWS Secret (`jobsearch/google_cse`) to securely manage the Google API Key and Custom Engine ID (CX).
 *   **Hardened Unit Tests:** Rewrote the entire `test_ingestor.py` suite to mock the new Google CSE response shape. Patched an edge-case regex bug allowing generic `hr@` emails to bypass the personal-email filter.
-*   **Executed E2E Validation:** Deployed the code and ran the autonomous QA Test Agent (`run_agents.py --qa`). Achieved a **100/100 (Grade A)** with all 60 unit tests passing and all Lambdas synchronized.
+*   **Executed E2E Validation:** Deployed the code and ran the autonomous QA Test Agent (`python tools/ops/run_agents.py --qa`). Achieved a **100/100 (Grade A)** with all 60 unit tests passing and all Lambdas synchronized.
 
 ---
 

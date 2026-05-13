@@ -21,9 +21,10 @@ TARGET_ENV = {
         "SCORE_THRESHOLD": "90",
         "MAX_JOB_AGE_DAYS": "14",
         "ENABLE_PRACTICE_MODE": "false",
+        "ALLOW_TELEGRAM_EMAIL_SEND": "true",
     },
     "job-sender": {
-        "ALLOW_REAL_EMAIL_SEND": "false",
+        "ALLOW_REAL_EMAIL_SEND": "true",
     },
 }
 

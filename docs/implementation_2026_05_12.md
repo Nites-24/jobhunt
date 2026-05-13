@@ -34,8 +34,8 @@
 
 ## Verification Plan
 ### Automated Tests
-- Run `test_ingestor_live.py` to ensure it successfully fetches hundreds of fresh jobs from HN and zero from Remotive.
-- Run `test_processor.py` to verify the LLM correctly down-scores old or irrelevant jobs.
+- Run `pytest tests/live/test_ingestor_live.py` to ensure it successfully fetches hundreds of fresh jobs from HN and zero from Remotive.
+- Run `pytest tests/test_processor.py` to verify the LLM correctly down-scores old or irrelevant jobs.
 
 ### Manual Verification
 - Trigger a `search jobs` command via Telegram and verify that only highly relevant, fresh jobs (like HN posts from the last few days) are returned in the `list` command.

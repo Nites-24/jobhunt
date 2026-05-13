@@ -18,7 +18,7 @@ from unittest.mock import patch, MagicMock, PropertyMock
 from decimal import Decimal
 
 # Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.base_agent import (
     BaseAgent, AgentObservation, AgentAction, AgentResult,

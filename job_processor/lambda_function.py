@@ -21,6 +21,7 @@ from botocore.exceptions import ClientError
 from typing import Tuple, Dict, Any, Optional
 from decimal import Decimal
 from datetime import datetime, timezone
+from shared.knowledge_graph import build_candidate_graph, render_candidate_graph
 
 # ---------------------------------------------------------------------------
 # 1. OBSERVABILITY
@@ -162,6 +163,65 @@ def _build_context_from_s3() -> str:
     _cached_context = "\n\n".join(parts)
     _context_loaded_at = now
     logger.info("CONTEXT_BUILT: %d chars from %d sections", len(_cached_context), len(parts))
+    return _cached_context
+
+
+def _build_candidate_graph_context() -> str:
+    """Build a compact candidate graph from S3 context files."""
+    global _cached_context, _context_loaded_at
+
+    now = time.time()
+    if _cached_context and (now - _context_loaded_at) < CONTEXT_TTL_SECONDS:
+        logger.info("CONTEXT_CACHE_HIT: Using cached graph context (age=%.0fs)", now - _context_loaded_at)
+        return _cached_context
+
+    logger.info("CONTEXT_CACHE_MISS: Building compact candidate graph from S3...")
+    raw_text_parts = []
+    raw_char_count = 0
+
+    resume_text = _load_s3_file(RESUME_KEY)
+    if resume_text:
+        raw_text_parts.append(resume_text)
+        raw_char_count += len(resume_text)
+    else:
+        logger.warning("RESUME_MISSING: %s not found, using graph fallback", RESUME_KEY)
+        raw_text_parts.append(
+            "Teja Gopal Reddy Vaka Senior AI Engineer specializing in RAG pipelines, "
+            "LLM orchestration, agentic systems, Python, PyTorch, AWS, LangChain, "
+            "vector databases. Achievements include 33% GPU cost reduction and 87% "
+            "autonomous ticket resolution. Projects include RetireIQ and Rivulet."
+        )
+
+    for folder in CONTEXT_FOLDERS:
+        folder = folder.strip()
+        if not folder:
+            continue
+        try:
+            response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=folder)
+            if "Contents" not in response:
+                continue
+
+            for obj in response["Contents"]:
+                key = obj["Key"]
+                if key.endswith("/") or not key.lower().endswith(ALLOWED_EXTENSIONS):
+                    continue
+                content = _load_s3_file(key)
+                if content:
+                    raw_text_parts.append(content)
+                    raw_char_count += len(content)
+        except Exception as e:
+            logger.error("CONTEXT_FOLDER_ERROR: %s - %s", folder, str(e))
+
+    graph = build_candidate_graph(*raw_text_parts)
+    _cached_context = render_candidate_graph(graph)
+    _context_loaded_at = now
+    logger.info(
+        "CONTEXT_GRAPH_BUILT: raw_chars=%d | compact_chars=%d | focus=%s | skills=%s",
+        raw_char_count,
+        len(_cached_context),
+        ",".join(graph.get("focus_areas", [])[:4]),
+        ",".join(graph.get("skills", [])[:6]),
+    )
     return _cached_context
 
 
@@ -536,8 +596,8 @@ def lambda_handler(event, context):
     records = event.get("Records", [])
     logger.info("BATCH_START | records=%d | function=%s", len(records), context.function_name)
 
-    # Build context once per invocation (cached across warm starts)
-    profile_context = _build_context_from_s3()
+    # Build compact profile context once per invocation (cached across warm starts)
+    profile_context = _build_candidate_graph_context()
 
     batch_item_failures = []
     stats = {"evaluated": 0, "matched": 0, "rejected": 0, "failed": 0}

@@ -39,6 +39,7 @@ SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "90"))
 MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "14"))
 LIST_FETCH_LIMIT = int(os.environ.get("LIST_FETCH_LIMIT", "100"))
 ENABLE_PRACTICE_MODE = os.environ.get("ENABLE_PRACTICE_MODE", "false").strip().lower() == "true"
+ALLOW_TELEGRAM_EMAIL_SEND = os.environ.get("ALLOW_TELEGRAM_EMAIL_SEND", "false").strip().lower() == "true"
 LIST_ALLOWED_SOURCES = {
     source.strip().lower()
     for source in os.environ.get("LIST_ALLOWED_SOURCES", "hackernews,hn,jsearch,google_cse,cse,adzuna,tejajob").split(",")
@@ -523,7 +524,10 @@ def _handle_list(bot_token: str, chat_id: str) -> None:
             lines.append(f"   Next: explain {i}, draft {i}, apply {i}")
         elif recruiter:
             lines.append(f"   Contact found: {recruiter}")
-            lines.append(f"   Next: draft {i} previews only, apply {i} shows contact. No auto-send.")
+            if ALLOW_TELEGRAM_EMAIL_SEND:
+                lines.append(f"   Next: draft {i} previews, send {i} sends email, apply {i} is manual")
+            else:
+                lines.append(f"   Next: draft {i} previews, apply {i} shows contact")
         else:
             lines.append(f"   Next: draft {i} to preview, apply {i} for manual follow-up")
         lines.append("")
@@ -660,6 +664,81 @@ def _handle_draft(bot_token: str, chat_id: str, index: int = 1) -> None:
         _send_telegram(bot_token, chat_id, f"Could not generate draft preview: {str(e)}")
 
 
+def _handle_send(bot_token: str, chat_id: str, index: int = 1) -> None:
+    """Send outreach for a reviewable job after explicit Telegram command."""
+    jobs = _get_pending_jobs(limit=20)
+    if not jobs:
+        _send_telegram(bot_token, chat_id, "Your review queue is empty. Use search jobs to scan live sources.")
+        return
+    if index < 1 or index > len(jobs):
+        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+        return
+
+    job = jobs[index - 1]
+    recruiter = (job.get("recruiter_email") or "").strip()
+    source_url = _source_url(job)
+    if job.get("source") == "tejajob":
+        _send_telegram(bot_token, chat_id, "Practice jobs cannot send real email.")
+        return
+    if not recruiter:
+        _send_telegram(
+            bot_token,
+            chat_id,
+            "No recruiter email is stored for this role.\n\n"
+            f"Use apply {index} for the source link and manual follow-up.",
+        )
+        return
+    if not source_url.startswith(("http://", "https://")):
+        _send_telegram(bot_token, chat_id, "Blocked: this role has no verifiable source link.")
+        return
+    if not ALLOW_TELEGRAM_EMAIL_SEND:
+        _send_telegram(
+            bot_token,
+            chat_id,
+            "Email send is disabled in Telegram config.\n\n"
+            "To enable it, set ALLOW_TELEGRAM_EMAIL_SEND=true on job-router and "
+            "ALLOW_REAL_EMAIL_SEND=true on job-sender.\n\n"
+            f"For now, use draft {index} then send manually.",
+        )
+        return
+
+    try:
+        response = lambda_client.invoke(
+            FunctionName=SENDER_LAMBDA,
+            InvocationType="RequestResponse",
+            Payload=_safe_json_dumps({"send_email": True, "job": job}),
+        )
+        payload = _read_lambda_payload(response)
+        status = payload.get("status", "")
+        if status == "send_disabled":
+            _send_telegram(
+                bot_token,
+                chat_id,
+                "Sender Lambda refused to send because ALLOW_REAL_EMAIL_SEND is false.\n\n"
+                f"Use draft {index} then send manually, or enable the sender kill switch.",
+            )
+            return
+        if status == "sent" or payload.get("sent", 0) > 0:
+            _send_telegram(
+                bot_token,
+                chat_id,
+                f"Email sent.\n\n"
+                f"Role: {job.get('title', 'Unknown')}\n"
+                f"Company: {job.get('company', 'Unknown')}\n"
+                f"To: {recruiter}\n"
+                f"Source: {_source_label(job)}\n"
+                f"Source link: {source_url}",
+            )
+            return
+        if status == "no_recruiter_email":
+            _send_telegram(bot_token, chat_id, f"No recruiter email is stored. Use apply {index}.")
+            return
+        raise ValueError(payload.get("reason") or payload.get("error") or f"unexpected sender status: {status}")
+    except Exception as e:
+        logger.error("SEND_COMMAND_ERROR: %s", str(e))
+        _send_telegram(bot_token, chat_id, f"Could not send email: {str(e)}")
+
+
 def _handle_reject(bot_token: str, chat_id: str, index: int = 1) -> None:
     """Reject a specific reviewable job."""
     jobs = _get_pending_jobs(limit=20)
@@ -744,7 +823,7 @@ def _handle_status(bot_token: str, chat_id: str) -> None:
     lines.extend([
         "",
         "Rule: if a role has no source link, do not act on it.",
-        "apply never sends email from Telegram.",
+        "apply never sends email. send requires explicit enablement and a recruiter email.",
     ])
     _send_telegram(bot_token, chat_id, "\n".join(lines))
 
@@ -758,6 +837,7 @@ def _handle_help(bot_token: str, chat_id: str) -> None:
         else
         "  apply 1 - Show contact/source and move to manual follow-up. No auto-send\n"
     )
+    send_line = "  send 1 - Send email for a sourced match with recruiter email\n" if ALLOW_TELEGRAM_EMAIL_SEND else ""
     msg = (
         "JobAlert commands\n"
         "-----------------\n\n"
@@ -767,6 +847,7 @@ def _handle_help(bot_token: str, chat_id: str) -> None:
         f"  list - Show fresh {SCORE_THRESHOLD}%+ matches\n"
         "  explain 1 - Show why a match scored well\n"
         "  draft 1 - Preview outreach without sending\n"
+        f"{send_line}"
         f"{apply_line}"
         "  reject 1 - Remove a match from the queue\n"
         "  status - Show counts plus role source links\n"
@@ -779,6 +860,7 @@ APPLY_PATTERN = re.compile(r"^apply\s*(\d+)?$", re.IGNORECASE)
 REJECT_PATTERN = re.compile(r"^reject\s*(\d+)?$", re.IGNORECASE)
 EXPLAIN_PATTERN = re.compile(r"^explain\s*(\d+)?$", re.IGNORECASE)
 DRAFT_PATTERN = re.compile(r"^draft\s*(\d+)?$", re.IGNORECASE)
+SEND_PATTERN = re.compile(r"^send\s*(\d+)?$", re.IGNORECASE)
 
 
 def _route_command(command: str, bot_token: str, chat_id: str) -> None:
@@ -841,6 +923,15 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
         return
     if cmd.startswith("draft"):
         _send_telegram(bot_token, chat_id, "Use a match number, for example: draft 1")
+        return
+
+    match = SEND_PATTERN.match(cmd)
+    if match:
+        index = int(match.group(1)) if match.group(1) else 1
+        _handle_send(bot_token, chat_id, index)
+        return
+    if cmd.startswith("send"):
+        _send_telegram(bot_token, chat_id, "Use a match number, for example: send 1")
         return
 
     match = REJECT_PATTERN.match(cmd)

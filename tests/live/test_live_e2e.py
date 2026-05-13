@@ -10,7 +10,7 @@ Prerequisites:
 
 Usage:
   1. Edit .env with your AWS credentials
-  2. Run: python test_live_e2e.py
+  2. Run: pytest tests/live/test_live_e2e.py
 """
 
 import os

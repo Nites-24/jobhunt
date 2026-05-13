@@ -27,6 +27,7 @@ from decimal import Decimal
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from shared.knowledge_graph import build_candidate_graph, render_candidate_graph
 
 # ---------------------------------------------------------------------------
 # 1. OBSERVABILITY
@@ -56,6 +57,16 @@ MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-202
 ALLOW_REAL_EMAIL_SEND = os.environ.get("ALLOW_REAL_EMAIL_SEND", "false").strip().lower() == "true"
 
 table = dynamodb.Table(TABLE_NAME)
+
+CANDIDATE_GRAPH_CONTEXT = render_candidate_graph(
+    build_candidate_graph(
+        "Teja Gopal Reddy Vaka Senior AI Engineer focused on RAG pipelines, "
+        "LLM orchestration, agentic systems, Python, PyTorch, AWS, LangChain, "
+        "evaluation pipelines, RetireIQ, and Rivulet. Achievements include 33% "
+        "GPU cost reduction and 87% autonomous ticket resolution. Open to relocate "
+        "and work onsite in the San Francisco Bay Area."
+    )
+)
 
 # ---------------------------------------------------------------------------
 # 4. SYSTEM PROMPT — The "Brain"
@@ -199,12 +210,14 @@ def _build_user_message(job: dict) -> str:
         f"GREETING TO USE: {greeting}",
         f"COMPANY NAME (mention by name in paragraph 1): {company or 'Not provided'}",
         f"ROLE: {title}",
+        "CANDIDATE GRAPH:",
+        CANDIDATE_GRAPH_CONTEXT,
     ]
     if keywords and isinstance(keywords, list):
         lines.append(f"KEY SKILLS TO REFERENCE: {', '.join(keywords)}")
     lines.append("JOB DESCRIPTION:")
     # Truncate description to avoid token waste
-    lines.append(description[:4000] if description else "Not provided")
+    lines.append(description[:2500] if description else "Not provided")
 
     return "\n".join(lines)
 
@@ -394,6 +407,9 @@ def lambda_handler(event, context):
                 jobs_to_process.append((record.get("messageId", "unknown"), job))
             except Exception as e:
                 logger.error("RECORD_PARSE_ERROR | %s", str(e))
+    elif isinstance(event, dict) and event.get("send_email") and "job" in event:
+        job = _deserialize_job(event.get("job", {}))
+        jobs_to_process.append(("direct", job))
     else:
         # Direct invoke from job-router
         job = _deserialize_job(event)
@@ -450,6 +466,7 @@ def lambda_handler(event, context):
     # --- Generate emails ---
     messages_to_send = []  # [(job_id, MIMEMessage)]
     batch_item_failures = []
+    no_recruiter_count = 0
 
     for msg_id, job in jobs_to_process:
         job_id = job.get("job_id", "unknown")
@@ -475,6 +492,7 @@ def lambda_handler(event, context):
                             job_id, job.get("company"), apply_url)
                 _mark_status(job_id, "NO_RECRUITER_EMAIL",
                              f"Apply directly: {apply_url}")
+                no_recruiter_count += 1
                 continue
 
             email_data = _generate_email(job)
@@ -495,14 +513,18 @@ def lambda_handler(event, context):
                 batch_item_failures.append({"itemIdentifier": msg_id})
 
     # --- Send all emails over a single SMTP connection ---
+    sent_count = 0
+    failed_count = 0
     if messages_to_send:
         send_results = _send_via_smtp(SENDER_EMAIL, app_password, messages_to_send)
 
         for job_id, success, error in send_results:
             if success:
                 _mark_status(job_id, "SENT")
+                sent_count += 1
             else:
                 _mark_status(job_id, "FAILED", f"SMTP_ERROR: {error}")
+                failed_count += 1
                 # Find the message_id for this job to add to failures
                 for m_id, job in jobs_to_process:
                     if job.get("job_id") == job_id and m_id != "direct":
@@ -512,4 +534,20 @@ def lambda_handler(event, context):
     logger.info("SENDER_COMPLETE | generated=%d | failures=%d",
                 len(messages_to_send), len(batch_item_failures))
 
-    return {"batchItemFailures": batch_item_failures}
+    if no_recruiter_count and not sent_count and not failed_count:
+        status = "no_recruiter_email"
+    elif failed_count:
+        status = "failed"
+    elif sent_count:
+        status = "sent"
+    else:
+        status = "skipped"
+
+    return {
+        "status": status,
+        "generated": len(messages_to_send),
+        "sent": sent_count,
+        "failed": failed_count,
+        "no_recruiter_email": no_recruiter_count,
+        "batchItemFailures": batch_item_failures,
+    }

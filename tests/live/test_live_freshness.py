@@ -4,7 +4,7 @@ This calls the REAL JSearch API to verify freshness and source links.
 
 Usage:
   1. Set your JSearch API key below
-  2. Run: python test_live_freshness.py
+  2. Run: pytest tests/live/test_live_freshness.py
 """
 
 import json
@@ -88,6 +88,6 @@ if __name__ == "__main__":
     if API_KEY == "YOUR_KEY_HERE":
         print("⚠️  Set your JSEARCH_API_KEY environment variable first:")
         print("   set JSEARCH_API_KEY=your_key_here")
-        print("   python test_live_freshness.py")
+        print("   pytest tests/live/test_live_freshness.py")
     else:
         fetch_and_display()

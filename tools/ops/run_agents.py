@@ -3,10 +3,10 @@
 Pipeline health-check CLI.
 
 Usage:
-  python run_agents.py              # Local orchestrator check
-  python run_agents.py --qa         # Run QA agent only
-  python run_agents.py --full       # Include AWS infrastructure agents
-  python run_agents.py --deploy     # Run checks in deploy mode
+  python tools/ops/run_agents.py              # Local orchestrator check
+  python tools/ops/run_agents.py --qa         # Run QA agent only
+  python tools/ops/run_agents.py --full       # Include AWS infrastructure agents
+  python tools/ops/run_agents.py --deploy     # Run checks in deploy mode
 """
 
 import argparse
@@ -16,7 +16,8 @@ import os
 import sys
 
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, PROJECT_ROOT)
 
 from agents.orchestrator_agent import OrchestratorAgent
 

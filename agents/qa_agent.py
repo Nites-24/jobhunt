@@ -46,11 +46,11 @@ LAMBDA_DIRS = {
 
 # Expected test files
 EXPECTED_TEST_FILES = [
-    "test_ingestor.py",
-    "test_deduplicator.py",
-    "test_processor.py",
-    "test_router.py",
-    "test_sender.py",
+    os.path.join("tests", "test_ingestor.py"),
+    os.path.join("tests", "test_deduplicator.py"),
+    os.path.join("tests", "test_processor.py"),
+    os.path.join("tests", "test_router.py"),
+    os.path.join("tests", "test_sender.py"),
 ]
 
 
@@ -197,9 +197,11 @@ class QAAgent(BaseAgent):
         observations = []
         existing_tests = set()
 
-        for f in os.listdir(PROJECT_ROOT):
-            if f.startswith("test_") and f.endswith(".py"):
-                existing_tests.add(f)
+        tests_dir = os.path.join(PROJECT_ROOT, "tests")
+        for root, _dirs, files in os.walk(tests_dir):
+            for f in files:
+                if f.startswith("test_") and f.endswith(".py"):
+                    existing_tests.add(os.path.relpath(os.path.join(root, f), PROJECT_ROOT))
 
         missing = []
         for expected in EXPECTED_TEST_FILES:

@@ -222,6 +222,7 @@ class TestSender:
         job = {**SAMPLE_JOB, "recruiter_name": "Sarah Chen"}
         msg = mod._build_user_message(job)
         assert "Hi Sarah," in msg
+        assert "<candidate_graph>" in msg
 
     def test_greeting_company_fallback(self):
         """Greeting should fall back to company name when no recruiter name."""
