@@ -42,8 +42,13 @@ GOOGLE_CSE_QUERIES = [
 ADZUNA_SECRET_NAME = os.environ.get("ADZUNA_SECRET_NAME", "adzuna/jobsearch")
 ADZUNA_ENABLED = os.environ.get("ADZUNA_ENABLED", "true").strip().lower() == "true"
 ADZUNA_MAX_RESULTS = int(os.environ.get("ADZUNA_MAX_RESULTS", "20"))
-ADZUNA_WHAT = os.environ.get("ADZUNA_WHAT", "AI Engineer OR LLM Engineer OR RAG Engineer")
-ADZUNA_WHERE = os.environ.get("ADZUNA_WHERE", "San Francisco Bay Area")
+ADZUNA_QUERIES = [
+    q.strip()
+    for q in os.environ.get("ADZUNA_QUERIES", "AI Engineer;;LLM Engineer;;Machine Learning Engineer").split(";;")
+    if q.strip()
+]
+ADZUNA_WHERE = os.environ.get("ADZUNA_WHERE", "San Francisco")
+ADZUNA_MAX_DAYS_OLD = int(os.environ.get("ADZUNA_MAX_DAYS_OLD", "14"))
 HN_MAX_COMMENTS = int(os.environ.get("HN_MAX_COMMENTS", "800"))
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
@@ -82,6 +87,7 @@ def _get_secret_payload(secret_name: str) -> dict:
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             payload = {}
+        payload = {str(key).strip(): value for key, value in payload.items()}
     except Exception as e:
         logger.warning("SECRET_READ_SKIP | secret=%s | error=%s", secret_name, str(e))
         payload = {}
@@ -511,31 +517,37 @@ def fetch_adzuna_jobs() -> list:
         logger.info("ADZUNA_SKIP: missing app_id or app_key")
         return []
 
-    params = urllib.parse.urlencode({
-        "app_id": app_id,
-        "app_key": app_key,
-        "results_per_page": ADZUNA_MAX_RESULTS,
-        "what": ADZUNA_WHAT,
-        "where": ADZUNA_WHERE,
-        "max_days_old": 14,
-        "content-type": "application/json",
-    })
-    url = f"https://api.adzuna.com/v1/api/jobs/us/search/1?{params}"
-    try:
-        with urllib.request.urlopen(urllib.request.Request(url), timeout=15) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        jobs = []
-        for raw in data.get("results", [])[:ADZUNA_MAX_RESULTS]:
-            job = _normalize_adzuna_job(raw)
-            if job and re.search(r"\b(ai|ml|llm|rag|machine learning|nlp|agent)\b", f"{job['title']} {job['description']}", re.IGNORECASE):
-                jobs.append(job)
-        logger.info("ADZUNA_QUERY | raw=%d | accepted=%d", len(data.get("results", [])), len(jobs))
-        return jobs
-    except urllib.error.HTTPError as e:
-        logger.warning("ADZUNA_QUERY_ERROR | status=%s | error=%s", e.code, str(e))
-    except Exception as e:
-        logger.warning("ADZUNA_QUERY_ERROR | error=%s", str(e))
-    return []
+    jobs = []
+    per_query = max(1, min(50, ADZUNA_MAX_RESULTS))
+    for query in ADZUNA_QUERIES:
+        params = urllib.parse.urlencode({
+            "app_id": app_id,
+            "app_key": app_key,
+            "results_per_page": per_query,
+            "what": query,
+            "where": ADZUNA_WHERE,
+            "max_days_old": ADZUNA_MAX_DAYS_OLD,
+            "content-type": "application/json",
+        })
+        url = f"https://api.adzuna.com/v1/api/jobs/us/search/1?{params}"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url), timeout=15) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            accepted_before = len(jobs)
+            for raw in data.get("results", [])[:per_query]:
+                job = _normalize_adzuna_job(raw)
+                if job and re.search(r"\b(ai|ml|llm|rag|machine learning|nlp|agent)\b", f"{job['title']} {job['description']}", re.IGNORECASE):
+                    job["source_search_query"] = query
+                    jobs.append(job)
+            logger.info(
+                "ADZUNA_QUERY | query=%s | raw=%d | accepted=%d | total=%d",
+                query, len(data.get("results", [])), len(jobs) - accepted_before, len(jobs),
+            )
+        except urllib.error.HTTPError as e:
+            logger.warning("ADZUNA_QUERY_ERROR | query=%s | status=%s | error=%s", query, e.code, str(e))
+        except Exception as e:
+            logger.warning("ADZUNA_QUERY_ERROR | query=%s | error=%s", query, str(e))
+    return jobs
 
 
 def _dedupe_batch(jobs: list[dict]) -> list[dict]:
