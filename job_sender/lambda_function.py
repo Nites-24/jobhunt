@@ -55,16 +55,19 @@ BUCKET = os.environ.get("RESUME_BUCKET", "job-search-pipeline-memory")
 RESUME_KEY = os.environ.get("RESUME_KEY", "data/resume/Teja_Vaka.pdf")
 MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
 ALLOW_REAL_EMAIL_SEND = os.environ.get("ALLOW_REAL_EMAIL_SEND", "false").strip().lower() == "true"
+BEDROCK_THROTTLE_RETRIES = int(os.environ.get("BEDROCK_THROTTLE_RETRIES", "2"))
 
 table = dynamodb.Table(TABLE_NAME)
 
 CANDIDATE_GRAPH_CONTEXT = render_candidate_graph(
     build_candidate_graph(
-        "Teja Gopal Reddy Vaka Senior AI Engineer focused on RAG pipelines, "
+        "Teja Gopal Reddy Vaka AI Engineer focused on RAG pipelines, "
         "LLM orchestration, agentic systems, Python, PyTorch, AWS, LangChain, "
-        "evaluation pipelines, RetireIQ, and Rivulet. Achievements include 33% "
-        "GPU cost reduction and 87% autonomous ticket resolution. Open to relocate "
-        "and work onsite in the San Francisco Bay Area."
+        "evaluation pipelines. Projects include RetireIQ, a retirement planning "
+        "and financial decision support app, and Rivulet, a personal life management "
+        "app. Achievements include 33% GPU cost reduction and 87% autonomous ticket "
+        "resolution. Currently based in Wichita, Kansas. Open to remote, hybrid, or "
+        "onsite roles in any location and open to relocate. CPT student."
     )
 )
 
@@ -72,7 +75,7 @@ CANDIDATE_GRAPH_CONTEXT = render_candidate_graph(
 # 4. SYSTEM PROMPT — The "Brain"
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "You are Teja Gopal Reddy Vaka, a Senior AI Engineer. You're writing a short, warm "
+    "You are Teja Gopal Reddy Vaka, an AI Engineer. You're writing a short, warm "
     "cold email to a hiring manager or recruiter. This person skims 50 emails a day. "
     "Your goal is to sound like a real human who read the role and wrote a useful note, not an AI.\n\n"
 
@@ -86,21 +89,10 @@ SYSTEM_PROMPT = (
     "The line after the greeting should immediately mention the role, company, or specific work they need. "
     "A recruiter should read this and think this person actually looked at the job.\n\n"
 
-    "BODY (2 short paragraphs + ask):\n"
-    "Paragraph 1: Read the provided job description carefully. Identify the single biggest core challenge, specific product, or main technology stack they are hiring for, for example LLM evaluation, agentic workflows, or data pipelines. Write one specific sentence mapping that need to Teja's AI-agent project work. Do not say 'I saw your posting', 'hope you're well', or use generic filler. Do not claim employers, dates, customer outcomes, or metrics unless they are explicitly present in the job payload.\n\n"
-
-    "Paragraph 2: Mention your two live projects naturally, explicitly connecting them to the challenge you identified in Paragraph 1. "
-    "You MUST include the raw URLs in parentheses exactly as provided: "
-    "RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ) handles multi-step financial "
-    "reasoning, and Rivulet (https://rivulet.info) does tool orchestration with human oversight. "
-    "Weave them into a sentence, don't just drop links.\n\n"
-
-    "Then add: I am fully open to all locations and am ready to relocate or be onsite as "
-    "required for this role.\n\n"
-
-    "End with: Would 20 minutes this week work to connect?\n\n"
-
-    "Sign off: Best,\\nTeja Gopal Reddy Vaka\\nSenior AI Engineer\\nhttps://linkedin.com/in/tejagopalreddyvaka/\n\n"
+    "BODY:\n"
+    "Only write the greeting plus one short opening paragraph, 1 or 2 sentences max. "
+    "Do not write the projects paragraph, location line, CTA, or signature. The system will append those separately.\n\n"
+    "Opening paragraph rule: Read the provided job description carefully. Identify the single biggest core challenge, specific product, or main technology stack they are hiring for, for example LLM evaluation, agentic workflows, or data pipelines. Write one specific sentence mapping that need to Teja's project work. Do not say 'I saw your posting', 'hope you're well', or use generic filler. Do not claim employers, dates, customer outcomes, or metrics unless they are explicitly present in the job payload.\n\n"
 
     "HARD RULES:\n"
     "- Under 130 words total\n"
@@ -134,7 +126,7 @@ EMAIL_TOOL_CONFIG = {
                             },
                             "body": {
                                 "type": "string",
-                                "description": "Full email body starting with greeting and ending with signature.",
+                                "description": "Greeting plus a short opening paragraph only. Do not include closing or signature.",
                             },
                         },
                         "required": ["subject", "body"],
@@ -147,18 +139,27 @@ EMAIL_TOOL_CONFIG = {
 }
 
 INVALID_FIRST_NAMES = {"hiring", "manager", "recruiter", "team", "hr", "talent", "hello", "dear", ""}
+FOUNDER_EMAIL_NAMES = {"founder", "founders"}
+CAREERS_EMAIL_NAMES = {"admin", "apply", "careers", "contact", "hello", "hi", "hiring", "hr", "info", "jobs", "recruiting", "support", "talent", "team"}
 GENERIC_EMAIL_NAMES = {
-    "admin", "apply", "careers", "contact", "hello", "hi", "hiring", "hr", "info", "jobs",
-    "no-reply", "noreply", "recruiting", "support", "talent", "team",
+    *CAREERS_EMAIL_NAMES, *FOUNDER_EMAIL_NAMES, "no-reply", "noreply",
 }
+ATS_HOST_HINTS = ("ashbyhq.com", "greenhouse.io", "lever.co", "wellfound.com", "workable.com")
 ROBOTIC_OR_UNSUPPORTED_PHRASES = {
     "at empower",
+    "at scale",
+    "aligns directly with that focus",
     "exactly what i've been doing",
     "exactly what i have been doing",
     "for the past few years",
     "from ground up",
     "from the ground up",
+    "i am interested in how",
+    "i'm interested in how",
     "i care about both",
+    "interested in exploring",
+    "i have spent the last months",
+    "i've spent the last months",
     "resonate",
     "resonates",
     "shipping fast with ownership",
@@ -210,8 +211,28 @@ def _format_first_name(value: str) -> str:
     return value[:1].upper() + value[1:].lower()
 
 
+def _email_local_part(email: str) -> str:
+    return str(email or "").split("@", 1)[0].split("+", 1)[0].strip().lower()
+
+
+def _extract_founder_name(job: dict) -> str:
+    description = str(job.get("description", "")).strip()
+    if not description:
+        return ""
+    patterns = [
+        r"\bI['’]?m\s+([A-Z][a-z]+)\s*,\s*founder\b",
+        r"\bI am\s+([A-Z][a-z]+)\s*,\s*founder\b",
+        r"\b([A-Z][a-z]+)\s+here,\s*founder\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, description)
+        if match:
+            return _format_first_name(match.group(1))
+    return ""
+
+
 def _first_name_from_email(email: str) -> str:
-    local = str(email or "").split("@", 1)[0].split("+", 1)[0].strip().lower()
+    local = _email_local_part(email)
     if not local or local in GENERIC_EMAIL_NAMES:
         return ""
 
@@ -224,7 +245,45 @@ def _first_name_from_email(email: str) -> str:
     return _format_first_name(token)
 
 
+def _recipient_mode(job: dict) -> str:
+    """Classify the audience so greeting and body can sound more human."""
+    recruiter_name = str(job.get("recruiter_name", "")).strip()
+    if recruiter_name:
+        first_name = _format_first_name(recruiter_name.split()[0])
+        if first_name and first_name.lower() not in INVALID_FIRST_NAMES:
+            return "person"
+
+    email_local = _email_local_part(str(job.get("recruiter_email", "")).strip())
+    founder_name = _extract_founder_name(job)
+    if founder_name:
+        return "founder_person"
+    if email_local in FOUNDER_EMAIL_NAMES:
+        return "founder_inbox"
+    if email_local and email_local not in GENERIC_EMAIL_NAMES:
+        return "person"
+
+    apply_url = str(job.get("apply_url") or job.get("url") or "").lower()
+    if any(host in apply_url for host in ATS_HOST_HINTS) or email_local in CAREERS_EMAIL_NAMES:
+        return "careers"
+    return "team"
+
+
+def _audience_prompt_hint(job: dict) -> str:
+    mode = _recipient_mode(job)
+    if mode == "person":
+        return "Recipient is a specific person. Sound direct, respectful, and natural, like a short note to one person."
+    if mode in {"founder_person", "founder_inbox"}:
+        return "Recipient is a founder inbox. Sound builder-to-builder, concrete, and startup-aware. Avoid recruiter phrasing."
+    if mode == "careers":
+        return "Recipient is a hiring or careers path. Sound concise, role-focused, and professional without sounding stiff."
+    return "Recipient is a company team inbox. Sound natural, brief, and specific to the work."
+
+
 def _resolve_greeting(job: dict) -> str:
+    founder_name = _extract_founder_name(job)
+    if founder_name:
+        return f"Hi {founder_name},"
+
     full_name = str(job.get("recruiter_name", "")).strip()
     first_name = _format_first_name(full_name.split()[0] if full_name else "")
     if first_name.lower() in INVALID_FIRST_NAMES:
@@ -237,6 +296,9 @@ def _resolve_greeting(job: dict) -> str:
 
     if first_name:
         return f"Hi {first_name},"
+    mode = _recipient_mode(job)
+    if company and mode == "careers":
+        return f"Hi {company} hiring team,"
     if company:
         return f"Hi {company} Team,"
     return "Hi there,"
@@ -278,6 +340,8 @@ def _build_user_message(job: dict) -> str:
 
     lines = [
         f"GREETING TO USE: {greeting}",
+        f"AUDIENCE MODE: {_recipient_mode(job)}",
+        f"AUDIENCE STYLE: {_audience_prompt_hint(job)}",
         f"COMPANY NAME (mention by name in paragraph 1): {company or 'Not provided'}",
         f"ROLE: {title}",
         "CANDIDATE GRAPH:",
@@ -310,6 +374,183 @@ def _sanitize_body(body: str) -> str:
     return body.strip()
 
 
+def _split_sentences(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text or "") if part.strip()]
+
+
+def _job_text(job: dict) -> str:
+    return " ".join(
+        str(job.get(field, "") or "").strip()
+        for field in ("title", "description", "linked_page_excerpt", "source_grounding")
+    ).lower()
+
+
+def _clean_source_fragment(text: str) -> str:
+    value = re.sub(r"https?://\S+", "", str(text or "").strip())
+    value = re.sub(r"\b(interested\?|learn more:|email\s+\S+)\b.*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+", " ", value).strip(" .,-")
+    return value
+
+
+def _compress_source_fragment(text: str) -> str:
+    value = _clean_source_fragment(text)
+    lowered = value.lower()
+
+    phrase_rules = [
+        (("customer success agents", "account intelligence"), "customer success agents and account intelligence"),
+        (("context", "memory", "agent"), "context and memory for AI agents"),
+        (("voice agent", "knowledge graph"), "voice agents and knowledge graphs"),
+        (("multi-agent", "eval"), "multi-agent systems and evals"),
+        (("rag", "retrieval"), "RAG and retrieval systems"),
+        (("python", "pytorch", "rag"), "Python, PyTorch, and RAG systems"),
+    ]
+    for terms, phrase in phrase_rules:
+        if all(term in lowered for term in terms):
+            return phrase
+
+    value = re.sub(r"^[A-Z][A-Za-z0-9 .'-]+?\s+(is building|builds|build|focuses on|focused on)\s+", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"^(we are building|building|work on|working on)\s+", "", value, flags=re.IGNORECASE)
+    value = re.split(r"\b(that|so|which|while|where)\b", value, maxsplit=1, flags=re.IGNORECASE)[0].strip(" ,.-")
+    value = value.split(",")[0].strip(" ,.-")
+
+    words = value.split()
+    if len(words) > 8:
+        value = " ".join(words[:8]).strip(" ,.-")
+    return value
+
+
+def _source_evidence_fragment(job: dict) -> str:
+    candidates = [
+        str(job.get("linked_page_excerpt", "")).strip(),
+        str(job.get("description", "")).strip(),
+    ]
+    priority_terms = (
+        "agent", "agents", "knowledge graph", "eval", "evaluation", "rag", "retrieval",
+        "voice", "workflow", "automation", "customer", "memory", "context", "inference",
+    )
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        for sentence in _split_sentences(candidate):
+            cleaned = _clean_source_fragment(sentence)
+            lowered = cleaned.lower()
+            if len(cleaned.split()) < 4:
+                continue
+            if any(term in lowered for term in priority_terms):
+                return _compress_source_fragment(cleaned)
+        cleaned = _clean_source_fragment(candidate[:220])
+        if cleaned:
+            return _compress_source_fragment(cleaned)
+    return ""
+
+
+def _default_opening(job: dict) -> str:
+    company = str(job.get("company", "your team")).strip() or "your team"
+    title = str(job.get("title", "AI Engineer")).strip() or "AI Engineer"
+    description = _job_text(job)
+    if "context" in description and "memory" in description and "agent" in description:
+        return f"{company} is building context and memory for AI agents, which is close to the kind of agent infrastructure work I want to keep doing."
+    if "clinical" in description and "agent" in description:
+        return f"{company}'s work on AI agents for clinical workflows looks close to the kind of practical AI systems work I want to keep doing."
+    if "inference" in description:
+        return f"{company}'s {title} role looks close to the production AI systems work I want to keep doing."
+    return f"{company}'s {title} role looks close to the practical AI product work I want to keep doing."
+
+
+def _deterministic_opening(job: dict) -> str:
+    company = str(job.get("company", "your team")).strip() or "your team"
+    evidence = _source_evidence_fragment(job)
+    if evidence:
+        return (
+            f"{company} stood out to me because the role is centered on {evidence}, "
+            "which is close to the kind of applied AI work I want to keep doing."
+        )
+    return _default_opening(job)
+
+
+def _extract_opening_sentence(generated_body: str, job: dict) -> str:
+    text = _sanitize_body(generated_body or "")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if lines and re.match(r"^hi\b.+,\s*$", lines[0], re.IGNORECASE):
+        lines = lines[1:]
+    cleaned = "\n".join(lines)
+    cleaned = re.split(r"\nBest,\b|\nRegards,\b|\nSincerely,\b", cleaned, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", cleaned) if p.strip()]
+    first_paragraph = paragraphs[0] if paragraphs else cleaned
+
+    for sentence in _split_sentences(first_paragraph):
+        lowered = sentence.lower()
+        if any(blocked in lowered for blocked in ROBOTIC_OR_UNSUPPORTED_PHRASES):
+            continue
+        if lowered.startswith(("i've built", "i built", "my recent", "i am ", "i'm ", "i have ")):
+            continue
+        if any(token in lowered for token in ("retireiq", "rivulet", "wichita", "preview body")):
+            continue
+        if "interesting" in lowered or "stood out" in lowered:
+            continue
+        if len(sentence.split()) > 28:
+            continue
+        company = str(job.get("company", "")).strip().lower()
+        if company and company not in lowered:
+            continue
+        if company and not (lowered.startswith(company) or lowered.startswith(f"{company}'s")):
+            continue
+        return sentence
+
+    return _deterministic_opening(job)
+
+
+def _select_project_line(job: dict) -> str:
+    text = _job_text(job)
+    if any(term in text for term in ("agent", "knowledge graph", "multi-agent", "multi agent", "eval", "automation", "voice")):
+        return (
+            "I built a private autonomous AI outreach agent that ingests live jobs, scores them with Bedrock plus a compact knowledge graph, "
+            "and keeps a human approval step before outreach."
+        )
+    if any(term in text for term in ("voice", "journal", "memory", "mobile", "react native", "firebase")):
+        return (
+            "I built Rivulet (https://rivulet.info), a personal life management app that uses LLM workflows for voice journaling, planning, and memory organization."
+        )
+    return (
+        "I built RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ), a retirement planning and financial decision support app with hybrid retrieval, "
+        "guardrails, and low-cost inference optimization."
+    )
+
+
+def _cta_line(job: dict) -> str:
+    mode = _recipient_mode(job)
+    if mode == "person":
+        return "If this looks relevant, would 20 minutes this week work to connect?"
+    if mode in {"founder_person", "founder_inbox"}:
+        return "If this seems relevant, would 20 minutes this week work to connect?"
+    if mode == "careers":
+        return "If the role is still open, would 20 minutes this week work to connect?"
+    return "Would 20 minutes this week work to connect?"
+
+
+def _compose_final_email(job: dict, subject: str, generated_body: str) -> dict:
+    greeting = _resolve_greeting(job)
+    opener = _extract_opening_sentence(generated_body, job)
+    body = (
+        f"{greeting}\n\n"
+        f"{opener}\n\n"
+        f"{_select_project_line(job)}\n\n"
+        "I am currently based in Wichita, Kansas, and I am open to remote, hybrid, or onsite roles in any location, including relocation.\n\n"
+        f"{_cta_line(job)}\n\n"
+        "Best,\n"
+        "Teja Gopal Reddy Vaka\n"
+        "AI Engineer\n"
+        "https://linkedin.com/in/tejagopalreddyvaka/"
+    )
+    final_subject = re.sub(r"\s+", " ", str(subject or "").strip())
+    if not final_subject:
+        final_subject = f"{job.get('title', 'AI Engineer')} role at {job.get('company', 'the team')}"
+    body = _enforce_greeting(_sanitize_body(body), greeting)
+    _validate_email_quality(final_subject, body)
+    return {"subject": final_subject, "body": body}
+
+
 def _generate_email(job: dict) -> dict:
     """Generate personalized email using Bedrock Converse API with tool-calling."""
     user_message = _build_user_message(job)
@@ -317,45 +558,58 @@ def _generate_email(job: dict) -> dict:
     logger.info("BEDROCK_INVOKE | job_id=%s | company=%s | model=%s",
                 job.get("job_id"), job.get("company"), MODEL_ID)
 
-    try:
-        response = bedrock_client.converse(
-            modelId=MODEL_ID,
-            messages=[{"role": "user", "content": [{"text": user_message}]}],
-            system=[{"text": SYSTEM_PROMPT}],
-            inferenceConfig={"maxTokens": 1000, "temperature": 0.3},
-            toolConfig=EMAIL_TOOL_CONFIG,
-        )
+    for attempt in range(BEDROCK_THROTTLE_RETRIES + 1):
+        try:
+            response = bedrock_client.converse(
+                modelId=MODEL_ID,
+                messages=[{"role": "user", "content": [{"text": user_message}]}],
+                system=[{"text": SYSTEM_PROMPT}],
+                inferenceConfig={"maxTokens": 1000, "temperature": 0.3},
+                toolConfig=EMAIL_TOOL_CONFIG,
+            )
 
-        # Log token usage
-        usage = response.get("usage", {})
-        logger.info("LLM_TELEMETRY | input=%s | output=%s",
-                     usage.get("inputTokens", "?"), usage.get("outputTokens", "?"))
+            usage = response.get("usage", {})
+            logger.info("LLM_TELEMETRY | input=%s | output=%s",
+                        usage.get("inputTokens", "?"), usage.get("outputTokens", "?"))
 
-        # Extract tool-call result
-        output_content = response["output"]["message"]["content"]
-        for block in output_content:
-            if "toolUse" in block:
-                result = block["toolUse"]["input"]
-                subject = str(result.get("subject", "")).strip()
-                body = _enforce_greeting(_sanitize_body(str(result.get("body", ""))), _resolve_greeting(job))
+            output_content = response["output"]["message"]["content"]
+            for block in output_content:
+                if "toolUse" in block:
+                    result = block["toolUse"]["input"]
+                    subject = str(result.get("subject", "")).strip()
+                    body = str(result.get("body", "")).strip()
 
-                if not subject:
-                    raise ValueError("Model returned empty subject")
-                if not body:
-                    raise ValueError("Model returned empty body")
-                _validate_email_quality(subject, body)
+                    if not body:
+                        raise ValueError("Model returned empty body")
+                    return _compose_final_email(job, subject, body)
 
-                return {"subject": subject, "body": body}
+            raise ValueError("Model did not invoke generate_email tool")
 
-        raise ValueError("Model did not invoke generate_email tool")
+        except ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            if error_code == "ThrottlingException" and attempt < BEDROCK_THROTTLE_RETRIES:
+                delay = 1 + attempt
+                logger.warning(
+                    "BEDROCK_THROTTLED_RETRY | attempt=%d | delay=%ds | job_id=%s",
+                    attempt + 1,
+                    delay,
+                    job.get("job_id"),
+                )
+                time.sleep(delay)
+                continue
+            logger.error("BEDROCK_ERROR: %s — %s", error_code, str(exc))
+            raise
+        except Exception as exc:
+            logger.error("EMAIL_GEN_ERROR: %s", str(exc))
+            raise
 
-    except ClientError as exc:
-        error_code = exc.response["Error"]["Code"]
-        logger.error("BEDROCK_ERROR: %s — %s", error_code, str(exc))
-        raise
-    except Exception as exc:
-        logger.error("EMAIL_GEN_ERROR: %s", str(exc))
-        raise
+
+def _fallback_preview_email(job: dict) -> dict:
+    """Deterministic preview when Bedrock is temporarily throttled."""
+    title = str(job.get("title", "AI Engineer")).strip() or "AI Engineer"
+    company = str(job.get("company", "the team")).strip() or "the team"
+    subject = f"{title} role at {company}"
+    return _compose_final_email(job, subject, _default_opening(job))
 
 
 # ---------------------------------------------------------------------------
@@ -462,7 +716,21 @@ def lambda_handler(event, context):
                 "status": "preview",
                 "job_id": job.get("job_id", "unknown"),
                 "email": email_data,
+                "generated_with_fallback": False,
             }
+        except ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            if error_code == "ThrottlingException":
+                logger.warning("PREVIEW_FALLBACK | job_id=%s | reason=bedrock_throttled", job.get("job_id", "unknown"))
+                return {
+                    "status": "preview",
+                    "job_id": job.get("job_id", "unknown"),
+                    "email": _fallback_preview_email(job),
+                    "generated_with_fallback": True,
+                    "fallback_reason": "Bedrock throttled during preview generation.",
+                }
+            logger.error("PREVIEW_FAILED: %s", str(e))
+            return {"status": "failed", "error": str(e)}
         except Exception as e:
             logger.error("PREVIEW_FAILED: %s", str(e))
             return {"status": "failed", "error": str(e)}

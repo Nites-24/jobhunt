@@ -46,6 +46,22 @@ def _make_sns_event(message_text):
     }
 
 
+def _make_callback_event(data, chat_id="99999", message_id=321):
+    """Create an API Gateway event mimicking a Telegram callback query."""
+    return {
+        "body": json.dumps({
+            "callback_query": {
+                "id": "callback-001",
+                "data": data,
+                "message": {
+                    "message_id": message_id,
+                    "chat": {"id": int(chat_id)},
+                },
+            }
+        })
+    }
+
+
 @mock_aws
 class TestRouter:
     """End-to-end tests for job-router."""
@@ -771,7 +787,12 @@ class TestRouter:
         assert "explain 1" in msg
         assert "list" in msg
         assert "apply" in msg
-        assert "Flow" in msg
+        assert "The quickest path" in msg
+        keyboard = mock_tg.call_args.kwargs["reply_markup"]["inline_keyboard"]
+        assert keyboard[0][0]["text"] == "Home"
+        assert keyboard[0][2]["text"] == "Review"
+        assert keyboard[2][0]["text"] == "Search"
+        assert keyboard[2][1]["text"] == "List"
 
     @patch("job_router.lambda_function._send_telegram")
     def test_help_command_with_send_enabled_shows_confirm_send(self, mock_tg):
@@ -783,9 +804,39 @@ class TestRouter:
         event = _make_telegram_event("help")
         mod.lambda_handler(event, MockContext())
 
-        msg = mock_tg.call_args[0][2]
-        assert "send 1: prepare email send confirmation" in msg
-        assert "confirm send 1: send after review" in msg
+        keyboard = mock_tg.call_args.kwargs["reply_markup"]["inline_keyboard"]
+        assert keyboard[1][1]["text"] == "Send"
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._edit_telegram_message")
+    def test_help_callback_switches_to_review_page(self, mock_edit, mock_answer):
+        """Breadcrumb buttons should edit the help message in place."""
+        mod, table = self._setup_infra()
+        mock_edit.return_value = True
+        mock_answer.return_value = True
+
+        event = _make_callback_event("help:review")
+        mod.lambda_handler(event, MockContext())
+
+        assert mock_edit.called
+        text = mock_edit.call_args.args[3]
+        markup = mock_edit.call_args.kwargs["reply_markup"]
+        assert "Home › Review" in text
+        assert markup["inline_keyboard"][0][2]["text"] == "Review"
+        mock_answer.assert_called_once()
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._handle_list")
+    def test_callback_command_runs_list(self, mock_list, mock_answer):
+        """Inline command shortcuts should route to normal command handlers."""
+        mod, table = self._setup_infra()
+        mock_answer.return_value = True
+
+        event = _make_callback_event("cmd:list")
+        mod.lambda_handler(event, MockContext())
+
+        mock_list.assert_called_once()
+        mock_answer.assert_called_once()
 
     @patch("job_router.lambda_function._send_telegram")
     def test_apply_n_gives_specific_correction(self, mock_tg):

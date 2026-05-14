@@ -18,6 +18,7 @@ import boto3
 from decimal import Decimal
 from moto import mock_aws
 from unittest.mock import patch, MagicMock
+from botocore.exceptions import ClientError
 from conftest import SAMPLE_JOB, MockContext, make_sqs_event
 
 
@@ -82,12 +83,13 @@ class TestSender:
                 "Anthropic's role points at reliable RAG evaluation and agent workflows. "
                 "My recent agent work is close to that: retrieve evidence, score results, "
                 "and keep a human approval step before action.\n\n"
-                "RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ) handles "
-                "multi-step financial reasoning, and Rivulet (https://rivulet.info) "
-                "handles tool orchestration with human oversight.\n\n"
-                "I am fully open to all locations and am ready to relocate or be onsite.\n\n"
+                "RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ) is a retirement "
+                "planning and financial decision support app, and Rivulet "
+                "(https://rivulet.info) is a personal life management app.\n\n"
+                "I am currently based in Wichita, Kansas, and I am open to remote, hybrid, "
+                "or onsite roles in any location, including relocation.\n\n"
                 "Would 20 minutes this week work to connect?\n\n"
-                "Best,\nTeja Gopal Reddy Vaka\nSenior AI Engineer"
+                "Best,\nTeja Gopal Reddy Vaka\nAI Engineer"
             )
         return {
             "output": {
@@ -141,6 +143,31 @@ class TestSender:
         assert result["email"]["subject"] == "AI outbound agent role"
         mock_creds.assert_not_called()
         mock_resume.assert_not_called()
+
+    @patch("job_sender.lambda_function.time.sleep")
+    @patch("job_sender.lambda_function.bedrock_client")
+    def test_preview_only_falls_back_on_bedrock_throttle(self, mock_bedrock, mock_sleep):
+        """Preview mode should return a deterministic fallback draft on Bedrock throttling."""
+        mod, table = self._setup_infra()
+        mock_bedrock.converse.side_effect = ClientError(
+            {
+                "Error": {
+                    "Code": "ThrottlingException",
+                    "Message": "Too many requests",
+                }
+            },
+            "Converse",
+        )
+
+        result = mod.lambda_handler({"preview_only": True, "job": SAMPLE_JOB}, MockContext())
+
+        assert result["status"] == "preview"
+        assert result["generated_with_fallback"] is True
+        assert "role at Anthropic" in result["email"]["subject"]
+        assert "RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ)" in result["email"]["body"]
+        assert "Rivulet (https://rivulet.info)" not in result["email"]["body"]
+        assert "If this looks relevant, would 20 minutes this week work to connect?" in result["email"]["body"]
+        assert mock_sleep.call_count == mod.BEDROCK_THROTTLE_RETRIES
 
     @patch("job_sender.lambda_function._send_via_smtp")
     @patch("job_sender.lambda_function._get_credentials")
@@ -251,7 +278,7 @@ class TestSender:
         assert "Hi Engineering Square Team," not in msg
 
     def test_greeting_ignores_generic_recipient_email(self):
-        """Generic inboxes should still fall back to company team."""
+        """Careers inboxes should use a hiring-team greeting."""
         import job_sender.lambda_function as mod
         mod, _ = self._setup_infra()
 
@@ -262,7 +289,38 @@ class TestSender:
             "recruiter_email": "careers@engineeringsquare.us",
         }
         msg = mod._build_user_message(job)
-        assert "GREETING TO USE: Hi Engineering Square Team," in msg
+        assert "GREETING TO USE: Hi Engineering Square hiring team," in msg
+
+    def test_greeting_treats_founders_inbox_as_generic(self):
+        """founders@ inboxes without a named founder should not use 'Hi Founders'."""
+        import job_sender.lambda_function as mod
+        mod, _ = self._setup_infra()
+
+        job = {
+            **SAMPLE_JOB,
+            "company": "Hyperspell",
+            "recruiter_name": "",
+            "recruiter_email": "founders@hyperspell.com",
+            "description": "Hyperspell is building context and memory for AI agents.",
+        }
+        msg = mod._build_user_message(job)
+        assert "GREETING TO USE: Hi Hyperspell Team," in msg
+        assert "GREETING TO USE: Hi Founders," not in msg
+
+    def test_founder_name_is_extracted_from_description(self):
+        """Founder descriptions should produce a named greeting when possible."""
+        import job_sender.lambda_function as mod
+        mod, _ = self._setup_infra()
+
+        job = {
+            **SAMPLE_JOB,
+            "company": "Hyperspell",
+            "recruiter_name": "",
+            "recruiter_email": "founders@hyperspell.com",
+            "description": "I'm Manu, founder of Hyperspell. We are building context and memory for AI agents.",
+        }
+        msg = mod._build_user_message(job)
+        assert "GREETING TO USE: Hi Manu," in msg
 
     def test_greeting_generic_fallback(self):
         """Greeting should use 'Hi there' when no name or company."""
@@ -281,7 +339,7 @@ class TestSender:
         job = {**SAMPLE_JOB, "recruiter_name": "Hiring Manager"}
         msg = mod._build_user_message(job)
         # Should fall back to company, not use "Hi Hiring,"
-        assert "Hi Anthropic Team," in msg
+        assert "Hi Anthropic hiring team," in msg
 
     @patch("job_sender.lambda_function.bedrock_client")
     def test_generated_body_greeting_is_enforced_from_email(self, mock_bedrock):
@@ -306,7 +364,7 @@ class TestSender:
 
     @patch("job_sender.lambda_function.bedrock_client")
     def test_generated_body_rejects_robotic_or_unsupported_claims(self, mock_bedrock):
-        """Robotic cover-letter language should fail before SMTP can send it."""
+        """Robotic model output should be normalized into the deterministic final structure."""
         import job_sender.lambda_function as mod
         mod, _ = self._setup_infra()
         mock_bedrock.converse.return_value = self._mock_bedrock_email_response(
@@ -325,8 +383,147 @@ class TestSender:
             "recruiter_email": "saikumar@engineeringsquare.us",
         }
 
-        with pytest.raises(ValueError, match="quality gate"):
-            mod._generate_email(job)
+        email = mod._generate_email(job)
+
+        assert email["body"].startswith("Hi Sai,")
+        assert "at Empower" not in email["body"]
+        assert "shipping fast with ownership" not in email["body"]
+        assert "resonates" not in email["body"]
+        assert "Engineering Square stood out to me because the role is centered on Python, PyTorch, and RAG systems" in email["body"]
+        assert "RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ)" in email["body"]
+        assert "Rivulet (https://rivulet.info)" not in email["body"]
+
+    @patch("job_sender.lambda_function.bedrock_client")
+    def test_generated_body_does_not_preserve_old_style_project_claims(self, mock_bedrock):
+        """The final email should not keep stale project narration from the model body."""
+        import job_sender.lambda_function as mod
+        mod, _ = self._setup_infra()
+        mock_bedrock.converse.return_value = self._mock_bedrock_email_response(
+            subject="AI Engineer for Hyperspell Agentic Systems",
+            body=(
+                "Hi Founders,\n\n"
+                "Building context and memory for AI agents requires solid orchestration and evaluation infrastructure. "
+                "I've spent the last months working on agentic systems that reduce operational overhead, and I'm interested in how Hyperspell is approaching this problem at scale.\n\n"
+                "I've built RetireIQ, a financial decision support app that uses LLM orchestration to handle complex user queries, "
+                "and Rivulet, a personal life management system that coordinates multiple agent workflows.\n\n"
+                "Best,\nTeja"
+            ),
+        )
+        job = {
+            **SAMPLE_JOB,
+            "company": "Hyperspell",
+            "recruiter_name": "",
+            "recruiter_email": "founders@hyperspell.com",
+            "description": "Hyperspell is building context and memory for AI agents.",
+        }
+
+        email = mod._generate_email(job)
+
+        assert email["body"].startswith("Hi Hyperspell Team,")
+        assert "Hi Founders," not in email["body"]
+        assert "I've spent the last months" not in email["body"]
+        assert "I'm interested in how" not in email["body"]
+        assert "at scale" not in email["body"]
+        assert "personal life management system that coordinates multiple agent workflows" not in email["body"]
+        assert "Hyperspell stood out to me because the role is centered on context and memory for AI agents" in email["body"]
+        assert "private autonomous AI outreach agent" in email["body"]
+        assert "RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ)" not in email["body"]
+        assert "Rivulet (https://rivulet.info)" not in email["body"]
+
+    @patch("job_sender.lambda_function.bedrock_client")
+    def test_founder_mode_uses_named_greeting_and_founder_cta(self, mock_bedrock):
+        """Founder contact should sound like a direct note, not a hiring-team template."""
+        import job_sender.lambda_function as mod
+        mod, _ = self._setup_infra()
+        mock_bedrock.converse.return_value = self._mock_bedrock_email_response(
+            subject="AI Engineer at Hyperspell",
+            body="Hi Manu,\n\nHyperspell is building context and memory for AI agents.\n\nBest,\nTeja",
+        )
+        job = {
+            **SAMPLE_JOB,
+            "company": "Hyperspell",
+            "recruiter_name": "",
+            "recruiter_email": "founders@hyperspell.com",
+            "description": "I'm Manu, founder of Hyperspell. We are building context and memory for AI agents.",
+        }
+
+        email = mod._generate_email(job)
+
+        assert email["body"].startswith("Hi Manu,")
+        assert "If this seems relevant, would 20 minutes this week work to connect?" in email["body"]
+
+    @patch("job_sender.lambda_function.bedrock_client")
+    def test_careers_mode_uses_hiring_team_greeting_and_cta(self, mock_bedrock):
+        """Careers route should sound role-focused rather than founder-directed."""
+        import job_sender.lambda_function as mod
+        mod, _ = self._setup_infra()
+        mock_bedrock.converse.return_value = self._mock_bedrock_email_response(
+            subject="AI Engineer application",
+            body="Hi Engineering Square hiring team,\n\nEngineering Square's AI Engineer role looks close to the practical AI product work I want to keep doing.\n\nBest,\nTeja",
+        )
+        job = {
+            **SAMPLE_JOB,
+            "company": "Engineering Square",
+            "recruiter_name": "",
+            "recruiter_email": "careers@engineeringsquare.us",
+            "apply_url": "https://jobs.ashbyhq.com/engineeringsquare",
+        }
+
+        email = mod._generate_email(job)
+
+        assert email["body"].startswith("Hi Engineering Square hiring team,")
+        assert "If the role is still open, would 20 minutes this week work to connect?" in email["body"]
+
+    def test_source_evidence_fragment_prefers_linked_page_excerpt(self):
+        """Linked page content should drive the deterministic opener when available."""
+        import job_sender.lambda_function as mod
+        mod, _ = self._setup_infra()
+
+        job = {
+            **SAMPLE_JOB,
+            "company": "Cora AI",
+            "title": "Applied AI Engineer",
+            "description": "Generic application text.",
+            "linked_page_excerpt": (
+                "Customer success agents and account intelligence layer that actually do the manual work "
+                "so customers can focus on relationship-driven work."
+            ),
+        }
+
+        opening = mod._deterministic_opening(job)
+
+        assert opening == (
+            "Cora AI stood out to me because the role is centered on customer success agents and account intelligence, "
+            "which is close to the kind of applied AI work I want to keep doing."
+        )
+
+    def test_source_fragment_compression_shortens_long_hn_style_text(self):
+        """Long source excerpts should compress to a short evidence phrase."""
+        import job_sender.lambda_function as mod
+        mod, _ = self._setup_infra()
+
+        fragment = mod._compress_source_fragment(
+            "Customer success agents and account intelligence layer that actually do the manual work so customers can focus on relationship-driven work."
+        )
+
+        assert fragment == "customer success agents and account intelligence"
+
+    def test_select_project_line_chooses_private_agent_for_agent_system_roles(self):
+        """Agentic and eval-heavy roles should map to the private outreach system, not a two-project dump."""
+        import job_sender.lambda_function as mod
+        mod, _ = self._setup_infra()
+
+        job = {
+            **SAMPLE_JOB,
+            "description": "Work on voice agents, knowledge graphs, multi-agent systems, evals, and automation.",
+            "linked_page_excerpt": "Voice agents, knowledge graphs, and multi-agent systems.",
+        }
+
+        project_line = mod._select_project_line(job)
+
+        assert "private autonomous AI outreach agent" in project_line
+        assert "RetireIQ" not in project_line
+        assert "Rivulet" not in project_line
 
     def test_decimal_deserialization(self):
         """DynamoDB Decimal values in job payload should not crash."""

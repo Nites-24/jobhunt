@@ -215,22 +215,192 @@ def _get_secrets() -> dict:
     return _cached_secrets
 
 
-def _send_telegram(bot_token: str, chat_id: str, text: str, parse_mode: str = None) -> bool:
-    """Send a Telegram message. Returns True on success."""
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-
-    data = urllib.parse.urlencode(payload).encode("utf-8")
+def _telegram_request(bot_token: str, method: str, payload: dict) -> bool:
+    """Send a Telegram Bot API request and return whether it succeeded."""
+    url = f"https://api.telegram.org/bot{bot_token}/{method}"
+    encoded_payload = {
+        key: json.dumps(value) if isinstance(value, (dict, list)) else value
+        for key, value in payload.items()
+        if value is not None
+    }
+    data = urllib.parse.urlencode(encoded_payload).encode("utf-8")
     req = urllib.request.Request(url, data=data)
     try:
         with urllib.request.urlopen(req, timeout=10) as response:
             result = json.loads(response.read().decode())
             return result.get("ok", False)
     except Exception as e:
-        logger.error("TELEGRAM_SEND_ERROR: %s", str(e))
+        logger.error("TELEGRAM_%s_ERROR: %s", method.upper(), str(e))
         return False
+
+
+def _send_telegram(
+    bot_token: str,
+    chat_id: str,
+    text: str,
+    parse_mode: str = None,
+    reply_markup: dict | None = None,
+) -> bool:
+    """Send a Telegram message. Returns True on success."""
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return _telegram_request(bot_token, "sendMessage", payload)
+
+
+def _edit_telegram_message(
+    bot_token: str,
+    chat_id: str,
+    message_id: int,
+    text: str,
+    parse_mode: str = None,
+    reply_markup: dict | None = None,
+) -> bool:
+    """Edit an existing Telegram message."""
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return _telegram_request(bot_token, "editMessageText", payload)
+
+
+def _answer_callback_query(bot_token: str, callback_query_id: str, text: str | None = None) -> bool:
+    """Acknowledge a Telegram callback query to clear button loading state."""
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    return _telegram_request(bot_token, "answerCallbackQuery", payload)
+
+
+def _build_help_keyboard() -> dict:
+    """Small reply keyboard for the most common navigation actions."""
+    return {
+        "keyboard": [
+            [{"text": "search jobs"}, {"text": "list"}, {"text": "status"}],
+            [{"text": "draft 1"}, {"text": "apply 1"}, {"text": "followups"}],
+            [{"text": "signal test"}, {"text": "help"}],
+        ],
+        "resize_keyboard": True,
+        "input_field_placeholder": "Type a command or tap an action",
+    }
+
+
+def _help_page(page: str) -> tuple[str, dict]:
+    """Build a breadcrumb-style help page with inline navigation."""
+    page_key = page if page in {"home", "start", "review", "followup", "send", "tools"} else "home"
+
+    pages = {
+        "home": [
+            "⌂ JobAlert",
+            "Home",
+            "",
+            "The quickest path:",
+            "search jobs -> list -> explain 1 -> draft 1 -> interested 1 -> apply 1 -> applied",
+            "",
+            "Tap a section below or run a command directly.",
+        ],
+        "start": [
+            "⌂ JobAlert",
+            "Home › Start",
+            "",
+            "Core commands",
+            "• search jobs  Scan live sources",
+            f"• list  Review fresh {SCORE_THRESHOLD}%+ matches",
+            "• status  Check queue counts and source evidence",
+        ],
+        "review": [
+            "⌂ JobAlert",
+            "Home › Review",
+            "",
+            "Review commands",
+            "• explain 1  Why match #1 scored well",
+            "• draft 1  Preview outreach",
+            "• interested 1  Save positive feedback",
+            "• meh 1 <reason>  Save neutral feedback",
+            "• not interested 1 <reason>  Remove and teach why",
+            "• reject 1  Remove match #1 from the queue",
+        ],
+        "followup": [
+            "⌂ JobAlert",
+            "Home › Follow-up",
+            "",
+            "Follow-up commands",
+            "• apply 1  Show source and contact for manual follow-up",
+            "• followups  Roles waiting for your real outcome",
+            "• applied  Mark the latest manual follow-up as applied",
+            "• not applied <reason>  Mark the latest manual follow-up as skipped",
+        ],
+        "send": [
+            "⌂ JobAlert",
+            "Home › Send",
+            "",
+            "Send commands",
+            "• send 1  Prepare email send confirmation",
+            "• confirm send 1  Send after review",
+            "",
+            "Real sending is shown only when Telegram send is enabled.",
+        ],
+        "tools": [
+            "⌂ JobAlert",
+            "Home › Tools",
+            "",
+            "Tool commands",
+            "• signal test  Run one synthetic live alert",
+            "• help  Return to this command center",
+        ],
+    }
+
+    action_rows = {
+        "home": [
+            [{"text": "Search", "callback_data": "cmd:search jobs"}, {"text": "List", "callback_data": "cmd:list"}],
+            [{"text": "Status", "callback_data": "cmd:status"}, {"text": "Signal Test", "callback_data": "cmd:signal test"}],
+        ],
+        "start": [
+            [{"text": "Search Jobs", "callback_data": "cmd:search jobs"}],
+            [{"text": "List", "callback_data": "cmd:list"}, {"text": "Status", "callback_data": "cmd:status"}],
+        ],
+        "review": [
+            [{"text": "Explain 1", "callback_data": "cmd:explain 1"}, {"text": "Draft 1", "callback_data": "cmd:draft 1"}],
+            [{"text": "Interested 1", "callback_data": "cmd:interested 1"}],
+            [{"text": "Meh 1", "callback_data": "cmd:meh 1 no reason provided"}],
+        ],
+        "followup": [
+            [{"text": "Apply 1", "callback_data": "cmd:apply 1"}, {"text": "Followups", "callback_data": "cmd:followups"}],
+            [{"text": "Applied", "callback_data": "cmd:applied"}],
+        ],
+        "send": [
+            [{"text": "Send 1", "callback_data": "cmd:send 1"}, {"text": "Confirm Send 1", "callback_data": "cmd:confirm send 1"}],
+        ],
+        "tools": [
+            [{"text": "Signal Test", "callback_data": "cmd:signal test"}],
+            [{"text": "Help Home", "callback_data": "help:home"}],
+        ],
+    }
+
+    nav_rows = [
+        [
+            {"text": "Home", "callback_data": "help:home"},
+            {"text": "Start", "callback_data": "help:start"},
+            {"text": "Review", "callback_data": "help:review"},
+        ],
+        [
+            {"text": "Follow-up", "callback_data": "help:followup"},
+            {"text": "Send", "callback_data": "help:send"},
+            {"text": "Tools", "callback_data": "help:tools"},
+        ],
+    ]
+
+    if not ALLOW_TELEGRAM_EMAIL_SEND:
+        nav_rows[1] = [button for button in nav_rows[1] if button["callback_data"] != "help:send"]
+        if page_key == "send":
+            page_key = "home"
+
+    text = "\n".join(pages[page_key])
+    keyboard = {"inline_keyboard": nav_rows + action_rows[page_key]}
+    return text, keyboard
 
 
 def _get_pending_jobs(limit: int = 10) -> list:
@@ -1114,52 +1284,19 @@ def _handle_status(bot_token: str, chat_id: str) -> None:
 
 def _handle_help(bot_token: str, chat_id: str) -> None:
     """Show available commands."""
-    lines = [
-        "JobAlert",
-        "",
-        "Start",
-        "search jobs: scan live sources",
-        f"list: review fresh {SCORE_THRESHOLD}%+ matches",
-        "status: check queue counts and source evidence",
-        "",
-        "Review a match",
-        "explain 1: why match #1 scored well",
-        "draft 1: preview outreach",
-        "interested 1: teach the agent this role fits your taste",
-        "meh 1 <reason>: save neutral feedback without removing it",
-        "not interested 1 <reason>: remove and teach why",
-        "apply 1: show source and contact for manual follow-up",
-        "followups: show roles waiting for your real outcome",
-        "applied: mark the latest manual follow-up as applied",
-        "not applied <reason>: mark the latest manual follow-up as skipped",
-        "reject 1: remove match #1 from the queue",
-    ]
+    text, inline_keyboard = _help_page("home")
+    _send_telegram(
+        bot_token,
+        chat_id,
+        text,
+        reply_markup=inline_keyboard,
+    )
 
-    if ALLOW_TELEGRAM_EMAIL_SEND:
-        lines.extend([
-            "",
-            "Send",
-            "send 1: prepare email send confirmation",
-            "confirm send 1: send after review",
-        ])
 
-    if ENABLE_PRACTICE_MODE:
-        lines.extend([
-            "",
-            "Practice",
-            "tejajob: add one practice opportunity",
-        ])
-
-    lines.extend([
-        "",
-        "Tools",
-        "signal test: run one synthetic live alert",
-        "help: show this message",
-        "",
-        "Flow",
-        "search jobs -> list -> explain 1 -> draft 1 -> interested 1 -> apply 1 -> applied",
-    ])
-    _send_telegram(bot_token, chat_id, "\n".join(lines))
+def _handle_help_callback(bot_token: str, chat_id: str, message_id: int, page: str) -> None:
+    """Edit the help message to the selected breadcrumb page."""
+    text, keyboard = _help_page(page)
+    _edit_telegram_message(bot_token, chat_id, message_id, text, reply_markup=keyboard)
 
 
 APPLY_PATTERN = re.compile(r"^apply\s*(\d+)?$", re.IGNORECASE)
@@ -1304,6 +1441,23 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
     _handle_help(bot_token, chat_id)
 
 
+def _handle_callback_command(bot_token: str, chat_id: str, callback_query_id: str, data: str, message_id: int) -> None:
+    """Handle Telegram inline button callbacks for help navigation and command shortcuts."""
+    if data.startswith("help:"):
+        page = data.split(":", 1)[1]
+        _handle_help_callback(bot_token, chat_id, message_id, page)
+        _answer_callback_query(bot_token, callback_query_id)
+        return
+
+    if data.startswith("cmd:"):
+        command = data.split(":", 1)[1]
+        _answer_callback_query(bot_token, callback_query_id, f"Running {command}")
+        _route_command(command, bot_token, chat_id)
+        return
+
+    _answer_callback_query(bot_token, callback_query_id, "Unknown action")
+
+
 def lambda_handler(event, context):
     """
     Entry point for both SNS notifications and Telegram webhook commands.
@@ -1331,6 +1485,23 @@ def lambda_handler(event, context):
     if "body" in event:
         try:
             body = json.loads(event["body"]) if isinstance(event["body"], str) else event["body"]
+            callback_query = body.get("callback_query")
+            if callback_query:
+                data = callback_query.get("data", "")
+                callback_query_id = callback_query.get("id", "")
+                message = callback_query.get("message", {})
+                incoming_chat_id = str(message.get("chat", {}).get("id", ""))
+                message_id = _as_int(message.get("message_id"))
+
+                if incoming_chat_id != str(chat_id):
+                    logger.warning("UNAUTHORIZED_CALLBACK_CHAT: %s (expected %s)", incoming_chat_id, chat_id)
+                    return {"statusCode": 200, "body": "Unauthorized"}
+
+                if data and callback_query_id and message_id:
+                    logger.info("TELEGRAM_CALLBACK: '%s' from chat %s", data, incoming_chat_id)
+                    _handle_callback_command(bot_token, chat_id, callback_query_id, data, message_id)
+                return {"statusCode": 200}
+
             message = body.get("message", {})
             user_text = message.get("text", "").strip()
             incoming_chat_id = str(message.get("chat", {}).get("id", ""))

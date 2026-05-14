@@ -175,6 +175,15 @@ Recommended first implementation:
 - Use feedback to create eval cases and deterministic rules first.
 - Only after enough examples exist should scoring or drafting prompts be tuned.
 
+Current implementation:
+
+- `tools/ops/export_feedback.py` exports Telegram feedback rows into eval-ready
+  JSON or JSONL so production decisions can be reviewed offline before changing
+  prompts or rules.
+- `tools/ops/feedback_summary.py` turns exported or live feedback into compact
+  summaries by label, stage, source, and top reasons so preference patterns are
+  visible before changing behavior.
+
 Feedback is training data for future evals and rules. It is not permission for
 an agent to auto-change production prompts after one thumbs-down.
 
