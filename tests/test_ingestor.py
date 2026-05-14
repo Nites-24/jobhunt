@@ -15,7 +15,7 @@ def _mock_response(payload):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def read(self):
+        def read(self, *_args):
             return json.dumps(payload).encode("utf-8")
 
     return Response()
@@ -79,6 +79,8 @@ class TestIngestor:
         assert bodies[0]["location"] == "San Francisco"
         assert bodies[0]["source"] == "hackernews"
         assert bodies[0]["recruiter_email"] == "real@anthropic.com"
+        assert bodies[0]["work_mode"] == "onsite"
+        assert bodies[0]["work_mode_source"] == "description"
         assert bodies[1]["title"] == "ML Engineer"
         assert bodies[1]["company"] == "DeepInfra"
 
@@ -98,6 +100,8 @@ class TestIngestor:
         assert parsed["company"] == "Hyperspell"
         assert parsed["title"] == "AI Engineer"
         assert parsed["location"] == "San Francisco, ONSITE"
+        assert parsed["work_mode"] == "onsite"
+        assert parsed["work_mode_source"] == "location"
         assert parsed["url"] == "https://news.ycombinator.com/item?id=47980487"
         assert parsed["source_provider"] == "Hacker News Firebase API"
 
@@ -140,6 +144,7 @@ class TestIngestor:
         assert job["source_origin"] == "Company Careers"
         assert job["url"] == "https://company.example/jobs/ai-agent-engineer"
         assert job["location"] == "South San Francisco, CA"
+        assert job["work_mode"] == ""
 
     def test_google_cse_normalization_preserves_source_evidence(self):
         mod, _, _ = self._setup_infra()
@@ -156,6 +161,8 @@ class TestIngestor:
         assert job["source_origin"] == "boards.greenhouse.io"
         assert job["url"] == "https://boards.greenhouse.io/exampleai/jobs/123"
         assert job["title"] == "AI Engineer"
+        assert job["location"] == "San Francisco"
+        assert job["work_mode"] == ""
 
     def test_adzuna_normalization_preserves_source_evidence(self):
         mod, _, _ = self._setup_infra()
@@ -175,6 +182,7 @@ class TestIngestor:
         assert job["source_provider"] == "Adzuna Jobs API"
         assert job["url"] == "https://www.adzuna.com/details/adz-1"
         assert job["title"] == "LLM Engineer"
+        assert job["work_mode"] == ""
 
     @patch("urllib.request.urlopen")
     def test_empty_when_no_thread_found(self, mock_urlopen):
@@ -195,3 +203,84 @@ class TestIngestor:
         desc = "Apply at hr@company.com or noreply@test.com. Real contact: teja@deepmind.com"
         email = mod._extract_email_from_description(desc)
         assert email == "teja@deepmind.com"
+
+    def test_hn_parser_extracts_obfuscated_email_and_author_contact(self):
+        mod, _, _ = self._setup_infra()
+
+        parsed = mod._parse_hn_comment({
+            "id": 47990001,
+            "by": "jesalg",
+            "time": 1778500000,
+            "text": (
+                "Cora AI | Full Stack / Applied AI Engineer | REMOTE (US ONLY, LA or SF a plus)<br>"
+                "Customer success agents and account intelligence layer that actually do manual work. "
+                "Work on voice agents, knowledge graphs, multi-agent systems, evals, and simulations. "
+                "Learn more: https://www.cora.ai/<br>"
+                "Interested? Email careers [at] cora.ai - these go straight to me, and I read every one."
+            ),
+        })
+
+        assert parsed["company"] == "Cora AI"
+        assert parsed["title"] == "Full Stack / Applied AI Engineer"
+        assert parsed["recruiter_email"] == "careers@cora.ai"
+        assert parsed["recruiter_name"] == "Jesal"
+        assert parsed["recruiter_name_source"] == "hn_author"
+        assert parsed["source_author"] == "jesalg"
+        assert parsed["external_links"] == ["https://www.cora.ai/"]
+        assert parsed["source_grounding"] == "hn_comment"
+
+    @patch("urllib.request.urlopen")
+    def test_hn_ingestion_enriches_from_linked_page(self, mock_urlopen):
+        mod, sqs, queue_url = self._setup_infra()
+        mod.HN_LINK_ENRICHMENT_ENABLED = True
+        mod.HN_MAX_LINK_ENRICHMENTS = 5
+
+        mock_urlopen.side_effect = [
+            _mock_response({"submitted": [1000]}),
+            _mock_response({"id": 1000, "title": "Ask HN: Who is hiring? (May 2026)"}),
+            _mock_response({"kids": [2001]}),
+            _mock_response({
+                "id": 2001,
+                "by": "jesalg",
+                "time": 1778500000,
+                "text": (
+                    "Cora AI | Full Stack / Applied AI Engineer | REMOTE<br>"
+                    "Build AI agents for customer success. Learn more: https://www.cora.ai/"
+                ),
+            }),
+            _mock_response({
+                "html": (
+                    "<html><head><title>Cora AI</title></head><body>"
+                    "Cora builds customer success agents, account intelligence, voice agents, "
+                    "knowledge graphs, multi-agent systems, evals, and simulations. "
+                    "Email careers [at] cora.ai."
+                    "</body></html>"
+                )
+            }),
+        ]
+
+        result = mod.lambda_handler({}, MockContext())
+
+        assert result["status"] == "success"
+        msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
+        body = json.loads(msgs["Messages"][0]["Body"])
+        assert body["source_grounding"] == "hn_comment+linked_page"
+        assert body["linked_page_url"] == "https://www.cora.ai/"
+        assert "customer success agents" in body["linked_page_excerpt"]
+        assert "Linked page context" in body["description"]
+        assert body["recruiter_email"] == "careers@cora.ai"
+
+    def test_signal_test_seed_queues_one_job(self):
+        mod, sqs, queue_url = self._setup_infra()
+
+        result = mod.lambda_handler({"seed_signal_test": True}, MockContext())
+
+        assert result["status"] == "success"
+        assert result["jobs_fetched"] == 1
+        assert result["jobs_queued"] == 1
+
+        msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
+        body = json.loads(msgs["Messages"][0]["Body"])
+        assert body["source"] == "signal_test"
+        assert body["signal_test"] is True
+        assert body["work_mode"] == "onsite"

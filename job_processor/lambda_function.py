@@ -2,7 +2,7 @@
 Job Processor Lambda — Unified Scorer (v2.0)
 Merges job-processor + job-evaluator into a single scoring brain.
 
-Pipeline: SQS (filtered-jobs) → Score via Bedrock → DynamoDB update → SNS alert (90%+)
+Pipeline: SQS (filtered-jobs) → Score via Bedrock → DynamoDB update → SNS alert (80%+)
 
 Uses:
   - Bedrock Converse API with forced tool-calling for deterministic JSON output
@@ -47,11 +47,13 @@ TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "Jobsearch")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "job-search-pipeline-memory")
 RESUME_KEY = os.environ.get("RESUME_KEY", "data/resume/Teja_Vaka.txt")
-SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "90"))
+SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "80"))
+DEFAULT_EVAL_PROFILE_VERSION = f"2026-05-13-th{SCORE_THRESHOLD}"
+JOB_EVAL_PROFILE_VERSION = os.environ.get("JOB_EVAL_PROFILE_VERSION", DEFAULT_EVAL_PROFILE_VERSION)
 MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "14"))
+HN_MAX_JOB_AGE_DAYS = int(os.environ.get("HN_MAX_JOB_AGE_DAYS", "3"))
 STALE_SCORE_CAP = int(os.environ.get("STALE_SCORE_CAP", "55"))
 MISSING_DATE_SCORE_CAP = int(os.environ.get("MISSING_DATE_SCORE_CAP", "70"))
-REMOTE_SCORE_CAP = int(os.environ.get("REMOTE_SCORE_CAP", "80"))
 LOW_AI_SIGNAL_SCORE_CAP = int(os.environ.get("LOW_AI_SIGNAL_SCORE_CAP", "50"))
 MISSING_SOURCE_SCORE_CAP = int(os.environ.get("MISSING_SOURCE_SCORE_CAP", "40"))
 
@@ -73,13 +75,6 @@ NEGATED_AI_SIGNAL_PATTERN = re.compile(
     r"(ai|ml|llm|rag|nlp|machine learning|deep learning|generative ai|"
     r"machine-learning|language model|modeling)\b|"
     r"\bnon[-\s](ai|ml|llm|rag|nlp|machine learning|language model)\b",
-    re.IGNORECASE,
-)
-
-BAY_AREA_PATTERN = re.compile(
-    r"\b(san francisco|sf bay|bay area|south san francisco|ssf|san mateo|"
-    r"mountain view|palo alto|menlo park|redwood city|san jose|oakland|"
-    r"berkeley|fremont|sunnyvale|cupertino|santa clara)\b",
     re.IGNORECASE,
 )
 
@@ -125,11 +120,13 @@ def _build_context_from_s3() -> str:
         logger.warning("RESUME_MISSING: %s not found, using fallback", RESUME_KEY)
         parts.append(
             "<candidate_resume>\n"
-            "Teja Gopal Reddy Vaka — Senior AI Engineer\n"
+            "Teja Gopal Reddy Vaka — AI Engineer\n"
             "Specializing in RAG pipelines, LLM orchestration, agentic systems.\n"
             "Python, PyTorch, AWS, LangChain, vector databases.\n"
             "Achievements: 33% GPU cost reduction, 87% autonomous ticket resolution.\n"
-            "Projects: RetireIQ (HuggingFace), Rivulet (rivulet.info)\n"
+            "Projects: RetireIQ (retirement planning and financial decision support), "
+            "Rivulet (personal life management)\n"
+            "Location: currently Wichita, Kansas. Open to relocate and open to remote, hybrid, or onsite roles in any location.\n"
             "</candidate_resume>"
         )
 
@@ -186,10 +183,13 @@ def _build_candidate_graph_context() -> str:
     else:
         logger.warning("RESUME_MISSING: %s not found, using graph fallback", RESUME_KEY)
         raw_text_parts.append(
-            "Teja Gopal Reddy Vaka Senior AI Engineer specializing in RAG pipelines, "
+            "Teja Gopal Reddy Vaka AI Engineer specializing in RAG pipelines, "
             "LLM orchestration, agentic systems, Python, PyTorch, AWS, LangChain, "
             "vector databases. Achievements include 33% GPU cost reduction and 87% "
-            "autonomous ticket resolution. Projects include RetireIQ and Rivulet."
+            "autonomous ticket resolution. Projects include RetireIQ, a retirement planning "
+            "and financial decision support app, and Rivulet, a personal life management app. "
+            "The candidate is currently based in Wichita, Kansas, is open to relocate, "
+            "is open to remote, hybrid, or onsite roles in any location, and is a CPT student."
         )
 
     for folder in CONTEXT_FOLDERS:
@@ -230,20 +230,20 @@ def _build_candidate_graph_context() -> str:
 # ---------------------------------------------------------------------------
 SYSTEM_INSTRUCTION = (
     "You are an elite technical recruiter evaluating job-candidate fit.\n"
-    "The candidate is a Senior AI Engineer specializing in RAG, LLMs, agentic systems, "
+    "The candidate is an AI Engineer specializing in RAG, LLMs, agentic systems, "
     "Python, PyTorch, and AWS.\n\n"
     "SCORING CRITERIA (weight each equally):\n"
     "1. SKILL OVERLAP: How many required skills match the candidate's profile?\n"
-    "2. SENIORITY FIT: Does the role level match Senior/Staff/Lead AI Engineer?\n"
+    "2. SENIORITY FIT: Does the role level match an individual-contributor AI Engineer path, including AI Engineer, Applied AI Engineer, or ML Engineer?\n"
     "3. DOMAIN RELEVANCE: Is the domain (AI/ML/NLP/Data) aligned?\n"
     "4. TECH STACK: Does the tech stack overlap (Python, AWS, PyTorch, LLMs)?\n"
     "5. ROLE TYPE: Is this an IC engineering role (not pure management/sales)?\n\n"
     "CRITICAL GUARDRAILS:\n"
     "- FRESHNESS: If the job was posted more than 14 days ago, or if the date is missing/stale, "
     "reduce the final score by 30 points. We prioritize FRESH leads.\n"
-    "- LOCATION: The candidate prefers Onsite/Hybrid roles in South San Francisco or general SF Bay Area. "
-    "If the job is purely remote or in another country (e.g., Brazil, Colombia), reduce the score by 20 points "
-    "unless it is an exceptional match. Pure remote jobs should not score above 80.\n"
+    "- LOCATION: The candidate is currently based in Wichita, Kansas and is open to relocate. "
+    "Strong remote, hybrid, and onsite roles in any location should still score well. "
+    "Do not hard-penalize a strong AI role only because it is outside Kansas or requires relocation.\n"
     "- RELEVANCE: If the job is purely Frontend (React), Backend (Java/Kotlin), "
     "or generic Full Stack without heavy AI/LLM/ML focus, the score MUST be below 50.\n\n"
     "Score 0-100. Be extremely strict. Only true, fresh, local AI/ML/LLM roles should score 85+.\n\n"
@@ -375,6 +375,13 @@ def _job_age_days(job: Dict[str, Any], now: Optional[datetime] = None) -> Option
     return int(age_seconds // 86400)
 
 
+def _source_max_age_days(job: Dict[str, Any]) -> int:
+    source = str(job.get("source", "")).strip().lower()
+    if source in {"hackernews", "hn"}:
+        return HN_MAX_JOB_AGE_DAYS
+    return MAX_JOB_AGE_DAYS
+
+
 def _to_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -386,11 +393,6 @@ def _to_bool(value: Any) -> bool:
 def _is_remote_job(job: Dict[str, Any]) -> bool:
     location = str(job.get("location", ""))
     return _to_bool(job.get("is_remote")) or "remote" in location.lower()
-
-
-def _is_bay_area_location(job: Dict[str, Any]) -> bool:
-    location = str(job.get("location", ""))
-    return bool(BAY_AREA_PATTERN.search(location))
 
 
 def _has_ai_signal(job: Dict[str, Any]) -> bool:
@@ -423,13 +425,11 @@ def _apply_deterministic_guardrails(job: Dict[str, Any], score: int, reason: str
     caps: list[tuple[int, str]] = []
 
     age_days = _job_age_days(job)
+    max_age_days = _source_max_age_days(job)
     if age_days is None:
         caps.append((_blocking_score_cap(MISSING_DATE_SCORE_CAP), "missing posting date"))
-    elif age_days > MAX_JOB_AGE_DAYS:
-        caps.append((_blocking_score_cap(STALE_SCORE_CAP), f"posted {age_days} days ago"))
-
-    if _is_remote_job(job) and not _is_bay_area_location(job):
-        caps.append((_blocking_score_cap(REMOTE_SCORE_CAP), "remote-only or non-local role"))
+    elif age_days > max_age_days:
+        caps.append((_blocking_score_cap(STALE_SCORE_CAP), f"posted {age_days} days ago, source limit {max_age_days} days"))
 
     if not _has_ai_signal(job):
         caps.append((_blocking_score_cap(LOW_AI_SIGNAL_SCORE_CAP), "insufficient AI/ML signal"))
@@ -459,18 +459,16 @@ def _pre_llm_rejection(job: Dict[str, Any]) -> Optional[Tuple[int, str]]:
     Reject jobs before Bedrock when hard guardrails make approval impossible.
 
     This protects the live demo from burst throttling: a HN search can return 100+
-    keyword hits, but remote/stale/low-signal jobs can never reach the 90% queue.
+    keyword hits, but remote/stale/low-signal jobs can never reach the 80% queue.
     """
     rejection_caps: list[tuple[int, str]] = []
 
     age_days = _job_age_days(job)
+    max_age_days = _source_max_age_days(job)
     if age_days is None:
         rejection_caps.append((_blocking_score_cap(MISSING_DATE_SCORE_CAP), "missing posting date"))
-    elif age_days > MAX_JOB_AGE_DAYS:
-        rejection_caps.append((_blocking_score_cap(STALE_SCORE_CAP), f"posted {age_days} days ago"))
-
-    if _is_remote_job(job) and not _is_bay_area_location(job):
-        rejection_caps.append((_blocking_score_cap(REMOTE_SCORE_CAP), "remote-only or non-local role"))
+    elif age_days > max_age_days:
+        rejection_caps.append((_blocking_score_cap(STALE_SCORE_CAP), f"posted {age_days} days ago, source limit {max_age_days} days"))
 
     if not _has_ai_signal(job):
         rejection_caps.append((_blocking_score_cap(LOW_AI_SIGNAL_SCORE_CAP), "insufficient AI/ML signal"))
@@ -494,7 +492,7 @@ def _update_job_status(job_id: str, score: int, reason: str, status: str, email:
     try:
         update_expr = (
             "SET match_score = :ms, match_reason = :mr, #s = :st, "
-            "evaluated_at = :ea, model_id = :mid"
+            "evaluated_at = :ea, model_id = :mid, evaluation_profile_version = :epv"
         )
         expr_vals = {
             ":ms": score,
@@ -502,6 +500,7 @@ def _update_job_status(job_id: str, score: int, reason: str, status: str, email:
             ":st": status,
             ":ea": int(time.time()),
             ":mid": MODEL_ID,
+            ":epv": JOB_EVAL_PROFILE_VERSION,
         }
         
         if email:
@@ -531,7 +530,9 @@ def _send_match_notification(job: Dict[str, Any], score: int, reason: str) -> No
         f"━━━━━━━━━━━━━━━━━━\n\n"
         f"Company: {job.get('company', 'Unknown')}\n"
         f"Role: {job.get('title', 'Unknown')}\n"
-        f"Location: {job.get('location', 'Not specified')}\n\n"
+        f"Location: {job.get('location', 'Not specified')}\n"
+        f"Work mode: {job.get('work_mode', 'unknown') or 'unknown'}\n"
+        f"Work mode evidence: {job.get('work_mode_source', 'not found in source') or 'not found in source'}\n\n"
         f"AI Evaluation:\n{reason}\n\n"
         f"Apply: {job.get('url', 'N/A')}\n\n"
         f"Reply 'status' to audit source links, or 'list' to review matches."
@@ -615,18 +616,24 @@ def lambda_handler(event, context):
                 job_id, job.get("title"), job.get("company"),
             )
 
-            # Reject impossible matches before Bedrock to avoid burst throttling.
-            prefilter_result = _pre_llm_rejection(job)
-            if prefilter_result:
-                raw_score, raw_reason = prefilter_result
+            if job.get("signal_test"):
+                raw_score = 96
+                raw_reason = "Synthetic signal test seed routed through the live pipeline."
                 match_score, match_reason = raw_score, raw_reason
-                logger.info(
-                    "PREFILTER_REJECT | job_id=%s | score=%d | reason=%s",
-                    job_id, match_score, match_reason,
-                )
+                logger.info("SIGNAL_TEST_MATCH | job_id=%s | score=%d", job_id, match_score)
             else:
-                raw_score, raw_reason = evaluate_job(job, profile_context)
-                match_score, match_reason = _apply_deterministic_guardrails(job, raw_score, raw_reason)
+                # Reject impossible matches before Bedrock to avoid burst throttling.
+                prefilter_result = _pre_llm_rejection(job)
+                if prefilter_result:
+                    raw_score, raw_reason = prefilter_result
+                    match_score, match_reason = raw_score, raw_reason
+                    logger.info(
+                        "PREFILTER_REJECT | job_id=%s | score=%d | reason=%s",
+                        job_id, match_score, match_reason,
+                    )
+                else:
+                    raw_score, raw_reason = evaluate_job(job, profile_context)
+                    match_score, match_reason = _apply_deterministic_guardrails(job, raw_score, raw_reason)
             stats["evaluated"] += 1
 
             logger.info(

@@ -9,6 +9,7 @@ import logging
 import time
 import boto3
 import html
+from datetime import datetime, timezone
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -23,7 +24,7 @@ JSEARCH_QUERIES = [
     q.strip()
     for q in os.environ.get(
         "JSEARCH_QUERIES",
-        "AI Engineer San Francisco",
+        "AI Engineer,LLM Engineer,RAG Engineer,Machine Learning Engineer",
     ).split(",")
     if q.strip()
 ]
@@ -34,7 +35,7 @@ GOOGLE_CSE_QUERIES = [
     q.strip()
     for q in os.environ.get(
         "GOOGLE_CSE_QUERIES",
-        '("AI Engineer" OR "LLM Engineer" OR "RAG Engineer") ("San Francisco" OR "Bay Area") '
+        '("AI Engineer" OR "LLM Engineer" OR "RAG Engineer" OR "Machine Learning Engineer") '
         '(site:greenhouse.io OR site:lever.co OR site:ashbyhq.com OR site:workdayjobs.com OR site:jobs.ashbyhq.com)',
     ).split(";;")
     if q.strip()
@@ -47,9 +48,13 @@ ADZUNA_QUERIES = [
     for q in os.environ.get("ADZUNA_QUERIES", "AI Engineer;;LLM Engineer;;Machine Learning Engineer").split(";;")
     if q.strip()
 ]
-ADZUNA_WHERE = os.environ.get("ADZUNA_WHERE", "San Francisco")
+ADZUNA_WHERE = os.environ.get("ADZUNA_WHERE", "").strip()
 ADZUNA_MAX_DAYS_OLD = int(os.environ.get("ADZUNA_MAX_DAYS_OLD", "14"))
 HN_MAX_COMMENTS = int(os.environ.get("HN_MAX_COMMENTS", "800"))
+HN_LINK_ENRICHMENT_ENABLED = os.environ.get("HN_LINK_ENRICHMENT_ENABLED", "true").strip().lower() == "true"
+HN_MAX_LINK_ENRICHMENTS = int(os.environ.get("HN_MAX_LINK_ENRICHMENTS", "20"))
+HN_LINK_CONTEXT_CHARS = int(os.environ.get("HN_LINK_CONTEXT_CHARS", "1800"))
+HN_LINK_FETCH_TIMEOUT_SECONDS = int(os.environ.get("HN_LINK_FETCH_TIMEOUT_SECONDS", "4"))
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 URL_REGEX = re.compile(r'https?://[^\s"<>]+')
@@ -69,6 +74,7 @@ LOCATION_PATTERN = re.compile(
     r"boston|california|ca|us|usa)\b",
     re.IGNORECASE,
 )
+WORK_MODE_PATTERN = re.compile(r"\b(remote|hybrid|onsite|on-site)\b", re.IGNORECASE)
 NON_ROLE_SEGMENTS = re.compile(
     r"\b(yc\s*[swf]?\d{2}|seed|series\s+[abc]|venture|funded|salary|visa|h1b)\b",
     re.IGNORECASE,
@@ -78,9 +84,45 @@ _cached_jsearch_key = None
 _cached_secret_payloads: dict[str, dict] = {}
 SOURCE_ERRORS: list[dict[str, str]] = []
 
+GENERIC_EMAIL_LOCAL_PARTS = {
+    "admin", "apply", "careers", "contact", "hello", "hi", "hiring", "hr",
+    "info", "jobs", "recruiting", "support", "talent", "team",
+}
+NEVER_CONTACT_EMAIL_LOCAL_PARTS = {"noreply", "no-reply", "donotreply", "support", "info"}
+
 
 def _record_source_error(source: str, detail: str) -> None:
     SOURCE_ERRORS.append({"source": source, "detail": detail[:300]})
+
+
+def _build_signal_test_job() -> dict:
+    now = int(time.time())
+    posted_at = datetime.now(timezone.utc).isoformat()
+    return {
+        "job_id": f"signal_test_{now}",
+        "title": "AI Engineer Notification Test",
+        "company": "Signal Test AI",
+        "location": "Wichita, Kansas",
+        "description": (
+            "Synthetic end-to-end notification test for the live pipeline. "
+            "This AI Engineer role requires Python, AWS, LLM evaluation, RAG, "
+            "agent workflows, and production monitoring."
+        ),
+        "url": "https://example.com/signal-test-ai-engineer",
+        "apply_url": "https://example.com/signal-test-ai-engineer",
+        "source": "signal_test",
+        "source_provider": "Synthetic ingestion seed",
+        "source_origin": "Telegram signal test",
+        "salary": "$140,000 - $175,000",
+        "is_remote": False,
+        "work_mode": "onsite",
+        "work_mode_source": "location",
+        "employment_type": "FULL_TIME",
+        "posted_at": posted_at,
+        "recruiter_email": "",
+        "recruiter_name": "",
+        "signal_test": True,
+    }
 
 def _get_secret_payload(secret_name: str) -> dict:
     if not secret_name:
@@ -101,13 +143,56 @@ def _get_secret_payload(secret_name: str) -> dict:
     return payload
 
 
-def _extract_email_from_description(description: str) -> str:
-    if not description: return ""
-    matches = EMAIL_REGEX.findall(description)
-    skip_patterns = {"noreply", "no-reply", "donotreply", "support@", "info@", "jobs@", "careers@", "recruiting@", "hiring@", "apply@", "hr@"}
+def _normalize_obfuscated_emails(text: str) -> str:
+    """Turn common HN contact formats like careers [at] cora.ai into emails."""
+    if not text:
+        return ""
+
+    normalized = html.unescape(text)
+    normalized = re.sub(
+        r"([A-Za-z0-9._%+-]+)\s*(?:\[at\]|\(at\)|\sat\s)\s*([A-Za-z0-9.-]+\.[A-Za-z]{2,})",
+        r"\1@\2",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        r"([A-Za-z0-9._%+-]+)\s*@\s*([A-Za-z0-9.-]+)\s*(?:\[dot\]|\(dot\)|\sdot\s)\s*([A-Za-z]{2,})",
+        r"\1@\2.\3",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return normalized
+
+
+def _email_local_part(email: str) -> str:
+    return str(email or "").split("@", 1)[0].split("+", 1)[0].strip().lower()
+
+
+def _has_direct_hn_contact_signal(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return bool(re.search(
+        r"\b(straight to me|i read every one|i read all|email me|contact me|reach me|"
+        r"send me|i['’]?m|i am)\b",
+        lowered,
+    ))
+
+
+def _extract_email_from_description(description: str, allow_generic: bool = False) -> str:
+    if not description:
+        return ""
+    normalized = _normalize_obfuscated_emails(description)
+    matches = EMAIL_REGEX.findall(normalized)
+    fallback = ""
     for email in matches:
-        if not any(p in email.lower() for p in skip_patterns):
+        local = _email_local_part(email)
+        if local in NEVER_CONTACT_EMAIL_LOCAL_PARTS:
+            continue
+        if local not in GENERIC_EMAIL_LOCAL_PARTS:
             return email
+        if allow_generic and not fallback:
+            fallback = email
+    if fallback:
+        return fallback
     return ""
 
 def _clean_hn_text(raw_text: str) -> str:
@@ -130,6 +215,90 @@ def _extract_urls(raw_text: str) -> list[str]:
         if clean.startswith("http") and clean not in urls:
             urls.append(clean)
     return urls[:5]
+
+
+def _is_person_like_hn_author(author: str) -> bool:
+    raw = re.sub(r"[^A-Za-z]", "", author or "")
+    return 4 <= len(raw) <= 20
+
+
+def _name_from_hn_author(author: str) -> str:
+    raw = re.sub(r"[^A-Za-z]", "", author or "").strip()
+    if not _is_person_like_hn_author(raw):
+        return ""
+    if len(raw) >= 5 and raw[-1].lower() in {"g", "v", "s", "r"}:
+        raw = raw[:-1]
+    return raw[:1].upper() + raw[1:].lower()
+
+
+def _extract_hn_contact_name(text: str, author: str = "") -> tuple[str, str]:
+    patterns = [
+        r"\bI['’]?m\s+([A-Z][a-z]+)\s*,?\s*(?:the\s+)?(?:founder|cofounder|co-founder)\b",
+        r"\bI am\s+([A-Z][a-z]+)\s*,?\s*(?:the\s+)?(?:founder|cofounder|co-founder)\b",
+        r"\b([A-Z][a-z]+)\s+here\s*,?\s*(?:the\s+)?(?:founder|cofounder|co-founder)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text or "")
+        if match:
+            return match.group(1), "hn_text"
+    if author and _has_direct_hn_contact_signal(text):
+        inferred = _name_from_hn_author(author)
+        if inferred:
+            return inferred, "hn_author"
+    return "", ""
+
+
+def _clean_linked_page_text(raw_html: str) -> str:
+    text = re.sub(r"(?is)<(script|style|noscript|svg).*?</\1>", " ", raw_html or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _fetch_linked_page_context(url: str) -> str:
+    if not url.startswith(("http://", "https://")):
+        return ""
+    if "news.ycombinator.com" in urllib.parse.urlparse(url).netloc.lower():
+        return ""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "JobHuntBot/1.0 (+source-grounding)"},
+        )
+        with urllib.request.urlopen(req, timeout=HN_LINK_FETCH_TIMEOUT_SECONDS) as resp:
+            raw = resp.read()
+        if isinstance(raw, bytes):
+            raw = raw[:120000].decode("utf-8", errors="ignore")
+        clean = _clean_linked_page_text(raw)
+        return clean[:HN_LINK_CONTEXT_CHARS]
+    except Exception as e:
+        logger.info("HN_LINK_ENRICH_SKIP | url=%s | error=%s", url, str(e))
+        return ""
+
+
+def _enrich_hn_job_from_link(job: dict) -> bool:
+    urls = job.get("external_links") or []
+    if not urls:
+        return False
+    linked_url = urls[0]
+    context = _fetch_linked_page_context(linked_url)
+    if not context:
+        return False
+
+    job["linked_page_url"] = linked_url
+    job["linked_page_excerpt"] = context
+    job["source_grounding"] = "hn_comment+linked_page"
+    job["description"] = (
+        f"{job.get('description', '').strip()}\n\n"
+        f"Linked page context ({linked_url}):\n{context}"
+    ).strip()
+    if not job.get("recruiter_email"):
+        email = _extract_email_from_description(context, allow_generic=True)
+        if email:
+            job["recruiter_email"] = email
+            job["recruiter_email_source"] = "linked_page"
+    return True
 
 
 def _looks_like_role(segment: str) -> bool:
@@ -193,6 +362,34 @@ def _infer_title_from_text(text: str) -> str:
     return "Software Engineer"
 
 
+def _extract_work_mode(*texts: str) -> tuple[str, str]:
+    """Return source-backed work mode plus where it was found."""
+    for source_name, text in texts:
+        raw = str(text or "")
+        match = WORK_MODE_PATTERN.search(raw)
+        if not match:
+            continue
+        label = match.group(1).lower()
+        if label == "on-site":
+            label = "onsite"
+        return label, source_name
+    return "", ""
+
+
+def _extract_google_cse_location(title: str, snippet: str) -> str:
+    text = f"{title} {snippet}"
+    if re.search(r"\bremote\b", text, re.IGNORECASE):
+        return "Remote"
+    match = re.search(
+        r"\b(san francisco|sf bay area|bay area|south san francisco|new york|nyc|austin|seattle|boston)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1)
+    return "Not specified"
+
+
 def _parse_hn_comment(comment: dict) -> dict | None:
     raw_text = comment.get("text", "") or ""
     clean_text = _clean_hn_text(raw_text)
@@ -219,7 +416,16 @@ def _parse_hn_comment(comment: dict) -> dict | None:
     urls = _extract_urls(raw_text)
     kid_id = comment.get("id")
     source_url = f"https://news.ycombinator.com/item?id={kid_id}"
-    email = _extract_email_from_description(clean_text)
+    author = str(comment.get("by") or "").strip()
+    contact_name, contact_name_source = _extract_hn_contact_name(clean_text, author)
+    email = _extract_email_from_description(
+        clean_text,
+        allow_generic=_has_direct_hn_contact_signal(clean_text),
+    )
+    work_mode, work_mode_source = _extract_work_mode(
+        ("location", location),
+        ("description", clean_text),
+    )
 
     return {
         "job_id": f"hn_{kid_id}",
@@ -233,14 +439,19 @@ def _parse_hn_comment(comment: dict) -> dict | None:
         "source_provider": "Hacker News Firebase API",
         "source_origin": "Ask HN: Who is hiring?",
         "source_comment_id": str(kid_id),
+        "source_author": author,
         "external_links": urls,
+        "source_grounding": "hn_comment",
         "salary": "",
         "is_remote": "remote" in location.lower() and "onsite" not in location.lower() and "on-site" not in location.lower(),
+        "work_mode": work_mode,
+        "work_mode_source": work_mode_source,
         "employment_type": "FULL_TIME",
         "posted_at": str(comment.get("time", "")),
         "employer_website": urls[0] if urls else "",
         "recruiter_email": email,
-        "recruiter_name": "",
+        "recruiter_name": contact_name,
+        "recruiter_name_source": contact_name_source,
     }
 
 
@@ -276,6 +487,7 @@ def fetch_hacker_news_jobs() -> list:
         logger.info("HN Thread found. Checking top %d comments for AI roles...", HN_MAX_COMMENTS)
         
         hn_jobs = []
+        enriched_count = 0
         for kid_id in kids[:HN_MAX_COMMENTS]:
             try:
                 comment_url = f'https://hacker-news.firebaseio.com/v0/item/{kid_id}.json'
@@ -284,10 +496,17 @@ def fetch_hacker_news_jobs() -> list:
                     comment = json.loads(resp.read().decode())
                     parsed = _parse_hn_comment(comment)
                     if parsed:
+                        if (
+                            HN_LINK_ENRICHMENT_ENABLED
+                            and enriched_count < HN_MAX_LINK_ENRICHMENTS
+                            and _enrich_hn_job_from_link(parsed)
+                        ):
+                            enriched_count += 1
                         hn_jobs.append(parsed)
             except Exception as e:
                 logger.warning("HN_COMMENT_SKIP | kid_id=%s | error=%s", kid_id, str(e))
                 
+        logger.info("HN_LINK_ENRICHMENT | enriched=%d | jobs=%d", enriched_count, len(hn_jobs))
         return hn_jobs
     except Exception as e:
         logger.error("HN_ERROR: %s", str(e))
@@ -326,6 +545,13 @@ def _normalize_jsearch_job(raw: dict, query: str) -> dict | None:
     state = (raw.get("job_state") or "").strip()
     country = (raw.get("job_country") or "").strip()
     location = ", ".join([part for part in (city, state or country) if part]) or ("Remote" if raw.get("job_is_remote") else "Not specified")
+    work_mode = "remote" if raw.get("job_is_remote") else ""
+    work_mode_source = "job_is_remote" if work_mode else ""
+    if not work_mode:
+        work_mode, work_mode_source = _extract_work_mode(
+            ("description", raw.get("job_description") or ""),
+            ("employment_type", raw.get("job_employment_type") or ""),
+        )
 
     return {
         "job_id": raw.get("job_id") or f"jsearch_{uuid.uuid4().hex}",
@@ -342,6 +568,8 @@ def _normalize_jsearch_job(raw: dict, query: str) -> dict | None:
         "source_google_link": raw.get("job_google_link") or "",
         "salary": raw.get("job_salary") or "",
         "is_remote": bool(raw.get("job_is_remote")),
+        "work_mode": work_mode,
+        "work_mode_source": work_mode_source,
         "employment_type": raw.get("job_employment_type") or "",
         "posted_at": raw.get("job_posted_at_datetime_utc") or "",
         "employer_website": raw.get("employer_website") or "",
@@ -415,12 +643,17 @@ def _normalize_google_cse_item(item: dict, query: str) -> dict | None:
     title_without_company = re.split(r"\s[-|]\s", title)[0].strip()
     inferred_title = _infer_title_from_text(f"{title_without_company} {snippet}")
     company = display_link.split(".")[0].replace("jobs", "").replace("boards", "").strip("- ") or "Unknown"
+    location = _extract_google_cse_location(title, snippet)
+    work_mode, work_mode_source = _extract_work_mode(
+        ("title", title),
+        ("snippet", snippet),
+    )
 
     return {
         "job_id": f"google_cse_{uuid.uuid5(uuid.NAMESPACE_URL, link).hex}",
         "title": title_without_company[:120] if ROLE_WORD_PATTERN.search(title_without_company) else inferred_title[:120],
         "company": company[:120],
-        "location": "San Francisco Bay Area",
+        "location": location[:120],
         "description": f"{title}\n\n{snippet}",
         "url": link,
         "apply_url": link,
@@ -430,6 +663,8 @@ def _normalize_google_cse_item(item: dict, query: str) -> dict | None:
         "source_search_query": query,
         "salary": "",
         "is_remote": "remote" in f"{title} {snippet}".lower(),
+        "work_mode": work_mode,
+        "work_mode_source": work_mode_source,
         "employment_type": "",
         "posted_at": "",
         "employer_website": f"https://{display_link}" if display_link else "",
@@ -492,6 +727,13 @@ def _normalize_adzuna_job(raw: dict) -> dict | None:
         return None
 
     location = (raw.get("location") or {}).get("display_name", "") or "Not specified"
+    work_mode = "remote" if "remote" in f"{title} {location} {raw.get('description', '')}".lower() else ""
+    work_mode_source = "location" if work_mode and "remote" in location.lower() else ("description" if work_mode else "")
+    if not work_mode:
+        work_mode, work_mode_source = _extract_work_mode(
+            ("location", location),
+            ("description", raw.get("description") or ""),
+        )
     salary_min = raw.get("salary_min")
     salary_max = raw.get("salary_max")
     salary = ""
@@ -511,6 +753,8 @@ def _normalize_adzuna_job(raw: dict) -> dict | None:
         "source_origin": raw.get("adref") or "Adzuna",
         "salary": salary,
         "is_remote": "remote" in f"{title} {location} {raw.get('description', '')}".lower(),
+        "work_mode": work_mode,
+        "work_mode_source": work_mode_source,
         "employment_type": raw.get("contract_time") or "",
         "posted_at": raw.get("created") or "",
         "employer_website": "",
@@ -532,15 +776,17 @@ def fetch_adzuna_jobs() -> list:
     jobs = []
     per_query = max(1, min(50, ADZUNA_MAX_RESULTS))
     for query in ADZUNA_QUERIES:
-        params = urllib.parse.urlencode({
+        query_params = {
             "app_id": app_id,
             "app_key": app_key,
             "results_per_page": per_query,
             "what": query,
-            "where": ADZUNA_WHERE,
             "max_days_old": ADZUNA_MAX_DAYS_OLD,
             "content-type": "application/json",
-        })
+        }
+        if ADZUNA_WHERE:
+            query_params["where"] = ADZUNA_WHERE
+        params = urllib.parse.urlencode(query_params)
         url = f"https://api.adzuna.com/v1/api/jobs/us/search/1?{params}"
         try:
             with urllib.request.urlopen(urllib.request.Request(url), timeout=15) as response:
@@ -599,6 +845,18 @@ def _send_to_sqs(jobs: list) -> int:
 def lambda_handler(event, context):
     global SOURCE_ERRORS
     SOURCE_ERRORS = []
+    if isinstance(event, dict) and event.get("seed_signal_test"):
+        logger.info("INGESTOR_SIGNAL_TEST_START")
+        jobs = [_build_signal_test_job()]
+        sent_count = _send_to_sqs(jobs)
+        logger.info("INGESTOR_SIGNAL_TEST_COMPLETE | queued=%d", sent_count)
+        return {
+            "status": "success",
+            "jobs_fetched": 1,
+            "jobs_queued": sent_count,
+            "sources": {"signal_test": 1},
+            "source_errors": [],
+        }
     logger.info("INGESTOR_START | Using HN + Google CSE + Adzuna + JSearch")
     hn_jobs = fetch_hacker_news_jobs()
     google_cse_jobs = fetch_google_cse_jobs()

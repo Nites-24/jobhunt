@@ -101,6 +101,8 @@ class TestRouter:
                 "title": f"AI Engineer Role {i+1}",
                 "company": f"Company{i+1}",
                 "location": "San Francisco, CA",
+                "work_mode": "onsite",
+                "work_mode_source": "location",
                 "match_score": Decimal(str(90 + i)),
                 "match_reason": f"Strong match #{i+1}",
                 "status": "PENDING_APPROVAL",
@@ -131,6 +133,23 @@ class TestRouter:
         assert "search started" in mock_tg.call_args[0][2].lower()
 
     @patch("job_router.lambda_function._send_telegram")
+    @patch("job_router.lambda_function.lambda_client")
+    def test_signal_test_triggers_ingestor_seed(self, mock_lambda, mock_tg):
+        """'signal test' should invoke the ingestor with the synthetic notification seed."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+
+        event = _make_telegram_event("signal test")
+        mod.lambda_handler(event, MockContext())
+
+        mock_lambda.invoke.assert_called_once()
+        payload = json.loads(mock_lambda.invoke.call_args.kwargs["Payload"])
+        assert payload["seed_signal_test"] is True
+        msg = mock_tg.call_args[0][2]
+        assert "Signal test started" in msg
+        assert "synthetic AI Engineer match" in msg
+
+    @patch("job_router.lambda_function._send_telegram")
     def test_list_shows_pending_jobs(self, mock_tg):
         """'list' should show all PENDING_APPROVAL jobs split by email availability."""
         mod, table = self._setup_infra()
@@ -144,6 +163,8 @@ class TestRouter:
         msg = mock_tg.call_args[0][2]
         assert "Review queue" in msg
         assert "AI Engineer Role" in msg
+        assert "Work mode: onsite" in msg
+        assert "Work mode evidence: source location text" in msg
         assert "Source: Hacker News Who is Hiring" in msg
         assert "manual follow-up" in msg
 
@@ -171,7 +192,7 @@ class TestRouter:
         mod.lambda_handler(event, MockContext())
 
         msg = mock_tg.call_args[0][2]
-        assert "No 90%+ matches are ready yet" in msg
+        assert "No 80%+ matches are ready yet" in msg
         assert "still unscored" in msg
 
     @patch("job_router.lambda_function._send_telegram")
@@ -194,8 +215,31 @@ class TestRouter:
         mod.lambda_handler(event, MockContext())
 
         msg = mock_tg.call_args[0][2]
-        assert "No fresh 90%+ matches are ready" in msg
+        assert "No fresh 80%+ matches are ready" in msg
         assert "Dry Ground AI" not in msg
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_list_hides_hacker_news_rows_older_than_three_days(self, mock_tg):
+        """HN posts older than three days should not remain reviewable."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        table.put_item(Item={
+            "job_id": "old-hn",
+            "title": "Applied AI Engineer",
+            "company": "Cora AI",
+            "status": "PENDING_APPROVAL",
+            "source": "hackernews",
+            "posted_at": "2026-05-09T12:00:00Z",
+            "match_score": Decimal("94"),
+            "url": "https://news.ycombinator.com/item?id=123",
+        })
+
+        event = _make_telegram_event("list")
+        mod.lambda_handler(event, MockContext())
+
+        msg = mock_tg.call_args[0][2]
+        assert "No fresh 80%+ matches are ready" in msg
+        assert "Cora AI" not in msg
 
     @patch("job_router.lambda_function._send_telegram")
     def test_list_hides_practice_rows_when_disabled(self, mock_tg):
@@ -216,7 +260,7 @@ class TestRouter:
         mod.lambda_handler(event, MockContext())
 
         msg = mock_tg.call_args[0][2]
-        assert "No fresh 90%+ matches are ready" in msg
+        assert "No fresh 80%+ matches are ready" in msg
         assert "Northstar Revenue AI" not in msg
 
     @patch("job_router.lambda_function._send_telegram")
@@ -234,6 +278,8 @@ class TestRouter:
         item = table.get_item(Key={"job_id": "pending-002"})["Item"]
         assert item["status"] == "MANUAL_APPLY"
         msg = mock_tg.call_args[0][2]
+        assert "Work mode: onsite" in msg
+        assert "Work mode evidence: source location text" in msg
         assert "Contact: recruiter2@company2.com" in msg
         assert "No email was sent" in msg
         assert "Source link: https://company2.com/apply" in msg
@@ -255,6 +301,137 @@ class TestRouter:
         assert "Contact: no recruiter email found" in mock_tg.call_args[0][2]
         assert "Source link: https://company1.com/apply" in mock_tg.call_args[0][2]
         assert "Status set to" not in mock_tg.call_args[0][2]
+        assert "reply applied" in mock_tg.call_args[0][2]
+
+    @patch("job_router.lambda_function._send_telegram")
+    @patch("job_router.lambda_function.lambda_client")
+    def test_applied_records_real_world_outcome(self, mock_lambda, mock_tg):
+        """After manual follow-up, 'applied' should record the real user outcome."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        self._insert_pending_jobs(table, 1, with_email=False)
+
+        mod.lambda_handler(_make_telegram_event("apply 1"), MockContext())
+        mod.lambda_handler(_make_telegram_event("applied"), MockContext())
+
+        mock_lambda.invoke.assert_not_called()
+        item = table.get_item(Key={"job_id": "pending-001"})["Item"]
+        assert item["status"] == "APPLIED"
+        assert item["application_outcome"] == "applied"
+        assert item["user_feedback"] == "applied"
+        assert item["feedback_source"] == "telegram"
+        assert "applied_at" in item
+        assert "Recorded: applied" in mock_tg.call_args[0][2]
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_not_applied_records_reason(self, mock_tg):
+        """'not applied <reason>' should capture why the user skipped a role."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        table.put_item(Item={
+            "job_id": "manual-001",
+            "title": "Applied AI Engineer",
+            "company": "Cora AI",
+            "location": "Remote",
+            "status": "MANUAL_APPLY",
+            "source": "hackernews",
+            "posted_at": "2026-05-12T12:00:00Z",
+            "match_score": Decimal("91"),
+            "url": "https://news.ycombinator.com/item?id=123",
+            "status_updated_at": 1778600000,
+        })
+
+        mod.lambda_handler(_make_telegram_event("not applied too generic"), MockContext())
+
+        item = table.get_item(Key={"job_id": "manual-001"})["Item"]
+        assert item["status"] == "NOT_APPLIED"
+        assert item["application_outcome"] == "not_applied"
+        assert item["user_feedback"] == "not_applied"
+        assert item["user_feedback_reason"] == "too generic"
+        assert item["feedback_source"] == "telegram"
+        assert "not_applied_at" in item
+        assert "Recorded: not applied" in mock_tg.call_args[0][2]
+        assert "too generic" in mock_tg.call_args[0][2]
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_followups_lists_manual_outcome_queue(self, mock_tg):
+        """'followups' should show manual roles still waiting for applied/not applied."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        table.put_item(Item={
+            "job_id": "manual-001",
+            "title": "Applied AI Engineer",
+            "company": "Cora AI",
+            "location": "Remote",
+            "status": "MANUAL_APPLY",
+            "source": "hackernews",
+            "posted_at": "2026-05-12T12:00:00Z",
+            "match_score": Decimal("91"),
+            "url": "https://news.ycombinator.com/item?id=123",
+            "recruiter_email": "careers@cora.ai",
+            "status_updated_at": 1778600000,
+        })
+
+        mod.lambda_handler(_make_telegram_event("followups"), MockContext())
+
+        msg = mock_tg.call_args[0][2]
+        assert "Manual follow-ups waiting" in msg
+        assert "Applied AI Engineer" in msg
+        assert "Cora AI" in msg
+        assert "applied 1" in msg
+        assert "not applied 1" in msg
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_interested_records_preference_without_removing_job(self, mock_tg):
+        """'interested N' should teach preference while keeping the role actionable."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        self._insert_pending_jobs(table, 1, with_email=False)
+
+        mod.lambda_handler(_make_telegram_event("interested 1"), MockContext())
+
+        item = table.get_item(Key={"job_id": "pending-001"})["Item"]
+        assert item["status"] == "PENDING_APPROVAL"
+        assert item["user_interest"] == "interested"
+        assert item["user_feedback"] == "interested"
+        assert item["feedback_source"] == "telegram"
+        assert "Recorded: interested" in mock_tg.call_args[0][2]
+        assert "draft 1" in mock_tg.call_args[0][2]
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_not_interested_records_reason_and_removes_job(self, mock_tg):
+        """'not interested N reason' should remove the role and store why."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        self._insert_pending_jobs(table, 1, with_email=False)
+
+        mod.lambda_handler(_make_telegram_event("not interested 1 too remote"), MockContext())
+
+        item = table.get_item(Key={"job_id": "pending-001"})["Item"]
+        assert item["status"] == "NOT_INTERESTED"
+        assert item["user_interest"] == "not_interested"
+        assert item["user_feedback"] == "not_interested"
+        assert item["user_feedback_reason"] == "too remote"
+        assert item["feedback_source"] == "telegram"
+        assert mod._get_pending_jobs(limit=5) == []
+        assert "Recorded: not interested" in mock_tg.call_args[0][2]
+        assert "too remote" in mock_tg.call_args[0][2]
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_meh_records_neutral_feedback(self, mock_tg):
+        """'meh N reason' should save neutral feedback without hiding the job."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        self._insert_pending_jobs(table, 1, with_email=False)
+
+        mod.lambda_handler(_make_telegram_event("meh 1 draft generic"), MockContext())
+
+        item = table.get_item(Key={"job_id": "pending-001"})["Item"]
+        assert item["status"] == "PENDING_APPROVAL"
+        assert item["user_interest"] == "neutral"
+        assert item["user_feedback"] == "neutral"
+        assert item["user_feedback_reason"] == "draft generic"
+        assert "Recorded: neutral" in mock_tg.call_args[0][2]
 
     @patch("job_router.lambda_function._send_telegram")
     def test_tejajob_seeds_reviewable_job(self, mock_tg):
@@ -370,6 +547,33 @@ class TestRouter:
         assert payload["preview_only"] is True
         msg = mock_tg.call_args[0][2]
         assert "Draft preview" in msg
+        assert "No email was sent" in msg
+        assert "interested 1" in msg
+        assert "not interested 1" in msg
+
+    @patch("job_router.lambda_function._send_telegram")
+    @patch("job_router.lambda_function.lambda_client")
+    def test_draft_shows_fallback_note_when_sender_degrades(self, mock_lambda, mock_tg):
+        """Draft preview should clearly label fallback generation when sender was throttled."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        self._insert_pending_jobs(table, 1, with_email=False)
+        mock_lambda.invoke.return_value = {
+            "Payload": io.BytesIO(json.dumps({
+                "status": "preview",
+                "generated_with_fallback": True,
+                "email": {
+                    "subject": "AI Engineer role at Company1",
+                    "body": "Hi Company1 Team,\n\nFallback body.\n\nBest,\nTeja",
+                },
+            }).encode("utf-8"))
+        }
+
+        event = _make_telegram_event("draft 1")
+        mod.lambda_handler(event, MockContext())
+
+        msg = mock_tg.call_args[0][2]
+        assert "safe fallback template" in msg
         assert "No email was sent" in msg
 
     @patch("job_router.lambda_function._send_telegram")
@@ -492,7 +696,7 @@ class TestRouter:
             "status": "PENDING_APPROVAL",
             "source": "jsearch",
             "posted_at": "2026-05-12T12:00:00Z",
-            "match_score": Decimal("82"),
+            "match_score": Decimal("72"),
             "url": "https://watchlist.example/jobs/ml-platform",
             "match_reason": "Good ML platform match but below the review threshold.",
         })
@@ -503,7 +707,7 @@ class TestRouter:
 
         msg = mock_tg.call_args[0][2]
         assert "Pipeline Status" in msg
-        assert "Review threshold:   90%" in msg
+        assert "Review threshold:   80%" in msg
         assert "Reviewable evidence" in msg
         assert "AI Agent Engineer" in msg
         assert "Source: Hacker News Who is Hiring" in msg
@@ -520,7 +724,7 @@ class TestRouter:
         mod, table = self._setup_infra()
         mock_tg.return_value = True
 
-        event = _make_sns_event("New high match: 95% - Senior AI Engineer at Anthropic")
+        event = _make_sns_event("New high match: 95% - AI Engineer at Anthropic")
         result = mod.lambda_handler(event, MockContext())
 
         assert result["statusCode"] == 200
@@ -567,6 +771,21 @@ class TestRouter:
         assert "explain 1" in msg
         assert "list" in msg
         assert "apply" in msg
+        assert "Flow" in msg
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_help_command_with_send_enabled_shows_confirm_send(self, mock_tg):
+        """Help should show the explicit confirmation step when email sending is enabled."""
+        mod, table = self._setup_infra()
+        mod.ALLOW_TELEGRAM_EMAIL_SEND = True
+        mock_tg.return_value = True
+
+        event = _make_telegram_event("help")
+        mod.lambda_handler(event, MockContext())
+
+        msg = mock_tg.call_args[0][2]
+        assert "send 1: prepare email send confirmation" in msg
+        assert "confirm send 1: send after review" in msg
 
     @patch("job_router.lambda_function._send_telegram")
     def test_apply_n_gives_specific_correction(self, mock_tg):

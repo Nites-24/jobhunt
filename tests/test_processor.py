@@ -26,7 +26,7 @@ class TestProcessor:
         """Create DynamoDB, S3, and SNS resources."""
         import os
         os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
-        os.environ["SCORE_THRESHOLD"] = "90"
+        os.environ["SCORE_THRESHOLD"] = "80"
 
         dynamo = boto3.resource("dynamodb", region_name="us-east-1")
         table = dynamo.create_table(
@@ -42,7 +42,7 @@ class TestProcessor:
         s3.put_object(
             Bucket="job-search-pipeline-memory",
             Key="data/resume/Teja_Vaka.txt",
-            Body=b"Teja Vaka - Senior AI Engineer, Python, PyTorch, RAG, LLMs",
+            Body=b"Teja Vaka - AI Engineer, Python, PyTorch, RAG, LLMs",
         )
 
         sns = boto3.client("sns", region_name="us-east-1")
@@ -88,7 +88,7 @@ class TestProcessor:
 
     @patch("job_processor.lambda_function.bedrock")
     def test_high_score_pending_approval(self, mock_bedrock):
-        """Job scoring ≥90 should be set to PENDING_APPROVAL with SNS alert."""
+        """Job scoring ≥80 should be set to PENDING_APPROVAL with SNS alert."""
         mod, table, s3, sns = self._setup_infra()
         mock_bedrock.converse.return_value = self._mock_bedrock_response(
             95, "Strong match: Python, PyTorch, RAG experience aligns perfectly."
@@ -104,6 +104,7 @@ class TestProcessor:
         assert item["status"] == "PENDING_APPROVAL"
         assert int(item["match_score"]) == 95
         assert "Strong match" in item["match_reason"]
+        assert item["evaluation_profile_version"] == mod.JOB_EVAL_PROFILE_VERSION
 
     @patch("job_processor.lambda_function.bedrock")
     def test_low_score_rejected(self, mock_bedrock):
@@ -208,28 +209,56 @@ class TestProcessor:
         mock_bedrock.converse.assert_not_called()
 
     @patch("job_processor.lambda_function.bedrock")
+    def test_hacker_news_jobs_older_than_three_days_are_rejected_before_llm(self, mock_bedrock):
+        """HN leads must be fresher than generic sources because startup posts age quickly."""
+        mod, table, s3, sns = self._setup_infra()
+        hn_stale = {
+            **SAMPLE_JOB,
+            "job_id": "hn-stale",
+            "company": "Cora AI",
+            "title": "Applied AI Engineer",
+            "source": "hackernews",
+            "description": "Build AI agents, knowledge graphs, multi-agent systems, evals, and simulations.",
+            "url": "https://news.ycombinator.com/item?id=123",
+            "apply_url": "https://news.ycombinator.com/item?id=123",
+            "posted_at": "2026-05-09T12:00:00Z",
+        }
+        table.put_item(Item={"job_id": "hn-stale", "status": "NEW"})
+
+        result = mod.lambda_handler(make_sqs_event([hn_stale]), MockContext())
+
+        assert result["batchItemFailures"] == []
+        item = table.get_item(Key={"job_id": "hn-stale"})["Item"]
+        assert item["status"] == "REJECTED"
+        assert int(item["match_score"]) <= 55
+        assert "source limit 3 days" in item["match_reason"]
+        mock_bedrock.converse.assert_not_called()
+
+    @patch("job_processor.lambda_function.bedrock")
     def test_hard_guardrails_stay_below_lower_threshold(self, mock_bedrock):
         """Hard rejections must not become pending when production threshold is lower."""
         mod, table, s3, sns = self._setup_infra()
         mod.SCORE_THRESHOLD = 72
-        remote_nonlocal = {
+        missing_source = {
             **SAMPLE_JOB,
-            "job_id": "remote-nonlocal",
+            "job_id": "missing-source-low-threshold",
             "location": "Remote, Brazil",
             "is_remote": True,
+            "url": "",
+            "apply_url": "",
             "posted_at": "2026-05-12T12:00:00Z",
         }
-        table.put_item(Item={"job_id": "remote-nonlocal", "status": "NEW"})
+        table.put_item(Item={"job_id": "missing-source-low-threshold", "status": "NEW"})
 
-        result = mod.lambda_handler(make_sqs_event([remote_nonlocal]), MockContext())
+        result = mod.lambda_handler(make_sqs_event([missing_source]), MockContext())
 
         assert result["batchItemFailures"] == []
-        item = table.get_item(Key={"job_id": "remote-nonlocal"})["Item"]
+        item = table.get_item(Key={"job_id": "missing-source-low-threshold"})["Item"]
         assert item["status"] == "REJECTED"
-        assert int(item["match_score"]) == 71
-        assert "remote-only or non-local role" in item["match_reason"]
+        assert int(item["match_score"]) == 40
+        assert "missing verifiable source link" in item["match_reason"]
         mock_bedrock.converse.assert_not_called()
-        mod.SCORE_THRESHOLD = 90
+        mod.SCORE_THRESHOLD = 80
 
     @patch("job_processor.lambda_function.bedrock")
     def test_missing_source_link_is_rejected_before_llm(self, mock_bedrock):
@@ -252,6 +281,36 @@ class TestProcessor:
         assert int(item["match_score"]) <= 40
         assert "missing verifiable source link" in item["match_reason"]
         mock_bedrock.converse.assert_not_called()
+
+    @patch("job_processor.lambda_function._find_hunter_email", return_value="")
+    @patch("job_processor.lambda_function._send_match_notification")
+    @patch("job_processor.lambda_function.bedrock")
+    def test_signal_test_seed_bypasses_llm_and_notifies(self, mock_bedrock, mock_notify, mock_hunter):
+        """Synthetic signal-test jobs should produce a deterministic high-match notification."""
+        mod, table, s3, sns = self._setup_infra()
+        signal_job = {
+            **SAMPLE_JOB,
+            "job_id": "signal-test-001",
+            "title": "AI Engineer Notification Test",
+            "company": "Signal Test AI",
+            "location": "Wichita, Kansas",
+            "url": "https://example.com/signal-test-ai-engineer",
+            "apply_url": "https://example.com/signal-test-ai-engineer",
+            "source": "signal_test",
+            "work_mode": "onsite",
+            "work_mode_source": "location",
+            "signal_test": True,
+        }
+        table.put_item(Item={"job_id": "signal-test-001", "status": "NEW"})
+
+        result = mod.lambda_handler(make_sqs_event([signal_job]), MockContext())
+
+        assert result["batchItemFailures"] == []
+        item = table.get_item(Key={"job_id": "signal-test-001"})["Item"]
+        assert item["status"] == "PENDING_APPROVAL"
+        assert int(item["match_score"]) == 96
+        mock_bedrock.converse.assert_not_called()
+        mock_notify.assert_called_once()
 
     @patch("job_processor.lambda_function.bedrock")
     def test_negated_ai_signal_is_rejected_before_llm(self, mock_bedrock):

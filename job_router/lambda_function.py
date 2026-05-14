@@ -35,14 +35,15 @@ SECRET_NAME = os.environ.get("TELEGRAM_SECRET_NAME", "telegram")
 TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "Jobsearch")
 SENDER_LAMBDA = os.environ.get("SENDER_LAMBDA_NAME", "job-sender")
 INGESTOR_LAMBDA = os.environ.get("INGESTOR_LAMBDA_NAME", "job-ingestor")
-SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "90"))
+SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "80"))
 MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "14"))
+HN_MAX_JOB_AGE_DAYS = int(os.environ.get("HN_MAX_JOB_AGE_DAYS", "3"))
 LIST_FETCH_LIMIT = int(os.environ.get("LIST_FETCH_LIMIT", "100"))
 ENABLE_PRACTICE_MODE = os.environ.get("ENABLE_PRACTICE_MODE", "false").strip().lower() == "true"
 ALLOW_TELEGRAM_EMAIL_SEND = os.environ.get("ALLOW_TELEGRAM_EMAIL_SEND", "false").strip().lower() == "true"
 LIST_ALLOWED_SOURCES = {
     source.strip().lower()
-    for source in os.environ.get("LIST_ALLOWED_SOURCES", "hackernews,hn,jsearch,google_cse,cse,adzuna,tejajob").split(",")
+    for source in os.environ.get("LIST_ALLOWED_SOURCES", "hackernews,hn,jsearch,google_cse,cse,adzuna,tejajob,signal_test").split(",")
     if source.strip()
 }
 
@@ -100,6 +101,13 @@ def _job_age_days(job: dict) -> int | None:
     return int(age_seconds // 86400)
 
 
+def _source_max_age_days(job: dict) -> int:
+    source = str(job.get("source", "")).strip().lower()
+    if source in {"hackernews", "hn"}:
+        return HN_MAX_JOB_AGE_DAYS
+    return MAX_JOB_AGE_DAYS
+
+
 def _source_allowed(job: dict) -> bool:
     source = str(job.get("source", "")).strip().lower()
     if source in {"showcase", "tejajob"} and not ENABLE_PRACTICE_MODE:
@@ -113,6 +121,8 @@ def _source_label(job: dict) -> str:
         return "Hacker News Who is Hiring"
     if source in {"showcase", "tejajob"}:
         return "Practice item"
+    if source == "signal_test":
+        return "Notification test seed"
     if source in {"google_cse", "cse"}:
         return "Google Custom Search"
     if source == "jsearch":
@@ -124,6 +134,30 @@ def _source_label(job: dict) -> str:
 
 def _source_url(job: dict) -> str:
     return str(job.get("url") or job.get("apply_url") or "").strip()
+
+
+def _work_mode_label(job: dict) -> str:
+    label = str(job.get("work_mode") or "").strip().lower()
+    if label in {"remote", "hybrid", "onsite"}:
+        return label
+    return "unknown"
+
+
+def _work_mode_evidence(job: dict) -> str:
+    source = str(job.get("work_mode_source") or "").strip().lower()
+    if source == "job_is_remote":
+        return "source API remote flag"
+    if source == "location":
+        return "source location text"
+    if source == "description":
+        return "source job description"
+    if source == "title":
+        return "source title text"
+    if source == "snippet":
+        return "source snippet text"
+    if source == "employment_type":
+        return "source employment text"
+    return "not found in source"
 
 
 def _short_text(value: Any, limit: int = 220) -> str:
@@ -143,7 +177,7 @@ def _is_reviewable_job(job: dict) -> bool:
         return False
 
     age = _job_age_days(job)
-    if age is None or age > MAX_JOB_AGE_DAYS:
+    if age is None or age > _source_max_age_days(job):
         return False
     return True
 
@@ -154,7 +188,7 @@ def _is_fresh_allowed_pending_job(job: dict) -> bool:
     if not _source_allowed(job):
         return False
     age = _job_age_days(job)
-    return age is not None and age <= MAX_JOB_AGE_DAYS
+    return age is not None and age <= _source_max_age_days(job)
 
 
 def _sort_reviewable_jobs(jobs: list[dict]) -> list[dict]:
@@ -250,6 +284,37 @@ def _get_scored_pending_jobs(limit: int = 10) -> list:
         return []
 
 
+def _get_manual_followup_jobs(limit: int = 10) -> list:
+    """Fetch jobs the user selected for manual follow-up but has not resolved."""
+    try:
+        items = []
+        query_args = {
+            "IndexName": "status-index",
+            "KeyConditionExpression": Key("status").eq("MANUAL_APPLY"),
+            "Limit": LIST_FETCH_LIMIT,
+        }
+
+        while True:
+            response = table.query(**query_args)
+            items.extend(response.get("Items", []))
+            if len(items) >= LIST_FETCH_LIMIT or "LastEvaluatedKey" not in response:
+                break
+            query_args["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+
+        return sorted(
+            items,
+            key=lambda job: (
+                _as_int(job.get("status_updated_at")),
+                _as_int(job.get("evaluated_at")),
+                _as_int(job.get("ingested_at")),
+            ),
+            reverse=True,
+        )[:limit]
+    except Exception as e:
+        logger.error("QUERY_MANUAL_FOLLOWUP_ERROR: %s", str(e))
+        return []
+
+
 def _get_pipeline_stats() -> dict:
     """Get counts of jobs by status using paginated scans."""
     stats = {
@@ -257,6 +322,9 @@ def _get_pipeline_stats() -> dict:
         "PENDING_APPROVAL": 0,
         "APPROVED": 0,
         "MANUAL_APPLY": 0,
+        "APPLIED": 0,
+        "NOT_APPLIED": 0,
+        "NOT_INTERESTED": 0,
         "SHOWCASE_COMPLETE": 0,
         "SENT": 0,
         "REJECTED": 0,
@@ -288,6 +356,62 @@ def _update_job_status(job_id: str, new_status: str) -> None:
         ExpressionAttributeNames={"#s": "status"},
         ExpressionAttributeValues={":s": new_status, ":t": int(time.time())},
     )
+
+
+def _record_application_outcome(job_id: str, outcome: str, reason: str = "") -> str:
+    """Persist the user's real-world application decision for future evals."""
+    now = int(time.time())
+    status = "APPLIED" if outcome == "applied" else "NOT_APPLIED"
+    timestamp_field = "applied_at" if outcome == "applied" else "not_applied_at"
+    update_expr = (
+        "SET #s = :s, status_updated_at = :t, application_outcome = :outcome, "
+        "user_feedback = :outcome, user_feedback_at = :t, feedback_source = :source, "
+        f"{timestamp_field} = :t"
+    )
+    expr_vals = {
+        ":s": status,
+        ":t": now,
+        ":outcome": outcome,
+        ":source": "telegram",
+    }
+    if reason:
+        update_expr += ", user_feedback_reason = :reason"
+        expr_vals[":reason"] = reason[:500]
+
+    table.update_item(
+        Key={"job_id": job_id},
+        UpdateExpression=update_expr,
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues=expr_vals,
+    )
+    return status
+
+
+def _record_review_feedback(job_id: str, sentiment: str, reason: str = "") -> str:
+    """Persist the user's review preference while preserving apply outcome semantics."""
+    now = int(time.time())
+    new_status = "NOT_INTERESTED" if sentiment == "not_interested" else "PENDING_APPROVAL"
+    update_expr = (
+        "SET #s = :s, status_updated_at = :t, user_interest = :sentiment, "
+        "user_feedback = :sentiment, user_feedback_at = :t, feedback_source = :source"
+    )
+    expr_vals = {
+        ":s": new_status,
+        ":t": now,
+        ":sentiment": sentiment,
+        ":source": "telegram",
+    }
+    if reason:
+        update_expr += ", user_feedback_reason = :reason"
+        expr_vals[":reason"] = reason[:500]
+
+    table.update_item(
+        Key={"job_id": job_id},
+        UpdateExpression=update_expr,
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues=expr_vals,
+    )
+    return new_status
 
 
 def _format_posted(posted_at: str) -> str:
@@ -387,7 +511,7 @@ def _format_job_explanation(job: dict, index: int) -> str:
     posted = _format_posted(job.get("posted_at", "")) or "Posted date unavailable"
     reason = job.get("match_reason") or "No model reason stored."
     age = _job_age_days(job)
-    freshness = "fresh" if age is not None and age <= MAX_JOB_AGE_DAYS else "not fresh"
+    freshness = "fresh" if age is not None and age <= _source_max_age_days(job) else "not fresh"
 
     return (
         f"Match explanation for #{index}\n\n"
@@ -395,6 +519,8 @@ def _format_job_explanation(job: dict, index: int) -> str:
         f"Company: {job.get('company', 'Unknown')}\n"
         f"Score: {job.get('match_score', '?')}%\n"
         f"Location: {job.get('location', 'Unknown')}\n"
+        f"Work mode: {_work_mode_label(job)}\n"
+        f"Work mode evidence: {_work_mode_evidence(job)}\n"
         f"Source: {_source_label(job)}\n"
         f"Source link: {_source_url(job) or 'Unavailable'}\n"
         f"{posted}\n"
@@ -423,6 +549,27 @@ def _handle_search(bot_token: str, chat_id: str) -> None:
     except Exception as e:
         logger.error("INVOKE_INGESTOR_ERROR: %s", str(e))
         _send_telegram(bot_token, chat_id, f"Error triggering search: {str(e)}")
+
+
+def _handle_signal_test(bot_token: str, chat_id: str) -> None:
+    """Seed one deterministic high-match test through the live pipeline."""
+    try:
+        lambda_client.invoke(
+            FunctionName=INGESTOR_LAMBDA,
+            InvocationType="Event",
+            Payload=json.dumps({"source": "telegram", "command": "signal test", "seed_signal_test": True}),
+        )
+        _send_telegram(
+            bot_token,
+            chat_id,
+            "Signal test started.\n\n"
+            "I seeded one synthetic AI Engineer match into the live ingestion pipeline.\n"
+            "If the pipeline is healthy, you should receive the normal high-match notification shortly.\n\n"
+            "Then use list or status to verify the stored source, work mode, and evidence fields.",
+        )
+    except Exception as e:
+        logger.error("INVOKE_SIGNAL_TEST_ERROR: %s", str(e))
+        _send_telegram(bot_token, chat_id, f"Error triggering signal test: {str(e)}")
 
 
 def _handle_showcase(bot_token: str, chat_id: str) -> None:
@@ -471,7 +618,7 @@ def _handle_list(bot_token: str, chat_id: str) -> None:
             _send_telegram(
                 bot_token,
                 chat_id,
-                "No 90%+ matches are ready yet.\n\n"
+                f"No {SCORE_THRESHOLD}%+ matches are ready yet.\n\n"
                 f"{new_count} job(s) are still unscored or waiting to be rescored. "
                 "The processor is strict and only puts strong matches in this queue.\n\n"
                 "Use status for pipeline counts, or check list again in a few minutes.",
@@ -481,7 +628,7 @@ def _handle_list(bot_token: str, chat_id: str) -> None:
             _send_telegram(
                 bot_token,
                 chat_id,
-                "No fresh 90%+ matches are ready.\n\n"
+                f"No fresh {SCORE_THRESHOLD}%+ matches are ready.\n\n"
                 f"{pending_total} older pending job(s) are hidden because they do not meet the current freshness/source rules.\n\n"
                 "Use search jobs to scan live sources again.",
             )
@@ -515,6 +662,8 @@ def _handle_list(bot_token: str, chat_id: str) -> None:
         lines.append(f"{i}. {title}")
         lines.append(f"   {company} | {location}")
         lines.append(f"   Match: {score}%")
+        lines.append(f"   Work mode: {_work_mode_label(job)}")
+        lines.append(f"   Work mode evidence: {_work_mode_evidence(job)}")
         lines.append(f"   Source: {_source_label(job)}")
         if source_url:
             lines.append(f"   Source link: {source_url}")
@@ -592,11 +741,120 @@ def _handle_apply(bot_token: str, chat_id: str, index: int = 1) -> None:
         f"Role: {job.get('title', 'Unknown')}\n"
         f"Company: {job.get('company', 'Unknown')}\n"
         f"Match: {job.get('match_score', '?')}%\n"
+        f"Work mode: {_work_mode_label(job)}\n"
+        f"Work mode evidence: {_work_mode_evidence(job)}\n"
         f"Source: {_source_label(job)}\n"
         f"Source link: {source_url or 'No source link stored'}\n"
         f"{contact_line}\n\n"
         "No email was sent from Telegram. Review the source and send manually if it is a real fit.\n"
-        "I moved it out of the active queue so it will not keep reappearing in list.",
+        "I moved it out of the active queue so it will not keep reappearing in list.\n\n"
+        "After you act, reply applied. If you decide not to apply, reply not applied <reason>.",
+    )
+
+
+def _handle_followups(bot_token: str, chat_id: str) -> None:
+    """Show manual follow-up jobs waiting for a real-world outcome."""
+    jobs = _get_manual_followup_jobs(limit=10)
+    if not jobs:
+        _send_telegram(
+            bot_token,
+            chat_id,
+            "No manual follow-ups are waiting for an outcome.\n\n"
+            "Use apply 1 on a reviewable job first, then reply applied or not applied <reason>.",
+        )
+        return
+
+    lines = [f"Manual follow-ups waiting: {len(jobs)}\n"]
+    for i, job in enumerate(jobs, 1):
+        source_url = _source_url(job)
+        recruiter = (job.get("recruiter_email") or "").strip()
+        lines.append(f"{i}. {job.get('title', 'Unknown Role')}")
+        lines.append(f"   {job.get('company', 'Unknown')} | {job.get('location', 'Location not specified')}")
+        lines.append(f"   Match: {job.get('match_score', '?')}%")
+        lines.append(f"   Source: {_source_label(job)}")
+        lines.append(f"   Source link: {source_url or 'No source link stored'}")
+        lines.append(f"   Contact: {recruiter or 'none found'}")
+        lines.append("")
+
+    lines.append("Reply applied 1 after you apply, or not applied 1 <reason> if you skip it.")
+    _send_telegram(bot_token, chat_id, "\n".join(lines))
+
+
+def _handle_application_outcome(
+    bot_token: str,
+    chat_id: str,
+    outcome: str,
+    index: int = 1,
+    reason: str = "",
+) -> None:
+    """Record whether the user really applied after manual follow-up."""
+    jobs = _get_manual_followup_jobs(limit=10)
+    if not jobs:
+        _send_telegram(
+            bot_token,
+            chat_id,
+            "I do not have any manual follow-ups waiting for an outcome.\n\n"
+            "Use apply 1 first so I know which role you are acting on.",
+        )
+        return
+
+    if index < 1 or index > len(jobs):
+        _send_telegram(bot_token, chat_id, f"Invalid follow-up index. Use a number from 1 to {len(jobs)}.")
+        return
+
+    job = jobs[index - 1]
+    status = _record_application_outcome(job["job_id"], outcome, reason)
+    label = "applied" if outcome == "applied" else "not applied"
+    reason_line = f"\nReason: {reason}" if reason else ""
+    _send_telegram(
+        bot_token,
+        chat_id,
+        f"Recorded: {label}.\n\n"
+        f"Role: {job.get('title', 'Unknown')}\n"
+        f"Company: {job.get('company', 'Unknown')}\n"
+        f"Stored status: {status}{reason_line}\n\n"
+        "This outcome is now stored on the job row for future feedback/eval analysis.",
+    )
+
+
+def _handle_review_feedback(
+    bot_token: str,
+    chat_id: str,
+    sentiment: str,
+    index: int = 1,
+    reason: str = "",
+) -> None:
+    """Record whether the user is interested in a reviewable job."""
+    jobs = _get_pending_jobs(limit=20)
+    if not jobs:
+        _send_telegram(bot_token, chat_id, "Your review queue is empty. Use search jobs to scan live sources.")
+        return
+
+    if index < 1 or index > len(jobs):
+        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+        return
+
+    job = jobs[index - 1]
+    status = _record_review_feedback(job["job_id"], sentiment, reason)
+    label = {
+        "interested": "interested",
+        "not_interested": "not interested",
+        "neutral": "neutral",
+    }.get(sentiment, sentiment)
+    next_step = (
+        "Next: use draft {0} or apply {0} if you want to act.".format(index)
+        if sentiment != "not_interested"
+        else "I removed it from the active review queue."
+    )
+    reason_line = f"\nReason: {reason}" if reason else ""
+    _send_telegram(
+        bot_token,
+        chat_id,
+        f"Recorded: {label}.\n\n"
+        f"Role: {job.get('title', 'Unknown')}\n"
+        f"Company: {job.get('company', 'Unknown')}\n"
+        f"Stored status: {status}{reason_line}\n\n"
+        f"{next_step}",
     )
 
 
@@ -650,14 +908,20 @@ def _handle_draft(bot_token: str, chat_id: str, index: int = 1) -> None:
         body = str(email.get("body", "")).strip()
         if len(body) > 2500:
             body = body[:2500].rstrip() + "\n[truncated]"
+        fallback_note = ""
+        if payload.get("generated_with_fallback"):
+            fallback_note = (
+                "\n\nNote: this preview used the safe fallback template because Bedrock was temporarily throttled."
+            )
 
         _send_telegram(
             bot_token,
             chat_id,
             f"Draft preview for #{index}\n\n"
             f"Subject: {email.get('subject', '')}\n\n"
-            f"{body}\n\n"
-            "No email was sent.",
+            f"{body}{fallback_note}\n\n"
+            "No email was sent.\n\n"
+            f"Next: interested {index}, meh {index} <reason>, not interested {index} <reason>, or apply {index}.",
         )
     except Exception as e:
         logger.error("DRAFT_PREVIEW_ERROR: %s", str(e))
@@ -786,6 +1050,9 @@ def _handle_status(bot_token: str, chat_id: str) -> None:
         f"Reviewable now:     {len(jobs)}",
         f"Scored live rows:   {len(scored_pending)}",
         f"Manual follow-up:   {stats.get('MANUAL_APPLY', 0)}",
+        f"Applied:            {stats.get('APPLIED', 0)}",
+        f"Not applied:        {stats.get('NOT_APPLIED', 0)}",
+        f"Not interested:     {stats.get('NOT_INTERESTED', 0)}",
         f"Sent before safety: {stats.get('SENT', 0)}",
         f"Rejected:           {stats.get('REJECTED', 0)}",
         f"Failed:             {stats.get('FAILED', 0)}",
@@ -811,6 +1078,8 @@ def _handle_status(bot_token: str, chat_id: str) -> None:
         lines.append(f"{i}. {job.get('title', 'Unknown Role')}")
         lines.append(f"   Company: {job.get('company', 'Unknown')}")
         lines.append(f"   Location: {job.get('location', 'Location not specified')}")
+        lines.append(f"   Work mode: {_work_mode_label(job)}")
+        lines.append(f"   Work mode evidence: {_work_mode_evidence(job)}")
         lines.append(f"   Match: {job.get('match_score', '?')}%")
         lines.append(f"   Source: {_source_label(job)}")
         lines.append(f"   Source link: {source_url or 'MISSING - verify before acting'}")
@@ -828,6 +1097,8 @@ def _handle_status(bot_token: str, chat_id: str) -> None:
             lines.append("")
             lines.append(f"{i}. {job.get('title', 'Unknown Role')}")
             lines.append(f"   Company: {job.get('company', 'Unknown')}")
+            lines.append(f"   Work mode: {_work_mode_label(job)}")
+            lines.append(f"   Work mode evidence: {_work_mode_evidence(job)}")
             lines.append(f"   Match: {job.get('match_score', '?')}%")
             lines.append(f"   Source: {_source_label(job)}")
             lines.append(f"   Source link: {source_url or 'MISSING - verify before acting'}")
@@ -843,33 +1114,65 @@ def _handle_status(bot_token: str, chat_id: str) -> None:
 
 def _handle_help(bot_token: str, chat_id: str) -> None:
     """Show available commands."""
-    practice_line = "  tejajob - Add a safe practice opportunity\n" if ENABLE_PRACTICE_MODE else ""
-    apply_line = (
-        "  apply 1 - Show contact/source and move to manual follow-up. No auto-send\n"
-        if ENABLE_PRACTICE_MODE
-        else
-        "  apply 1 - Show contact/source and move to manual follow-up. No auto-send\n"
-    )
-    send_line = "  send 1 - Stage email send confirmation for a sourced match\n" if ALLOW_TELEGRAM_EMAIL_SEND else ""
-    msg = (
-        "JobAlert commands\n"
-        "-----------------\n\n"
-        "Commands:\n"
-        "  search jobs - Scan live job sources\n"
-        f"{practice_line}"
-        f"  list - Show fresh {SCORE_THRESHOLD}%+ matches\n"
-        "  explain 1 - Show why a match scored well\n"
-        "  draft 1 - Preview outreach without sending\n"
-        f"{send_line}"
-        f"{apply_line}"
-        "  reject 1 - Remove a match from the queue\n"
-        "  status - Show counts plus role source links\n"
-        "  help - Show this message\n"
-    )
-    _send_telegram(bot_token, chat_id, msg)
+    lines = [
+        "JobAlert",
+        "",
+        "Start",
+        "search jobs: scan live sources",
+        f"list: review fresh {SCORE_THRESHOLD}%+ matches",
+        "status: check queue counts and source evidence",
+        "",
+        "Review a match",
+        "explain 1: why match #1 scored well",
+        "draft 1: preview outreach",
+        "interested 1: teach the agent this role fits your taste",
+        "meh 1 <reason>: save neutral feedback without removing it",
+        "not interested 1 <reason>: remove and teach why",
+        "apply 1: show source and contact for manual follow-up",
+        "followups: show roles waiting for your real outcome",
+        "applied: mark the latest manual follow-up as applied",
+        "not applied <reason>: mark the latest manual follow-up as skipped",
+        "reject 1: remove match #1 from the queue",
+    ]
+
+    if ALLOW_TELEGRAM_EMAIL_SEND:
+        lines.extend([
+            "",
+            "Send",
+            "send 1: prepare email send confirmation",
+            "confirm send 1: send after review",
+        ])
+
+    if ENABLE_PRACTICE_MODE:
+        lines.extend([
+            "",
+            "Practice",
+            "tejajob: add one practice opportunity",
+        ])
+
+    lines.extend([
+        "",
+        "Tools",
+        "signal test: run one synthetic live alert",
+        "help: show this message",
+        "",
+        "Flow",
+        "search jobs -> list -> explain 1 -> draft 1 -> interested 1 -> apply 1 -> applied",
+    ])
+    _send_telegram(bot_token, chat_id, "\n".join(lines))
 
 
 APPLY_PATTERN = re.compile(r"^apply\s*(\d+)?$", re.IGNORECASE)
+REVIEW_FEEDBACK_PATTERN = re.compile(
+    r"^(interested|like|liked|yes|good|not\s+interested|not\s+like|dislike|bad|no|meh|neutral|maybe)"
+    r"(?:\s+(\d+))?(?:\s+(.+))?$",
+    re.IGNORECASE,
+)
+APPLICATION_OUTCOME_PATTERN = re.compile(
+    r"^(applied|not\s+applied|not\s+apply|did\s+not\s+apply|skipped|skip|pass|passed)"
+    r"(?:\s+(\d+))?(?:\s+(.+))?$",
+    re.IGNORECASE,
+)
 REJECT_PATTERN = re.compile(r"^reject\s*(\d+)?$", re.IGNORECASE)
 EXPLAIN_PATTERN = re.compile(r"^explain\s*(\d+)?$", re.IGNORECASE)
 DRAFT_PATTERN = re.compile(r"^draft\s*(\d+)?$", re.IGNORECASE)
@@ -879,7 +1182,8 @@ CONFIRM_SEND_PATTERN = re.compile(r"^confirm\s+send\s+(\d+)$", re.IGNORECASE)
 
 def _route_command(command: str, bot_token: str, chat_id: str) -> None:
     """Parse user input and route to a command handler."""
-    cmd = command.strip().lower()
+    raw = command.strip()
+    cmd = raw.lower()
 
     if cmd in (
         "search jobs",
@@ -896,6 +1200,10 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
         _handle_search(bot_token, chat_id)
         return
 
+    if cmd in ("signal test", "test signal", "notify test", "notification test"):
+        _handle_signal_test(bot_token, chat_id)
+        return
+
     if cmd in ("tejajob", "teja job", "showcase", "showcase agent", "agent showcase", "seed showcase", "showcase mode"):
         _handle_showcase(bot_token, chat_id)
         return
@@ -904,12 +1212,43 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
         _handle_list(bot_token, chat_id)
         return
 
+    if cmd in ("followups", "follow ups", "manual followups", "manual follow-ups", "manual"):
+        _handle_followups(bot_token, chat_id)
+        return
+
     if cmd in ("status", "stats"):
         _handle_status(bot_token, chat_id)
         return
 
     if cmd in ("help", "start", "/start", "/help"):
         _handle_help(bot_token, chat_id)
+        return
+
+    match = APPLICATION_OUTCOME_PATTERN.match(raw)
+    if match:
+        command_word = re.sub(r"\s+", " ", match.group(1).strip().lower())
+        outcome = "applied" if command_word == "applied" else "not_applied"
+        index = int(match.group(2)) if match.group(2) else 1
+        reason = (match.group(3) or "").strip()
+        if outcome == "not_applied" and not reason:
+            reason = "No reason provided"
+        _handle_application_outcome(bot_token, chat_id, outcome, index, reason)
+        return
+
+    match = REVIEW_FEEDBACK_PATTERN.match(raw)
+    if match:
+        command_word = re.sub(r"\s+", " ", match.group(1).strip().lower())
+        if command_word in {"interested", "like", "liked", "yes", "good"}:
+            sentiment = "interested"
+        elif command_word in {"meh", "neutral", "maybe"}:
+            sentiment = "neutral"
+        else:
+            sentiment = "not_interested"
+        index = int(match.group(2)) if match.group(2) else 1
+        reason = (match.group(3) or "").strip()
+        if sentiment == "not_interested" and not reason:
+            reason = "No reason provided"
+        _handle_review_feedback(bot_token, chat_id, sentiment, index, reason)
         return
 
     match = APPLY_PATTERN.match(cmd)
