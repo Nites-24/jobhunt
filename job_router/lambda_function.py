@@ -49,6 +49,7 @@ LIST_ALLOWED_SOURCES = {
 
 table = dynamodb.Table(TABLE_NAME)
 _cached_secrets = None
+REVIEW_SESSION_PREFIX = "telegram_session_"
 
 
 class DecimalEncoder(json.JSONEncoder):
@@ -106,6 +107,23 @@ def _source_max_age_days(job: dict) -> int:
     if source in {"hackernews", "hn"}:
         return HN_MAX_JOB_AGE_DAYS
     return MAX_JOB_AGE_DAYS
+
+
+def _is_synthetic_job(job: dict) -> bool:
+    """Return True for non-user-facing practice, test, or internal session rows."""
+    source = str(job.get("source", "")).strip().lower()
+    url = _source_url(job).lower()
+    model_id = str(job.get("model_id", "")).strip().lower()
+    entity_type = str(job.get("entity_type", "")).strip().lower()
+    if source in {"showcase", "tejajob"} and ENABLE_PRACTICE_MODE:
+        return False
+    return bool(
+        entity_type == "telegram_review_session"
+        or source in {"signal_test", "tejajob", "showcase"}
+        or job.get("signal_test")
+        or model_id == "showcase-seed"
+        or url.startswith("https://example.com/")
+    )
 
 
 def _source_allowed(job: dict) -> bool:
@@ -169,6 +187,8 @@ def _short_text(value: Any, limit: int = 220) -> str:
 
 def _is_reviewable_job(job: dict) -> bool:
     """Apply hard UX filters before a job can appear in the command queue."""
+    if _is_synthetic_job(job):
+        return False
     if job.get("status") != "PENDING_APPROVAL":
         return False
     if _as_int(job.get("match_score")) < SCORE_THRESHOLD:
@@ -183,6 +203,8 @@ def _is_reviewable_job(job: dict) -> bool:
 
 
 def _is_fresh_allowed_pending_job(job: dict) -> bool:
+    if _is_synthetic_job(job):
+        return False
     if job.get("status") != "PENDING_APPROVAL":
         return False
     if not _source_allowed(job):
@@ -275,128 +297,185 @@ def _answer_callback_query(bot_token: str, callback_query_id: str, text: str | N
     return _telegram_request(bot_token, "answerCallbackQuery", payload)
 
 
-def _build_help_keyboard() -> dict:
-    """Small reply keyboard for the most common navigation actions."""
-    return {
-        "keyboard": [
-            [{"text": "search jobs"}, {"text": "list"}, {"text": "status"}],
-            [{"text": "draft 1"}, {"text": "apply 1"}, {"text": "followups"}],
-            [{"text": "signal test"}, {"text": "help"}],
+def _build_state_keyboard(state: str) -> dict:
+    """Reply keyboard tuned to the current Telegram state."""
+    state_key = state if state in {"home", "review", "followup", "more", "empty_pending"} else "home"
+    layouts = {
+        "home": [
+            [{"text": "Next Match"}, {"text": "More"}],
+            [{"text": "Search"}, {"text": "List"}, {"text": "Follow-up"}],
         ],
+        "review": [
+            [{"text": "Why"}, {"text": "Draft"}, {"text": "Apply"}, {"text": "Skip"}],
+            [{"text": "Next Match"}],
+            [{"text": "List"}, {"text": "More"}, {"text": "Home"}],
+        ],
+        "followup": [
+            [{"text": "Followups"}, {"text": "Applied"}, {"text": "Not Applied"}],
+            [{"text": "List"}, {"text": "Next Match"}, {"text": "More"}],
+            [{"text": "Home"}],
+        ],
+        "more": [
+            [{"text": "Status"}, {"text": "Backlog"}, {"text": "Followups"}],
+            [{"text": "Signal Test"}],
+            [{"text": "Search"}, {"text": "List"}, {"text": "Next Match"}],
+            [{"text": "Home"}],
+        ],
+        "empty_pending": [
+            [{"text": "Backlog"}, {"text": "Search"}],
+            [{"text": "List"}, {"text": "Next Match"}],
+            [{"text": "Home"}],
+        ],
+    }
+    return {
+        "keyboard": layouts[state_key],
         "resize_keyboard": True,
-        "input_field_placeholder": "Type a command or tap an action",
+        "input_field_placeholder": "Choose an action or type a command",
     }
 
 
+def _help_text(page: str) -> str:
+    """Telegram-friendly product copy for the main state pages."""
+    page_key = page if page in {"home", "review", "followup", "more"} else "home"
+    pages = {
+        "home": [
+            "JobAlert",
+            "AI Job Copilot",
+            "",
+            "Fresh AI-matched roles for Teja.",
+            "",
+            "Start with Next Match.",
+            "Use Search for a new scan.",
+            "Use List to view ready matches.",
+            "Use Follow-up for jobs you acted on.",
+            "Use More for Status, Backlog, and Signal Test.",
+        ],
+        "review": [
+            "Review",
+            "",
+            "Use one match at a time.",
+            "",
+            "Next Match  Move forward",
+            "Why  Full fit explanation",
+            "Draft  Outreach preview",
+            "Apply  Manual follow-up",
+            "Skip  Remove it and tell me why",
+        ],
+        "followup": [
+            "Follow-up",
+            "",
+            "Use this area for jobs you decided to act on in the real world.",
+            "",
+            "Followups  See waiting outcomes",
+            "Applied  Record success",
+            "Not Applied  Record why you skipped it",
+        ],
+        "more": [
+            "More",
+            "",
+            "Advanced controls live here.",
+            "",
+            "Status  Queue counts and evidence",
+            "Backlog  Older processed jobs behind the freshness rules",
+            "Signal Test  Synthetic live alert",
+            "Followups  Open follow-up tracking",
+        ],
+    }
+    return "\n".join(pages[page_key])
+
+
 def _help_page(page: str) -> tuple[str, dict]:
-    """Build a breadcrumb-style help page with inline navigation."""
-    page_key = page if page in {"home", "start", "review", "followup", "send", "tools"} else "home"
+    """Build a concise help page with inline navigation."""
+    page_key = page if page in {"home", "review", "followup", "more"} else "home"
 
     pages = {
         "home": [
-            "⌂ JobAlert",
+            "JobAlert",
             "Home",
             "",
-            "The quickest path:",
-            "search jobs -> list -> explain 1 -> draft 1 -> interested 1 -> apply 1 -> applied",
+            "Best path:",
+            "search jobs -> list -> next -> why -> draft -> skip <reason> or apply",
             "",
-            "Tap a section below or run a command directly.",
-        ],
-        "start": [
-            "⌂ JobAlert",
-            "Home › Start",
-            "",
-            "Core commands",
-            "• search jobs  Scan live sources",
-            f"• list  Review fresh {SCORE_THRESHOLD}%+ matches",
-            "• status  Check queue counts and source evidence",
+            "Use next to review one fresh match at a time.",
         ],
         "review": [
-            "⌂ JobAlert",
-            "Home › Review",
+            "JobAlert",
+            "Home > Review",
             "",
             "Review commands",
-            "• explain 1  Why match #1 scored well",
-            "• draft 1  Preview outreach",
-            "• interested 1  Save positive feedback",
-            "• meh 1 <reason>  Save neutral feedback",
-            "• not interested 1 <reason>  Remove and teach why",
-            "• reject 1  Remove match #1 from the queue",
+            "- next  Move through fresh review items",
+            "- why  Explain the current match",
+            "- draft  Preview outreach for the current match",
+            "- skip <reason>  Remove the current match and teach why",
+            "- apply  Show source and contact for manual follow-up",
+            "- interested 1 / meh 1 <reason> / not interested 1 <reason>  Numbered feedback stays available",
         ],
         "followup": [
-            "⌂ JobAlert",
-            "Home › Follow-up",
+            "JobAlert",
+            "Home > Follow-up",
             "",
             "Follow-up commands",
-            "• apply 1  Show source and contact for manual follow-up",
-            "• followups  Roles waiting for your real outcome",
-            "• applied  Mark the latest manual follow-up as applied",
-            "• not applied <reason>  Mark the latest manual follow-up as skipped",
+            "- apply  Show source and contact for the current review item",
+            "- followups  Roles waiting for your real outcome",
+            "- applied  Mark the latest manual follow-up as applied",
+            "- not applied <reason>  Mark the latest manual follow-up as skipped",
         ],
-        "send": [
-            "⌂ JobAlert",
-            "Home › Send",
+        "more": [
+            "JobAlert",
+            "Home > More",
             "",
-            "Send commands",
-            "• send 1  Prepare email send confirmation",
-            "• confirm send 1  Send after review",
+            "Advanced commands",
+            f"- status  Check queue counts and source evidence at {SCORE_THRESHOLD}%+",
+            "- followups  See roles waiting on your real outcome",
+            "- send 1  Prepare email send confirmation",
+            "- confirm send 1  Type this manually after review",
+            "- signal test  Run one synthetic live alert",
             "",
-            "Real sending is shown only when Telegram send is enabled.",
-        ],
-        "tools": [
-            "⌂ JobAlert",
-            "Home › Tools",
-            "",
-            "Tool commands",
-            "• signal test  Run one synthetic live alert",
-            "• help  Return to this command center",
+            "Use these only when you need deeper control.",
         ],
     }
 
     action_rows = {
         "home": [
             [{"text": "Search", "callback_data": "cmd:search jobs"}, {"text": "List", "callback_data": "cmd:list"}],
-            [{"text": "Status", "callback_data": "cmd:status"}, {"text": "Signal Test", "callback_data": "cmd:signal test"}],
-        ],
-        "start": [
-            [{"text": "Search Jobs", "callback_data": "cmd:search jobs"}],
-            [{"text": "List", "callback_data": "cmd:list"}, {"text": "Status", "callback_data": "cmd:status"}],
+            [{"text": "Next", "callback_data": "cmd:next"}, {"text": "Why", "callback_data": "cmd:why"}],
+            [{"text": "Draft", "callback_data": "cmd:draft"}, {"text": "Apply", "callback_data": "cmd:apply"}],
         ],
         "review": [
-            [{"text": "Explain 1", "callback_data": "cmd:explain 1"}, {"text": "Draft 1", "callback_data": "cmd:draft 1"}],
+            [{"text": "Next", "callback_data": "cmd:next"}, {"text": "Why", "callback_data": "cmd:why"}],
+            [{"text": "Draft", "callback_data": "cmd:draft"}, {"text": "Apply", "callback_data": "cmd:apply"}],
             [{"text": "Interested 1", "callback_data": "cmd:interested 1"}],
-            [{"text": "Meh 1", "callback_data": "cmd:meh 1 no reason provided"}],
         ],
         "followup": [
-            [{"text": "Apply 1", "callback_data": "cmd:apply 1"}, {"text": "Followups", "callback_data": "cmd:followups"}],
+            [{"text": "Apply", "callback_data": "cmd:apply"}, {"text": "Followups", "callback_data": "cmd:followups"}],
             [{"text": "Applied", "callback_data": "cmd:applied"}],
         ],
-        "send": [
-            [{"text": "Send 1", "callback_data": "cmd:send 1"}, {"text": "Confirm Send 1", "callback_data": "cmd:confirm send 1"}],
-        ],
-        "tools": [
+        "more": [
+            [{"text": "Status", "callback_data": "cmd:status"}, {"text": "Followups", "callback_data": "cmd:followups"}],
             [{"text": "Signal Test", "callback_data": "cmd:signal test"}],
-            [{"text": "Help Home", "callback_data": "help:home"}],
         ],
     }
 
-    nav_rows = [
-        [
-            {"text": "Home", "callback_data": "help:home"},
-            {"text": "Start", "callback_data": "help:start"},
-            {"text": "Review", "callback_data": "help:review"},
-        ],
-        [
-            {"text": "Follow-up", "callback_data": "help:followup"},
-            {"text": "Send", "callback_data": "help:send"},
-            {"text": "Tools", "callback_data": "help:tools"},
-        ],
-    ]
+    if ALLOW_TELEGRAM_EMAIL_SEND:
+        action_rows["more"].insert(1, [{"text": "Send 1", "callback_data": "cmd:send 1"}])
 
-    if not ALLOW_TELEGRAM_EMAIL_SEND:
-        nav_rows[1] = [button for button in nav_rows[1] if button["callback_data"] != "help:send"]
-        if page_key == "send":
-            page_key = "home"
+    if page_key == "home":
+        nav_rows = [
+            [
+                {"text": "Review", "callback_data": "help:review"},
+                {"text": "Follow-up", "callback_data": "help:followup"},
+                {"text": "More", "callback_data": "help:more"},
+            ]
+        ]
+    else:
+        nav_rows = [
+            [
+                {"text": "Home", "callback_data": "help:home"},
+                {"text": "Review", "callback_data": "help:review"},
+                {"text": "Follow-up", "callback_data": "help:followup"},
+                {"text": "More", "callback_data": "help:more"},
+            ]
+        ]
 
     text = "\n".join(pages[page_key])
     keyboard = {"inline_keyboard": nav_rows + action_rows[page_key]}
@@ -454,6 +533,49 @@ def _get_scored_pending_jobs(limit: int = 10) -> list:
         return []
 
 
+def _hidden_pending_reason(job: dict) -> str:
+    """Human-readable reason a pending job is hidden from the active review queue."""
+    if _is_synthetic_job(job):
+        return "internal test or practice row"
+    if job.get("status") != "PENDING_APPROVAL":
+        return "not pending review"
+    if not _source_allowed(job):
+        return "source is not allowed in the review queue"
+    age = _job_age_days(job)
+    if age is None:
+        return "missing posted date"
+    max_age = _source_max_age_days(job)
+    if age > max_age:
+        return f"older than the {max_age}-day freshness rule"
+    if _as_int(job.get("match_score")) < SCORE_THRESHOLD:
+        return f"below the {SCORE_THRESHOLD}% review threshold"
+    return "hidden by review rules"
+
+
+def _get_hidden_pending_jobs(limit: int = 10) -> list:
+    """Fetch pending jobs that exist in the pipeline but are not reviewable right now."""
+    try:
+        items = []
+        query_args = {
+            "IndexName": "status-index",
+            "KeyConditionExpression": Key("status").eq("PENDING_APPROVAL"),
+            "Limit": LIST_FETCH_LIMIT,
+        }
+
+        while True:
+            response = table.query(**query_args)
+            items.extend(response.get("Items", []))
+            if len(items) >= LIST_FETCH_LIMIT or "LastEvaluatedKey" not in response:
+                break
+            query_args["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+
+        hidden = [job for job in items if not _is_synthetic_job(job) and not _is_reviewable_job(job)]
+        return _sort_reviewable_jobs(hidden)[:limit]
+    except Exception as e:
+        logger.error("QUERY_HIDDEN_PENDING_ERROR: %s", str(e))
+        return []
+
+
 def _get_manual_followup_jobs(limit: int = 10) -> list:
     """Fetch jobs the user selected for manual follow-up but has not resolved."""
     try:
@@ -471,8 +593,9 @@ def _get_manual_followup_jobs(limit: int = 10) -> list:
                 break
             query_args["ExclusiveStartKey"] = response["LastEvaluatedKey"]
 
+        visible = [job for job in items if not _is_synthetic_job(job)]
         return sorted(
-            items,
+            visible,
             key=lambda job: (
                 _as_int(job.get("status_updated_at")),
                 _as_int(job.get("evaluated_at")),
@@ -483,6 +606,94 @@ def _get_manual_followup_jobs(limit: int = 10) -> list:
     except Exception as e:
         logger.error("QUERY_MANUAL_FOLLOWUP_ERROR: %s", str(e))
         return []
+
+
+def _review_session_key(chat_id: str) -> str:
+    return f"{REVIEW_SESSION_PREFIX}{chat_id}"
+
+
+def _get_active_review_job_id(chat_id: str) -> str:
+    try:
+        item = table.get_item(Key={"job_id": _review_session_key(chat_id)}).get("Item", {})
+        return str(item.get("active_review_job_id") or "").strip()
+    except Exception as e:
+        logger.warning("GET_REVIEW_SESSION_ERROR: %s", str(e))
+        return ""
+
+
+def _set_active_review_job(chat_id: str, job_id: str) -> None:
+    table.put_item(Item={
+        "job_id": _review_session_key(chat_id),
+        "entity_type": "telegram_review_session",
+        "telegram_chat_id": str(chat_id),
+        "active_review_job_id": job_id,
+        "updated_at": int(time.time()),
+    })
+
+
+def _clear_active_review_job(chat_id: str) -> None:
+    try:
+        table.delete_item(Key={"job_id": _review_session_key(chat_id)})
+    except Exception as e:
+        logger.warning("CLEAR_REVIEW_SESSION_ERROR: %s", str(e))
+
+
+def _job_index_by_id(jobs: list[dict], job_id: str) -> int | None:
+    for idx, job in enumerate(jobs):
+        if job.get("job_id") == job_id:
+            return idx
+    return None
+
+
+def _resolve_review_job(chat_id: str, jobs: list[dict], index: int | None = None) -> tuple[dict | None, int | None]:
+    """Resolve an explicit index or the chat's active review job."""
+    if not jobs:
+        _clear_active_review_job(chat_id)
+        return None, None
+
+    if index is not None:
+        if index < 1 or index > len(jobs):
+            return None, None
+        job = jobs[index - 1]
+        _set_active_review_job(chat_id, job["job_id"])
+        return job, index
+
+    active_job_id = _get_active_review_job_id(chat_id)
+    active_idx = _job_index_by_id(jobs, active_job_id) if active_job_id else None
+    if active_idx is None:
+        job = jobs[0]
+        _set_active_review_job(chat_id, job["job_id"])
+        return job, 1
+    return jobs[active_idx], active_idx + 1
+
+
+def _advance_review_job(chat_id: str, jobs: list[dict]) -> tuple[dict | None, int | None, bool]:
+    """Advance to the next reviewable job for this chat."""
+    if not jobs:
+        _clear_active_review_job(chat_id)
+        return None, None, False
+
+    active_job_id = _get_active_review_job_id(chat_id)
+    active_idx = _job_index_by_id(jobs, active_job_id) if active_job_id else None
+    if active_idx is None:
+        job = jobs[0]
+        _set_active_review_job(chat_id, job["job_id"])
+        return job, 1, True
+    if active_idx + 1 >= len(jobs):
+        return jobs[active_idx], active_idx + 1, False
+
+    next_idx = active_idx + 1
+    job = jobs[next_idx]
+    _set_active_review_job(chat_id, job["job_id"])
+    return job, next_idx + 1, True
+
+
+def _refresh_active_review_job(chat_id: str) -> None:
+    jobs = _get_pending_jobs(limit=20)
+    if jobs:
+        _set_active_review_job(chat_id, jobs[0]["job_id"])
+    else:
+        _clear_active_review_job(chat_id)
 
 
 def _get_pipeline_stats() -> dict:
@@ -502,12 +713,14 @@ def _get_pipeline_stats() -> dict:
     }
     try:
         scan_args = {
-            "ProjectionExpression": "#s",
-            "ExpressionAttributeNames": {"#s": "status"},
+            "ProjectionExpression": "job_id, #s, entity_type, #src, signal_test, model_id",
+            "ExpressionAttributeNames": {"#s": "status", "#src": "source"},
         }
         while True:
             response = table.scan(**scan_args)
             for item in response.get("Items", []):
+                if _is_synthetic_job(item):
+                    continue
                 status = item.get("status", "UNKNOWN")
                 stats[status] = stats.get(status, 0) + 1
             if "LastEvaluatedKey" not in response:
@@ -671,33 +884,80 @@ def _retire_old_showcase_rows(active_job_id: str) -> None:
 
 
 def _format_job_explanation(job: dict, index: int) -> str:
-    recruiter = (job.get("recruiter_email") or "").strip()
-    if job.get("source") == "tejajob":
-        action = "practice workflow: preview a draft or mark complete"
-    elif recruiter:
-        action = "email outreach available"
-    else:
-        action = "manual apply or draft preview available"
     posted = _format_posted(job.get("posted_at", "")) or "Posted date unavailable"
     reason = job.get("match_reason") or "No model reason stored."
-    age = _job_age_days(job)
-    freshness = "fresh" if age is not None and age <= _source_max_age_days(job) else "not fresh"
 
     return (
-        f"Match explanation for #{index}\n\n"
-        f"Role: {job.get('title', 'Unknown')}\n"
-        f"Company: {job.get('company', 'Unknown')}\n"
+        f"Match #{index}\n\n"
+        f"{job.get('title', 'Unknown')} at {job.get('company', 'Unknown')}\n"
         f"Score: {job.get('match_score', '?')}%\n"
         f"Location: {job.get('location', 'Unknown')}\n"
-        f"Work mode: {_work_mode_label(job)}\n"
-        f"Work mode evidence: {_work_mode_evidence(job)}\n"
+        f"Work mode: {_work_mode_label(job)} ({_work_mode_evidence(job)})\n"
         f"Source: {_source_label(job)}\n"
         f"Source link: {_source_url(job) or 'Unavailable'}\n"
-        f"{posted}\n"
-        f"Freshness gate: {freshness}\n"
-        f"Action: {action}\n\n"
-        f"Reason: {reason}"
+        f"{posted}\n\n"
+        f"Why it matched: {reason}\n\n"
+        "Next: draft, apply, skip <reason>, or next"
     )
+
+
+def _reason_bullets(reason: str, limit: int = 3) -> list[str]:
+    """Turn a stored match reason into short Telegram-friendly bullets."""
+    cleaned = (reason or "").strip()
+    if not cleaned:
+        return ["No model reason stored."]
+
+    parts = [
+        part.strip(" -\t\r\n.")
+        for part in re.split(r"(?:\s*[•;\n]\s*|\.\s+)", cleaned)
+        if part and part.strip(" -\t\r\n.")
+    ]
+    if not parts:
+        return [cleaned]
+    return parts[:limit]
+
+
+def _build_review_card_keyboard() -> dict:
+    """Focused inline keyboard for reviewing one match at a time."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Why", "callback_data": "cmd:why"},
+                {"text": "Draft", "callback_data": "cmd:draft"},
+                {"text": "✓ Apply", "callback_data": "cmd:apply"},
+                {"text": "Skip", "callback_data": "cmd:skip"},
+            ],
+            [
+                {"text": "→ Next Match", "callback_data": "cmd:next"},
+            ],
+        ]
+    }
+
+
+def _format_next_review_card(job: dict) -> str:
+    """Compact card-style job view for the daily review flow."""
+    title = job.get("title", "Unknown role")
+    company = job.get("company", "Unknown company")
+    location = job.get("location", "Location not specified")
+    score = job.get("match_score", "?")
+    posted = _format_posted(job.get("posted_at", "")) or "Posted date unavailable"
+    source = _source_label(job)
+    work_mode = _work_mode_label(job)
+    bullets = _reason_bullets(job.get("match_reason", ""))
+
+    lines = [
+        f"{title}  [{score}% match]",
+        f"{company} · {location}",
+        f"{work_mode} · {source}",
+        "",
+        "Why you fit",
+    ]
+    lines.extend(f"• {bullet}" for bullet in bullets)
+    lines.extend([
+        "",
+        f"{posted} · {source}",
+    ])
+    return "\n".join(lines)
 
 
 def _handle_search(bot_token: str, chat_id: str) -> None:
@@ -800,7 +1060,8 @@ def _handle_list(bot_token: str, chat_id: str) -> None:
                 chat_id,
                 f"No fresh {SCORE_THRESHOLD}%+ matches are ready.\n\n"
                 f"{pending_total} older pending job(s) are hidden because they do not meet the current freshness/source rules.\n\n"
-                "Use search jobs to scan live sources again.",
+                "Use backlog to inspect the older jobs archive, or search jobs to scan live sources again.",
+                reply_markup=_build_state_keyboard("empty_pending"),
             )
             return
         empty_msg = (
@@ -855,7 +1116,39 @@ def _handle_list(bot_token: str, chat_id: str) -> None:
     _send_telegram(bot_token, chat_id, "\n".join(lines))
 
 
-def _handle_apply(bot_token: str, chat_id: str, index: int = 1) -> None:
+def _handle_backlog(bot_token: str, chat_id: str) -> None:
+    """Show hidden pending jobs when the user wants to inspect the broader pipeline backlog."""
+    jobs = _get_hidden_pending_jobs(limit=10)
+    if not jobs:
+        _send_telegram(
+            bot_token,
+            chat_id,
+            "No older processed jobs are sitting behind the review rules.\n\n"
+            "Use list for ready matches or search jobs for a fresh scan.",
+            reply_markup=_build_state_keyboard("more"),
+        )
+        return
+
+    lines = [f"Older jobs archive: {len(jobs)} processed job(s)\n"]
+    for i, job in enumerate(jobs, 1):
+        source_url = _source_url(job)
+        lines.append(f"{i}. {job.get('title', 'Unknown Role')}")
+        lines.append(f"   {job.get('company', 'Unknown')} | {job.get('location', 'Location not specified')}")
+        lines.append(f"   Match: {job.get('match_score', '?')}%")
+        lines.append(f"   Hidden because: {_hidden_pending_reason(job)}")
+        lines.append(f"   Source: {_source_label(job)}")
+        if source_url:
+            lines.append(f"   Source link: {source_url}")
+        posted = _format_posted(job.get("posted_at", ""))
+        if posted:
+            lines.append(f"   {posted}")
+        lines.append("")
+
+    lines.append("These jobs are already processed, but they stay out of Next Match because they do not pass the current review rules.")
+    _send_telegram(bot_token, chat_id, "\n".join(lines), reply_markup=_build_state_keyboard("more"))
+
+
+def _handle_apply(bot_token: str, chat_id: str, index: int | None = None) -> None:
     """Move a reviewable job to manual follow-up. Telegram never sends email here."""
     jobs = _get_pending_jobs(limit=20)
 
@@ -870,14 +1163,18 @@ def _handle_apply(bot_token: str, chat_id: str, index: int = 1) -> None:
             bot_token,
             chat_id,
             empty_msg,
+            reply_markup=_build_state_keyboard("home"),
         )
         return
 
-    if index < 1 or index > len(jobs):
+    if index is not None and (index < 1 or index > len(jobs)):
         _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
         return
 
-    job = jobs[index - 1]
+    job, resolved_index = _resolve_review_job(chat_id, jobs, index)
+    if not job or resolved_index is None:
+        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+        return
     job_id = job["job_id"]
     recruiter = (job.get("recruiter_email") or "").strip()
     source_url = _source_url(job)
@@ -890,6 +1187,7 @@ def _handle_apply(bot_token: str, chat_id: str, index: int = 1) -> None:
 
     if is_practice:
         _update_job_status(job_id, "SHOWCASE_COMPLETE")
+        _refresh_active_review_job(chat_id)
         _send_telegram(
             bot_token,
             chat_id,
@@ -903,6 +1201,7 @@ def _handle_apply(bot_token: str, chat_id: str, index: int = 1) -> None:
         return
 
     _update_job_status(job_id, "MANUAL_APPLY")
+    _refresh_active_review_job(chat_id)
     contact_line = f"Contact: {recruiter}" if recruiter else "Contact: no recruiter email found"
     _send_telegram(
         bot_token,
@@ -991,7 +1290,7 @@ def _handle_review_feedback(
     bot_token: str,
     chat_id: str,
     sentiment: str,
-    index: int = 1,
+    index: int | None = None,
     reason: str = "",
 ) -> None:
     """Record whether the user is interested in a reviewable job."""
@@ -1000,21 +1299,26 @@ def _handle_review_feedback(
         _send_telegram(bot_token, chat_id, "Your review queue is empty. Use search jobs to scan live sources.")
         return
 
-    if index < 1 or index > len(jobs):
+    if index is not None and (index < 1 or index > len(jobs)):
         _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
         return
 
-    job = jobs[index - 1]
+    job, resolved_index = _resolve_review_job(chat_id, jobs, index)
+    if not job or resolved_index is None:
+        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+        return
     status = _record_review_feedback(job["job_id"], sentiment, reason)
+    if sentiment == "not_interested":
+        _refresh_active_review_job(chat_id)
     label = {
         "interested": "interested",
         "not_interested": "not interested",
         "neutral": "neutral",
     }.get(sentiment, sentiment)
     next_step = (
-        "Next: use draft {0} or apply {0} if you want to act.".format(index)
+        "Next: use draft, apply, next, or skip <reason>."
         if sentiment != "not_interested"
-        else "I removed it from the active review queue."
+        else "I removed it from the active review queue. Use next to continue."
     )
     reason_line = f"\nReason: {reason}" if reason else ""
     _send_telegram(
@@ -1028,7 +1332,7 @@ def _handle_review_feedback(
     )
 
 
-def _handle_explain(bot_token: str, chat_id: str, index: int = 1) -> None:
+def _handle_explain(bot_token: str, chat_id: str, index: int | None = None) -> None:
     """Explain why a job is in the review queue."""
     jobs = _get_pending_jobs(limit=20)
     if not jobs:
@@ -1040,14 +1344,58 @@ def _handle_explain(bot_token: str, chat_id: str, index: int = 1) -> None:
         )
         _send_telegram(bot_token, chat_id, msg)
         return
-    if index < 1 or index > len(jobs):
+    if index is not None and (index < 1 or index > len(jobs)):
         _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
         return
 
-    _send_telegram(bot_token, chat_id, _format_job_explanation(jobs[index - 1], index))
+    job, resolved_index = _resolve_review_job(chat_id, jobs, index)
+    if not job or resolved_index is None:
+        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+        return
+
+    _send_telegram(bot_token, chat_id, _format_job_explanation(job, resolved_index))
 
 
-def _handle_draft(bot_token: str, chat_id: str, index: int = 1) -> None:
+def _handle_next(bot_token: str, chat_id: str) -> None:
+    """Advance the review session to the next reviewable job."""
+    jobs = _get_pending_jobs(limit=20)
+    if not jobs:
+        msg = (
+            "Your review queue is empty. Use tejajob or search jobs to add matches."
+            if ENABLE_PRACTICE_MODE
+            else
+            "No fresh reviewable match is ready.\n\nUse backlog to inspect the older jobs archive, or search jobs for a fresh scan."
+        )
+        _send_telegram(bot_token, chat_id, msg, reply_markup=_build_state_keyboard("empty_pending"))
+        return
+
+    job, resolved_index, advanced = _advance_review_job(chat_id, jobs)
+    if not job or resolved_index is None:
+        _send_telegram(
+            bot_token,
+            chat_id,
+            "No fresh reviewable match is ready.\n\nUse backlog to inspect the older jobs archive, or search jobs for a fresh scan.",
+            reply_markup=_build_state_keyboard("empty_pending"),
+        )
+        return
+    if not advanced:
+        _send_telegram(
+            bot_token,
+            chat_id,
+            _format_next_review_card(job) + "\n\nYou are already on the last reviewable match.",
+            reply_markup=_build_state_keyboard("review"),
+        )
+        return
+
+    _send_telegram(
+        bot_token,
+        chat_id,
+        _format_next_review_card(job),
+        reply_markup=_build_state_keyboard("review"),
+    )
+
+
+def _handle_draft(bot_token: str, chat_id: str, index: int | None = None) -> None:
     """Generate a preview-only outreach draft for a reviewable job."""
     jobs = _get_pending_jobs(limit=20)
     if not jobs:
@@ -1059,11 +1407,14 @@ def _handle_draft(bot_token: str, chat_id: str, index: int = 1) -> None:
         )
         _send_telegram(bot_token, chat_id, msg)
         return
-    if index < 1 or index > len(jobs):
+    if index is not None and (index < 1 or index > len(jobs)):
         _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
         return
 
-    job = jobs[index - 1]
+    job, resolved_index = _resolve_review_job(chat_id, jobs, index)
+    if not job or resolved_index is None:
+        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+        return
     try:
         response = lambda_client.invoke(
             FunctionName=SENDER_LAMBDA,
@@ -1087,11 +1438,11 @@ def _handle_draft(bot_token: str, chat_id: str, index: int = 1) -> None:
         _send_telegram(
             bot_token,
             chat_id,
-            f"Draft preview for #{index}\n\n"
+            f"Draft for match #{resolved_index}\n\n"
             f"Subject: {email.get('subject', '')}\n\n"
             f"{body}{fallback_note}\n\n"
             "No email was sent.\n\n"
-            f"Next: interested {index}, meh {index} <reason>, not interested {index} <reason>, or apply {index}.",
+            "Next: interested, meh <reason>, apply, skip <reason>, or next.",
         )
     except Exception as e:
         logger.error("DRAFT_PREVIEW_ERROR: %s", str(e))
@@ -1186,7 +1537,7 @@ def _handle_send(bot_token: str, chat_id: str, index: int = 1, confirmed: bool =
         _send_telegram(bot_token, chat_id, f"Could not send email: {str(e)}")
 
 
-def _handle_reject(bot_token: str, chat_id: str, index: int = 1) -> None:
+def _handle_reject(bot_token: str, chat_id: str, index: int | None = None) -> None:
     """Reject a specific reviewable job."""
     jobs = _get_pending_jobs(limit=20)
 
@@ -1194,12 +1545,16 @@ def _handle_reject(bot_token: str, chat_id: str, index: int = 1) -> None:
         _send_telegram(bot_token, chat_id, "Your review queue is empty.")
         return
 
-    if index < 1 or index > len(jobs):
+    if index is not None and (index < 1 or index > len(jobs)):
         _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
         return
 
-    job = jobs[index - 1]
+    job, _resolved_index = _resolve_review_job(chat_id, jobs, index)
+    if not job:
+        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+        return
     _update_job_status(job["job_id"], "REJECTED")
+    _refresh_active_review_job(chat_id)
     _send_telegram(bot_token, chat_id, f"Rejected: {job.get('title', 'Unknown')} at {job.get('company', 'Unknown')}")
 
 
@@ -1230,12 +1585,24 @@ def _handle_status(bot_token: str, chat_id: str) -> None:
     ]
 
     if not jobs and not watchlist:
+        hidden_total = stats.get("PENDING_APPROVAL", 0)
         lines.extend([
             "Reviewable evidence: none",
             "",
-            "Use search jobs to scan live sources, then status to inspect source links before acting.",
+            (
+                f"{hidden_total} processed job(s) sit behind the current rules. "
+                "Use backlog to inspect them."
+                if hidden_total
+                else
+                "Use search jobs to scan live sources, then status to inspect source links before acting."
+            ),
         ])
-        _send_telegram(bot_token, chat_id, "\n".join(lines))
+        _send_telegram(
+            bot_token,
+            chat_id,
+            "\n".join(lines),
+            reply_markup=_build_state_keyboard("empty_pending") if hidden_total else _build_state_keyboard("more"),
+        )
         return
 
     lines.append("Reviewable evidence:" if jobs else f"Reviewable evidence: none at {SCORE_THRESHOLD}%+")
@@ -1284,12 +1651,12 @@ def _handle_status(bot_token: str, chat_id: str) -> None:
 
 def _handle_help(bot_token: str, chat_id: str) -> None:
     """Show available commands."""
-    text, inline_keyboard = _help_page("home")
+    text = _help_text("home")
     _send_telegram(
         bot_token,
         chat_id,
         text,
-        reply_markup=inline_keyboard,
+        reply_markup=_build_state_keyboard("home"),
     )
 
 
@@ -1321,6 +1688,7 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
     """Parse user input and route to a command handler."""
     raw = command.strip()
     cmd = raw.lower()
+    daily_skip = re.match(r"^skip(?:\s+(.+))?$", raw, re.IGNORECASE)
 
     if cmd in (
         "search jobs",
@@ -1353,12 +1721,48 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
         _handle_followups(bot_token, chat_id)
         return
 
+    if cmd in ("backlog", "hidden", "hidden jobs", "pending jobs", "pending backlog"):
+        _handle_backlog(bot_token, chat_id)
+        return
+
+    if cmd in ("follow-up", "follow up"):
+        _send_telegram(bot_token, chat_id, _help_text("followup"), reply_markup=_build_state_keyboard("followup"))
+        return
+
     if cmd in ("status", "stats"):
         _handle_status(bot_token, chat_id)
         return
 
+    if cmd in ("more", "advanced"):
+        _send_telegram(bot_token, chat_id, _help_text("more"), reply_markup=_build_state_keyboard("more"))
+        return
+
     if cmd in ("help", "start", "/start", "/help"):
         _handle_help(bot_token, chat_id)
+        return
+
+    if cmd in ("home", "main menu"):
+        _handle_help(bot_token, chat_id)
+        return
+
+    if cmd in ("next", "next match", "next job", "show next", "review next"):
+        _handle_next(bot_token, chat_id)
+        return
+
+    if cmd in ("why", "why this", "why this job"):
+        _handle_explain(bot_token, chat_id, None)
+        return
+
+    if daily_skip:
+        reason = (daily_skip.group(1) or "").strip()
+        if not reason:
+            _send_telegram(
+                bot_token,
+                chat_id,
+                "Tell me why you want to skip it so I can learn.\n\nExample: skip too senior",
+            )
+            return
+        _handle_review_feedback(bot_token, chat_id, "not_interested", None, reason)
         return
 
     match = APPLICATION_OUTCOME_PATTERN.match(raw)
@@ -1390,7 +1794,7 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
 
     match = APPLY_PATTERN.match(cmd)
     if match:
-        index = int(match.group(1)) if match.group(1) else 1
+        index = int(match.group(1)) if match.group(1) else None
         _handle_apply(bot_token, chat_id, index)
         return
     if cmd.startswith("apply"):
@@ -1399,7 +1803,7 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
 
     match = EXPLAIN_PATTERN.match(cmd)
     if match:
-        index = int(match.group(1)) if match.group(1) else 1
+        index = int(match.group(1)) if match.group(1) else None
         _handle_explain(bot_token, chat_id, index)
         return
     if cmd.startswith("explain"):
@@ -1408,7 +1812,7 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
 
     match = DRAFT_PATTERN.match(cmd)
     if match:
-        index = int(match.group(1)) if match.group(1) else 1
+        index = int(match.group(1)) if match.group(1) else None
         _handle_draft(bot_token, chat_id, index)
         return
     if cmd.startswith("draft"):
@@ -1431,7 +1835,7 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
 
     match = REJECT_PATTERN.match(cmd)
     if match:
-        index = int(match.group(1)) if match.group(1) else 1
+        index = int(match.group(1)) if match.group(1) else None
         _handle_reject(bot_token, chat_id, index)
         return
     if cmd.startswith("reject"):
@@ -1451,6 +1855,14 @@ def _handle_callback_command(bot_token: str, chat_id: str, callback_query_id: st
 
     if data.startswith("cmd:"):
         command = data.split(":", 1)[1]
+        if CONFIRM_SEND_PATTERN.match(command):
+            _answer_callback_query(bot_token, callback_query_id, "Type confirm send manually")
+            _send_telegram(
+                bot_token,
+                chat_id,
+                "For safety, confirm send must be typed manually.\n\nType exactly: confirm send 1",
+            )
+            return
         _answer_callback_query(bot_token, callback_query_id, f"Running {command}")
         _route_command(command, bot_token, chat_id)
         return
