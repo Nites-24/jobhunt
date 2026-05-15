@@ -86,6 +86,33 @@ _context_loaded_at: float = 0
 CONTEXT_TTL_SECONDS = 300  # Refresh S3 context every 5 minutes
 
 
+def _source_key(job: Dict[str, Any]) -> tuple[str, str]:
+    source = str(job.get("source") or "unknown").strip().lower() or "unknown"
+    query = str(job.get("source_search_query") or "").strip() or "-"
+    return source, query
+
+
+def _summarize_source_query_outcomes(results: list[dict]) -> list[dict]:
+    summary: dict[tuple[str, str], dict[str, int | str]] = {}
+    for result in results:
+        source = str(result.get("source") or "unknown")
+        query = str(result.get("query") or "-")
+        key = (source, query)
+        if key not in summary:
+            summary[key] = {
+                "source": source,
+                "query": query,
+                "evaluated": 0,
+                "matched": 0,
+                "rejected": 0,
+                "failed": 0,
+            }
+        bucket = summary[key]
+        for field in ("evaluated", "matched", "rejected", "failed"):
+            bucket[field] += int(result.get(field, 0) or 0)
+    return [summary[key] for key in sorted(summary)]
+
+
 def _load_s3_file(key: str) -> str:
     """Read a single S3 text file, return empty string on failure."""
     try:
@@ -602,14 +629,17 @@ def lambda_handler(event, context):
 
     batch_item_failures = []
     stats = {"evaluated": 0, "matched": 0, "rejected": 0, "failed": 0}
+    source_query_results = []
 
     for record in records:
         message_id = record.get("messageId", "unknown")
         job_id = "unknown"
+        job: Dict[str, Any] = {}
 
         try:
             job = json.loads(record["body"])
             job_id = job.get("job_id", "unknown")
+            source, query = _source_key(job)
 
             logger.info(
                 "EVAL_START | job_id=%s | title=%s | company=%s",
@@ -661,13 +691,31 @@ def lambda_handler(event, context):
                 status = "REJECTED"
                 stats["rejected"] += 1
                 _update_job_status(job_id, match_score, match_reason, status)
+            source_query_results.append({
+                "source": source,
+                "query": query,
+                "evaluated": 1,
+                "matched": 1 if status == "PENDING_APPROVAL" else 0,
+                "rejected": 1 if status == "REJECTED" else 0,
+                "failed": 0,
+            })
 
         except Exception as e:
             logger.error("RECORD_FAILED | job_id=%s | msg_id=%s | error=%s", job_id, message_id, str(e))
             stats["failed"] += 1
             batch_item_failures.append({"itemIdentifier": message_id})
+            source, query = _source_key(job)
+            source_query_results.append({
+                "source": source,
+                "query": query,
+                "evaluated": 0,
+                "matched": 0,
+                "rejected": 0,
+                "failed": 1,
+            })
 
     logger.info("BATCH_COMPLETE | %s", json.dumps(stats))
+    logger.info("PROCESSOR_YIELD_BY_SOURCE_QUERY | %s", json.dumps(_summarize_source_query_outcomes(source_query_results)))
 
     # SQS partial batch failures — only retry the specific records that failed
     return {"batchItemFailures": batch_item_failures}

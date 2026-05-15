@@ -8,8 +8,12 @@ import boto3
 
 REGION = "us-east-1"
 TARGET_ENV = {
+    "job-ingestor": {
+        "ADZUNA_QUERIES": "AI Engineer;;Applied AI Engineer;;LLM Engineer;;RAG Engineer;;Generative AI Engineer;;Agent Engineer;;AI Platform Engineer;;ML Systems Engineer;;Inference Engineer",
+        "ADZUNA_MAX_DAYS_OLD": "7",
+    },
     "job-processor": {
-        "SCORE_THRESHOLD": "90",
+        "SCORE_THRESHOLD": "80",
         "MAX_JOB_AGE_DAYS": "14",
         "STALE_SCORE_CAP": "55",
         "MISSING_DATE_SCORE_CAP": "70",
@@ -18,7 +22,7 @@ TARGET_ENV = {
         "MISSING_SOURCE_SCORE_CAP": "40",
     },
     "job-router": {
-        "SCORE_THRESHOLD": "90",
+        "SCORE_THRESHOLD": "80",
         "MAX_JOB_AGE_DAYS": "14",
         "ENABLE_PRACTICE_MODE": "false",
         "ALLOW_TELEGRAM_EMAIL_SEND": "true",

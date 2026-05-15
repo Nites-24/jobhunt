@@ -345,3 +345,30 @@ class TestProcessor:
         assert "candidate:" in context
         assert "skills:" in context
         assert "RetireIQ" in context
+
+    @patch("job_processor.lambda_function._send_match_notification")
+    @patch("job_processor.lambda_function.bedrock")
+    def test_processor_logs_source_query_yield_summary(self, mock_bedrock, mock_notify):
+        """Batch completion should log compact per-source/query scoring outcomes."""
+        mod, table, s3, sns = self._setup_infra()
+        job_high = {**SAMPLE_JOB, "job_id": "job-high", "source": "adzuna", "source_search_query": "AI Engineer"}
+        job_low = {**SAMPLE_JOB, "job_id": "job-low", "source": "hackernews", "source_search_query": "hn_who_is_hiring"}
+        table.put_item(Item={"job_id": "job-high", "status": "NEW"})
+        table.put_item(Item={"job_id": "job-low", "status": "NEW"})
+        mock_bedrock.converse.side_effect = [
+            self._mock_bedrock_response(95, "Great match"),
+            self._mock_bedrock_response(30, "Poor match"),
+        ]
+
+        with patch.object(mod.logger, "info") as mock_info:
+            mod.lambda_handler(make_sqs_event([job_high, job_low]), MockContext())
+
+        summary_call = next(
+            call for call in mock_info.call_args_list
+            if call.args and call.args[0] == "PROCESSOR_YIELD_BY_SOURCE_QUERY | %s"
+        )
+        payload = json.loads(summary_call.args[1])
+        assert payload == [
+            {"source": "adzuna", "query": "AI Engineer", "evaluated": 1, "matched": 1, "rejected": 0, "failed": 0},
+            {"source": "hackernews", "query": "hn_who_is_hiring", "evaluated": 1, "matched": 0, "rejected": 1, "failed": 0},
+        ]

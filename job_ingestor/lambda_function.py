@@ -14,6 +14,51 @@ from datetime import datetime, timezone
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+DEFAULT_GOOGLE_CSE_QUERY = (
+    '("AI Engineer" OR "LLM Engineer" OR "RAG Engineer" OR "Machine Learning Engineer") '
+    '(site:greenhouse.io OR site:lever.co OR site:ashbyhq.com OR site:workdayjobs.com OR site:jobs.ashbyhq.com)'
+)
+HN_SOURCE_QUERY = "hn_who_is_hiring"
+DEFAULT_ADZUNA_QUERIES = [
+    "AI Engineer",
+    "Applied AI Engineer",
+    "LLM Engineer",
+    "RAG Engineer",
+    "Generative AI Engineer",
+    "Agent Engineer",
+    "AI Platform Engineer",
+    "ML Systems Engineer",
+    "Inference Engineer",
+]
+
+
+def _load_google_cse_queries() -> list[str]:
+    raw = os.environ.get("GOOGLE_CSE_QUERIES", "")
+    if not raw.strip():
+        raw = DEFAULT_GOOGLE_CSE_QUERY
+    return [q.strip() for q in raw.split(";;") if q.strip()]
+
+
+def _load_adzuna_queries() -> list[str]:
+    raw = os.environ.get("ADZUNA_QUERIES", "")
+    if not raw.strip():
+        return DEFAULT_ADZUNA_QUERIES.copy()
+    return [q.strip() for q in raw.split(";;") if q.strip()]
+
+
+def _source_query_summary(jobs: list[dict]) -> list[dict]:
+    summary: dict[tuple[str, str], int] = {}
+    for job in jobs:
+        source = str(job.get("source") or "unknown").strip().lower() or "unknown"
+        query = str(job.get("source_search_query") or "").strip() or "-"
+        key = (source, query)
+        summary[key] = summary.get(key, 0) + 1
+
+    return [
+        {"source": source, "query": query, "fetched": count}
+        for (source, query), count in sorted(summary.items())
+    ]
+
 sqs = boto3.client("sqs", region_name="us-east-1")
 secretsmanager = boto3.client("secretsmanager", region_name="us-east-1")
 QUEUE_URL = os.environ.get("RAW_QUEUE_URL")
@@ -31,23 +76,11 @@ JSEARCH_QUERIES = [
 GOOGLE_CSE_SECRET_NAME = os.environ.get("GOOGLE_CSE_SECRET_NAME", "jobsearch/google_cse")
 GOOGLE_CSE_ENABLED = os.environ.get("GOOGLE_CSE_ENABLED", "true").strip().lower() == "true"
 GOOGLE_CSE_MAX_RESULTS = int(os.environ.get("GOOGLE_CSE_MAX_RESULTS", "10"))
-GOOGLE_CSE_QUERIES = [
-    q.strip()
-    for q in os.environ.get(
-        "GOOGLE_CSE_QUERIES",
-        '("AI Engineer" OR "LLM Engineer" OR "RAG Engineer" OR "Machine Learning Engineer") '
-        '(site:greenhouse.io OR site:lever.co OR site:ashbyhq.com OR site:workdayjobs.com OR site:jobs.ashbyhq.com)',
-    ).split(";;")
-    if q.strip()
-]
+GOOGLE_CSE_QUERIES = _load_google_cse_queries()
 ADZUNA_SECRET_NAME = os.environ.get("ADZUNA_SECRET_NAME", "adzuna/jobsearch")
 ADZUNA_ENABLED = os.environ.get("ADZUNA_ENABLED", "true").strip().lower() == "true"
 ADZUNA_MAX_RESULTS = int(os.environ.get("ADZUNA_MAX_RESULTS", "20"))
-ADZUNA_QUERIES = [
-    q.strip()
-    for q in os.environ.get("ADZUNA_QUERIES", "AI Engineer;;LLM Engineer;;Machine Learning Engineer").split(";;")
-    if q.strip()
-]
+ADZUNA_QUERIES = _load_adzuna_queries()
 ADZUNA_WHERE = os.environ.get("ADZUNA_WHERE", "").strip()
 ADZUNA_MAX_DAYS_OLD = int(os.environ.get("ADZUNA_MAX_DAYS_OLD", "14"))
 HN_MAX_COMMENTS = int(os.environ.get("HN_MAX_COMMENTS", "800"))
@@ -438,6 +471,7 @@ def _parse_hn_comment(comment: dict) -> dict | None:
         "source": "hackernews",
         "source_provider": "Hacker News Firebase API",
         "source_origin": "Ask HN: Who is hiring?",
+        "source_search_query": HN_SOURCE_QUERY,
         "source_comment_id": str(kid_id),
         "source_author": author,
         "external_links": urls,
@@ -677,6 +711,9 @@ def fetch_google_cse_jobs() -> list:
     if not GOOGLE_CSE_ENABLED:
         logger.info("GOOGLE_CSE_DISABLED")
         return []
+    if not GOOGLE_CSE_QUERIES:
+        logger.info("GOOGLE_CSE_SKIP: no queries configured")
+        return []
 
     api_key, cx = _get_google_cse_credentials()
     if not api_key or not cx:
@@ -863,6 +900,7 @@ def lambda_handler(event, context):
     adzuna_jobs = fetch_adzuna_jobs()
     jsearch_jobs = fetch_jsearch_jobs()
     all_jobs = _dedupe_batch(hn_jobs + google_cse_jobs + adzuna_jobs + jsearch_jobs)
+    logger.info("INGESTOR_YIELD_BY_SOURCE_QUERY | %s", json.dumps(_source_query_summary(all_jobs)))
     
     if not all_jobs:
         return {"status": "success", "message": "No jobs found.", "jobs_ingested": 0}

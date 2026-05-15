@@ -13,6 +13,7 @@ import json
 import pytest
 import boto3
 from moto import mock_aws
+from unittest.mock import patch
 from conftest import SAMPLE_JOB, MockContext, make_sqs_event
 
 
@@ -62,7 +63,7 @@ class TestDeduplicator:
         assert scan["Count"] == 1
         item = scan["Items"][0]
         assert item["status"] == "NEW"
-        assert item["title"] == "Senior AI Engineer"
+        assert item["title"] == "AI Engineer"
 
         # Job forwarded to SQS
         msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
@@ -84,9 +85,13 @@ class TestDeduplicator:
         sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
         table.update_item(
             Key={"job_id": SAMPLE_JOB["job_id"]},
-            UpdateExpression="SET #s = :s, evaluated_at = :e",
+            UpdateExpression="SET #s = :s, evaluated_at = :e, evaluation_profile_version = :v",
             ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":s": "REJECTED", ":e": 1778630000},
+            ExpressionAttributeValues={
+                ":s": "REJECTED",
+                ":e": 1778630000,
+                ":v": mod.CURRENT_EVAL_PROFILE_VERSION,
+            },
         )
 
         # Second run: duplicate
@@ -97,6 +102,33 @@ class TestDeduplicator:
         assert table.scan()["Count"] == 1
         msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
         assert msgs.get("Messages", []) == []
+
+    def test_duplicate_rejected_job_requeued_when_profile_version_changes(self):
+        """A previously rejected row should be re-scored once when the eval profile version changes."""
+        mod, table, sqs, queue_url = self._setup_infra()
+
+        event = make_sqs_event([SAMPLE_JOB])
+
+        mod.lambda_handler(event, MockContext())
+        sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
+        table.update_item(
+            Key={"job_id": SAMPLE_JOB["job_id"]},
+            UpdateExpression="SET #s = :s, evaluated_at = :e, evaluation_profile_version = :v",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":s": "REJECTED",
+                ":e": 1778630000,
+                ":v": "2026-05-01",
+            },
+        )
+
+        result = mod.lambda_handler(event, MockContext())
+
+        assert result["batchItemFailures"] == []
+        msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
+        assert len(msgs.get("Messages", [])) == 1
+        body = json.loads(msgs["Messages"][0]["Body"])
+        assert body["job_id"] == SAMPLE_JOB["job_id"]
 
     def test_duplicate_unscored_job_requeued(self):
         """A duplicate stuck in NEW should be re-forwarded for scoring."""
@@ -196,3 +228,26 @@ class TestDeduplicator:
         assert item.get("location") == "San Francisco, CA"
         assert "ingested_at" in item
         assert "ttl" in item
+
+    def test_dedup_logs_source_query_yield_summary(self):
+        """Batch completion should log compact per-source/query outcomes."""
+        mod, table, sqs, queue_url = self._setup_infra()
+        job2 = {
+            **SAMPLE_JOB,
+            "job_id": "test-job-002",
+            "source": "adzuna",
+            "source_search_query": "LLM Engineer",
+        }
+
+        with patch.object(mod.logger, "info") as mock_info:
+            mod.lambda_handler(make_sqs_event([SAMPLE_JOB, job2]), MockContext())
+
+        summary_call = next(
+            call for call in mock_info.call_args_list
+            if call.args and call.args[0] == "DEDUP_YIELD_BY_SOURCE_QUERY | %s"
+        )
+        payload = json.loads(summary_call.args[1])
+        assert payload == [
+            {"source": "adzuna", "query": "LLM Engineer", "new": 1, "requeued": 0, "duplicate": 0, "failed": 0},
+            {"source": "jsearch", "query": "-", "new": 1, "requeued": 0, "duplicate": 0, "failed": 0},
+        ]

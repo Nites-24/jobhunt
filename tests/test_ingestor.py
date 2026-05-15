@@ -1,4 +1,6 @@
 import json
+import importlib
+import os
 from unittest.mock import patch
 
 import boto3
@@ -78,6 +80,7 @@ class TestIngestor:
         assert bodies[0]["company"] == "Anthropic"
         assert bodies[0]["location"] == "San Francisco"
         assert bodies[0]["source"] == "hackernews"
+        assert bodies[0]["source_search_query"] == "hn_who_is_hiring"
         assert bodies[0]["recruiter_email"] == "real@anthropic.com"
         assert bodies[0]["work_mode"] == "onsite"
         assert bodies[0]["work_mode_source"] == "description"
@@ -104,6 +107,7 @@ class TestIngestor:
         assert parsed["work_mode_source"] == "location"
         assert parsed["url"] == "https://news.ycombinator.com/item?id=47980487"
         assert parsed["source_provider"] == "Hacker News Firebase API"
+        assert parsed["source_search_query"] == "hn_who_is_hiring"
 
     def test_hn_parser_compacts_prose_leaking_into_location(self):
         mod, _, _ = self._setup_infra()
@@ -163,6 +167,49 @@ class TestIngestor:
         assert job["title"] == "AI Engineer"
         assert job["location"] == "San Francisco"
         assert job["work_mode"] == ""
+
+    def test_google_cse_blank_env_uses_default_queries(self):
+        previous = os.environ.get("GOOGLE_CSE_QUERIES")
+        os.environ["GOOGLE_CSE_QUERIES"] = ""
+
+        import job_ingestor.lambda_function as mod
+        mod = importlib.reload(mod)
+
+        try:
+            assert mod.GOOGLE_CSE_QUERIES
+            assert any("greenhouse.io" in query for query in mod.GOOGLE_CSE_QUERIES)
+        finally:
+            if previous is None:
+                os.environ.pop("GOOGLE_CSE_QUERIES", None)
+            else:
+                os.environ["GOOGLE_CSE_QUERIES"] = previous
+            importlib.reload(mod)
+
+    def test_adzuna_blank_env_uses_targeted_default_queries(self):
+        previous = os.environ.get("ADZUNA_QUERIES")
+        os.environ["ADZUNA_QUERIES"] = ""
+
+        import job_ingestor.lambda_function as mod
+        mod = importlib.reload(mod)
+
+        try:
+            assert mod.ADZUNA_QUERIES == [
+                "AI Engineer",
+                "Applied AI Engineer",
+                "LLM Engineer",
+                "RAG Engineer",
+                "Generative AI Engineer",
+                "Agent Engineer",
+                "AI Platform Engineer",
+                "ML Systems Engineer",
+                "Inference Engineer",
+            ]
+        finally:
+            if previous is None:
+                os.environ.pop("ADZUNA_QUERIES", None)
+            else:
+                os.environ["ADZUNA_QUERIES"] = previous
+            importlib.reload(mod)
 
     def test_adzuna_normalization_preserves_source_evidence(self):
         mod, _, _ = self._setup_infra()

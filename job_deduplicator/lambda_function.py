@@ -35,11 +35,24 @@ REQUEUE_DUPLICATE_STATUSES = {
     for status in os.environ.get("REQUEUE_DUPLICATE_STATUSES", "NEW").split(",")
     if status.strip()
 }
-REFRESH_DUPLICATE_STATUSES = {
+REEVALUATE_DUPLICATE_STATUSES = {
     status.strip()
-    for status in os.environ.get("REFRESH_DUPLICATE_STATUSES", "NEW,PENDING_APPROVAL").split(",")
+    for status in os.environ.get(
+        "REEVALUATE_DUPLICATE_STATUSES",
+        "REJECTED,REJECTED_OLD,NO_RECRUITER_EMAIL",
+    ).split(",")
     if status.strip()
 }
+REFRESH_DUPLICATE_STATUSES = {
+    status.strip()
+    for status in os.environ.get(
+        "REFRESH_DUPLICATE_STATUSES",
+        "NEW,PENDING_APPROVAL,REJECTED,REJECTED_OLD,NO_RECRUITER_EMAIL",
+    ).split(",")
+    if status.strip()
+}
+DEFAULT_EVAL_PROFILE_VERSION = f"2026-05-13-th{os.environ.get('SCORE_THRESHOLD', '80')}"
+CURRENT_EVAL_PROFILE_VERSION = os.environ.get("JOB_EVAL_PROFILE_VERSION", DEFAULT_EVAL_PROFILE_VERSION)
 
 # Fields used for deduplication hash (title + company + URL uniquely identifies a job)
 HASH_FIELDS = ("title", "company", "url", "apply_url")
@@ -67,6 +80,38 @@ REFRESH_FIELDS = (
 )
 
 
+def _source_key(job: dict) -> tuple[str, str]:
+    source = str(job.get("source") or "unknown").strip().lower() or "unknown"
+    query = str(job.get("source_search_query") or "").strip() or "-"
+    return source, query
+
+
+def _summarize_source_query_outcomes(results: list[dict]) -> list[dict]:
+    summary: dict[tuple[str, str], dict[str, int | str]] = {}
+    for result in results:
+        source = str(result.get("source") or "unknown")
+        query = str(result.get("query") or "-")
+        key = (source, query)
+        if key not in summary:
+            summary[key] = {
+                "source": source,
+                "query": query,
+                "new": 0,
+                "requeued": 0,
+                "duplicate": 0,
+                "failed": 0,
+            }
+        bucket = summary[key]
+        outcome = str(result.get("status") or "failed")
+        if outcome in ("duplicate", "duplicate_race"):
+            bucket["duplicate"] += 1
+        elif outcome in ("new", "requeued", "failed"):
+            bucket[outcome] += 1
+        else:
+            bucket["failed"] += 1
+    return [summary[key] for key in sorted(summary)]
+
+
 def _compute_job_hash(job: dict) -> str:
     """Generate a deterministic hash for deduplication based on core job identity."""
     raw = "|".join(
@@ -80,13 +125,22 @@ def _get_existing_job(job_id: str) -> dict | None:
     try:
         response = table.get_item(
             Key={"job_id": job_id},
-            ProjectionExpression="job_id, #s, evaluated_at, match_score",
+            ProjectionExpression="job_id, #s, evaluated_at, match_score, evaluation_profile_version",
             ExpressionAttributeNames={"#s": "status"},
         )
         return response.get("Item")
     except Exception as e:
         logger.error("DB_CHECK_ERROR | job_id=%s | %s", job_id, str(e))
         raise
+
+
+def _should_reevaluate(existing_job: dict) -> bool:
+    """Allow one controlled re-score when the evaluation profile version changes."""
+    status = existing_job.get("status", "")
+    if status not in REEVALUATE_DUPLICATE_STATUSES:
+        return False
+    stored_version = str(existing_job.get("evaluation_profile_version", "") or "").strip()
+    return stored_version != CURRENT_EVAL_PROFILE_VERSION
 
 
 def _persist_job(job: dict, job_id: str) -> None:
@@ -178,14 +232,26 @@ def _process_record(record: dict) -> dict:
         if existing_status in REQUEUE_DUPLICATE_STATUSES and not existing_job.get("evaluated_at"):
             _forward_to_filtered_queue(raw_job, job_id)
             logger.info(
-                "DUPLICATE_REQUEUED | job_id=%s | status=%s | title=%s",
+                "DUPLICATE_REQUEUED | job_id=%s | status=%s | reason=unscored | title=%s",
                 job_id, existing_status, raw_job.get("title", "?"),
             )
             return {"status": "requeued", "job_id": job_id}
 
+        if _should_reevaluate(existing_job):
+            _forward_to_filtered_queue(raw_job, job_id)
+            logger.info(
+                "DUPLICATE_REQUEUED | job_id=%s | status=%s | reason=profile_version_changed | old_version=%s | new_version=%s | title=%s",
+                job_id,
+                existing_status,
+                existing_job.get("evaluation_profile_version", ""),
+                CURRENT_EVAL_PROFILE_VERSION,
+                raw_job.get("title", "?"),
+            )
+            return {"status": "requeued", "job_id": job_id}
+
         logger.info(
-            "DUPLICATE_SKIP | job_id=%s | status=%s | title=%s",
-            job_id, existing_status, raw_job.get("title", "?"),
+            "DUPLICATE_SKIP | job_id=%s | status=%s | eval_version=%s | title=%s",
+            job_id, existing_status, existing_job.get("evaluation_profile_version", ""), raw_job.get("title", "?"),
         )
         return {"status": "duplicate", "job_id": job_id}
 
@@ -213,11 +279,24 @@ def lambda_handler(event: dict, context: Any) -> dict:
     logger.info("DEDUP_BATCH_START | count=%d", len(records))
 
     stats = {"new": 0, "requeued": 0, "duplicate": 0, "failed": 0}
+    source_query_results = []
     batch_item_failures = []
 
     for record in records:
+        raw_job = None
         try:
+            try:
+                raw_job = json.loads(record["body"])
+            except json.JSONDecodeError:
+                raw_job = None
+
             result = _process_record(record)
+            source, query = _source_key(raw_job or {})
+            source_query_results.append({
+                "status": result["status"],
+                "source": source,
+                "query": query,
+            })
             if result["status"] == "new":
                 stats["new"] += 1
             elif result["status"] == "requeued":
@@ -231,8 +310,15 @@ def lambda_handler(event: dict, context: Any) -> dict:
             logger.error("RECORD_FAILED | messageId=%s | error=%s", record["messageId"], str(e))
             stats["failed"] += 1
             batch_item_failures.append({"itemIdentifier": record["messageId"]})
+            source, query = _source_key(raw_job or {})
+            source_query_results.append({
+                "status": "failed",
+                "source": source,
+                "query": query,
+            })
 
     logger.info("DEDUP_BATCH_COMPLETE | %s", json.dumps(stats))
+    logger.info("DEDUP_YIELD_BY_SOURCE_QUERY | %s", json.dumps(_summarize_source_query_outcomes(source_query_results)))
 
     # SQS partial batch failure format — only return batchItemFailures
     return {"batchItemFailures": batch_item_failures}
