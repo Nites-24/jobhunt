@@ -33,7 +33,7 @@ pending = [i for i in all_items if i.get("status") == "PENDING_APPROVAL"]
 print(f"\nFound {len(pending)} PENDING_APPROVAL jobs in DynamoDB")
 
 if not pending:
-    # Check for any 85%+ jobs that were rejected at 90% threshold
+    # Check for any 85%+ jobs that were rejected at 80% threshold
     high_scores = [i for i in all_items if int(i.get("match_score", 0)) >= 85]
     print(f"Found {len(high_scores)} jobs scored 85%+ (updating to PENDING_APPROVAL)")
     for job in high_scores:

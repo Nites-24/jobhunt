@@ -64,7 +64,7 @@ def _evaluate_case(case: dict, threshold: int) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run offline scoring guardrail evals.")
     parser.add_argument("--cases", default="evals/scoring_labeled_set.json")
-    parser.add_argument("--threshold", type=int, default=90)
+    parser.add_argument("--threshold", type=int, default=80)
     args = parser.parse_args()
 
     cases = _load_cases(ROOT / args.cases)

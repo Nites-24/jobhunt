@@ -6,7 +6,7 @@ Responsibilities:
   - Calibrate scoring thresholds (is 85% too strict / too loose?)
   - Audit prompt quality (system instructions, tool schemas)
   - Monitor token usage and cost
-  - Detect scoring drift (all jobs getting 90+ or all below 50)
+  - Detect scoring drift (all jobs getting 80+ or all below 50)
   - Test email generation quality (banned words, tone, formatting)
   
 This agent is the "brain tuner" — it makes sure the AI scoring
@@ -316,7 +316,7 @@ class AIEngineerAgent(BaseAgent):
         if high_pct > 80:
             recommendation = (
                 f"Average score is {avg}. {high_pct}% of jobs score 85+. "
-                f"Consider raising SCORE_THRESHOLD to 90 or tightening the system prompt "
+                f"Consider raising SCORE_THRESHOLD above 80 or tightening the system prompt "
                 f"to penalize generic roles more heavily."
             )
         elif high_pct < 5:

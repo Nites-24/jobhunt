@@ -1,0 +1,885 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JobAlert Bot — UX Redesign Concept</title>
+<link href="https://api.fontshare.com/v2/css?f[]=satoshi@300,400,500,600,700&display=swap" rel="stylesheet">
+<style>
+:root, [data-theme="light"] {
+  --color-bg: #f7f6f2;
+  --color-surface: #f9f8f5;
+  --color-surface-2: #fbfbf9;
+  --color-surface-offset: #f3f0ec;
+  --color-divider: #dcd9d5;
+  --color-border: #d4d1ca;
+  --color-text: #28251d;
+  --color-text-muted: #7a7974;
+  --color-text-faint: #bab9b4;
+  --color-primary: #01696f;
+  --color-primary-hover: #0c4e54;
+  --color-success: #437a22;
+  --color-success-highlight: #d4dfcc;
+  --font-body: 'Satoshi', system-ui, sans-serif;
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-full: 9999px;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+  --space-12: 3rem;
+  --tg-bg: #17212b;
+  --tg-surface: #242f3d;
+  --tg-bubble-bot: #182533;
+  --tg-bubble-user: #2b5278;
+  --tg-btn: #2b5278;
+  --tg-btn-hover: #3a6a9a;
+  --tg-text: #e8f0f9;
+  --tg-text-muted: #7d8fa1;
+  --tg-text-faint: #455768;
+  --tg-border: rgba(255,255,255,0.07);
+  --tg-accent: #5ba4cf;
+  --tg-green: #4caf87;
+  --tg-orange: #f0a050;
+}
+
+[data-theme="dark"] {
+  --color-bg: #0f1117;
+  --color-surface: #161b22;
+  --color-surface-2: #1c2128;
+  --color-surface-offset: #21262d;
+  --color-divider: #30363d;
+  --color-border: #3d444e;
+  --color-text: #e6edf3;
+  --color-text-muted: #8b949e;
+  --color-text-faint: #3d444e;
+  --color-primary: #4f98a3;
+  --color-primary-hover: #227f8b;
+  --color-success: #6daa45;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { -webkit-font-smoothing: antialiased; scroll-behavior: smooth; }
+body {
+  font-family: var(--font-body);
+  background: var(--color-bg);
+  color: var(--color-text);
+  min-height: 100dvh;
+  line-height: 1.6;
+  font-size: 16px;
+}
+
+/* ============ LAYOUT ============ */
+.page-header {
+  padding: var(--space-6) var(--space-8);
+  border-bottom: 1px solid var(--color-divider);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  background: var(--color-bg);
+  z-index: 100;
+  backdrop-filter: blur(12px);
+}
+.logo-mark {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-weight: 600;
+  font-size: 1.1rem;
+}
+.logo-mark svg { color: var(--color-primary); }
+
+.hero-section {
+  text-align: center;
+  padding: var(--space-12) var(--space-8) var(--space-8);
+}
+.hero-section h1 {
+  font-size: clamp(1.75rem, 1.2rem + 2.5vw, 3rem);
+  font-weight: 700;
+  margin-bottom: var(--space-3);
+  line-height: 1.2;
+}
+.hero-section p {
+  font-size: 1.05rem;
+  color: var(--color-text-muted);
+  max-width: 520px;
+  margin: 0 auto var(--space-6);
+}
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-4);
+  border-radius: var(--radius-full);
+  font-size: 0.8rem;
+  font-weight: 500;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  margin-bottom: var(--space-4);
+  background: color-mix(in oklch, var(--color-primary) 15%, transparent);
+  color: var(--color-primary);
+  border: 1px solid color-mix(in oklch, var(--color-primary) 25%, transparent);
+}
+
+/* ============ COMPARISON GRID ============ */
+.comparison-section {
+  padding: var(--space-4) var(--space-8) var(--space-12);
+  max-width: 1160px;
+  margin: 0 auto;
+}
+.section-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  margin-bottom: var(--space-6);
+  text-align: center;
+}
+.phones-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-8);
+  align-items: start;
+}
+@media (max-width: 768px) {
+  .phones-grid { grid-template-columns: 1fr; }
+  .comparison-section { padding: var(--space-4) var(--space-4) var(--space-10); }
+  .hero-section { padding: var(--space-8) var(--space-4) var(--space-6); }
+  .page-header { padding: var(--space-4); }
+}
+
+.phone-column { display: flex; flex-direction: column; align-items: center; gap: var(--space-4); }
+.column-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.column-label.before { color: #e07070; }
+.column-label.after { color: var(--tg-green); }
+
+/* ============ PHONE SHELL ============ */
+.phone-shell {
+  width: 320px;
+  max-width: 100%;
+  background: var(--tg-bg);
+  border-radius: 36px;
+  overflow: hidden;
+  box-shadow: 0 24px 60px rgba(0,0,0,0.4), 0 4px 16px rgba(0,0,0,0.3);
+  border: 1px solid rgba(255,255,255,0.08);
+  position: relative;
+}
+.phone-notch {
+  height: 28px;
+  background: #0e1621;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.phone-notch-bar {
+  width: 80px;
+  height: 5px;
+  background: rgba(255,255,255,0.15);
+  border-radius: 99px;
+}
+
+/* ============ TELEGRAM UI ============ */
+.tg-header {
+  background: var(--tg-surface);
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  border-bottom: 1px solid var(--tg-border);
+}
+.tg-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #4caf87, #2b8a5e);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: white;
+  flex-shrink: 0;
+}
+.tg-header-info { flex: 1; min-width: 0; }
+.tg-header-name {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--tg-text);
+  line-height: 1.2;
+}
+.tg-header-status { font-size: 0.7rem; color: var(--tg-text-muted); }
+
+.tg-chat {
+  background: var(--tg-bg);
+  min-height: 340px;
+  max-height: 400px;
+  overflow-y: auto;
+  padding: var(--space-3) var(--space-3) var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.1) transparent;
+}
+
+.tg-msg-bot, .tg-msg-user {
+  max-width: 85%;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-lg);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+.tg-msg-bot {
+  background: var(--tg-bubble-bot);
+  color: var(--tg-text);
+  align-self: flex-start;
+  border-bottom-left-radius: 4px;
+}
+.tg-msg-user {
+  background: var(--tg-bubble-user);
+  color: var(--tg-text);
+  align-self: flex-end;
+  border-bottom-right-radius: 4px;
+}
+.tg-msg-time {
+  font-size: 0.65rem;
+  color: var(--tg-text-muted);
+  text-align: right;
+  margin-top: var(--space-1);
+}
+
+/* ============ KEYBOARD BUTTONS ============ */
+.tg-keyboard {
+  background: var(--tg-surface);
+  padding: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  border-top: 1px solid var(--tg-border);
+}
+.kb-row {
+  display: flex;
+  gap: var(--space-1);
+}
+.kb-btn {
+  flex: 1;
+  padding: var(--space-2) var(--space-1);
+  background: var(--tg-btn);
+  color: var(--tg-text);
+  border: none;
+  border-radius: var(--radius-md);
+  font-size: 0.72rem;
+  font-family: var(--font-body);
+  font-weight: 500;
+  cursor: pointer;
+  text-align: center;
+  line-height: 1.2;
+  transition: background 0.15s ease;
+}
+.kb-btn:hover { background: var(--tg-btn-hover); }
+.kb-btn.primary {
+  background: color-mix(in oklch, #5ba4cf 40%, var(--tg-btn));
+  font-weight: 600;
+}
+.kb-btn.primary:hover {
+  background: color-mix(in oklch, #5ba4cf 55%, var(--tg-btn));
+}
+.kb-btn.success {
+  background: color-mix(in oklch, #4caf87 35%, var(--tg-btn));
+  font-weight: 600;
+}
+.kb-btn.muted {
+  background: rgba(255,255,255,0.05);
+  color: var(--tg-text-muted);
+}
+.kb-btn.full { flex: 2; }
+
+.tg-input-bar {
+  background: var(--tg-surface);
+  padding: var(--space-2) var(--space-3);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  border-top: 1px solid var(--tg-border);
+}
+.tg-input-pill {
+  flex: 1;
+  background: rgba(255,255,255,0.06);
+  border-radius: var(--radius-full);
+  padding: var(--space-2) var(--space-3);
+  font-size: 0.78rem;
+  color: var(--tg-text-muted);
+}
+
+/* ============ JOB CARD ============ */
+.job-card {
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: var(--radius-lg);
+  padding: var(--space-3);
+  font-size: 0.8rem;
+}
+.job-card-title {
+  font-weight: 700;
+  color: var(--tg-text);
+  font-size: 0.95rem;
+  margin-bottom: var(--space-1);
+}
+.job-card-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--tg-text-muted);
+  font-size: 0.72rem;
+  margin-bottom: var(--space-2);
+  flex-wrap: wrap;
+}
+.match-badge {
+  background: color-mix(in oklch, #4caf87 20%, transparent);
+  color: #4caf87;
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-full);
+  font-size: 0.68rem;
+  font-weight: 600;
+  border: 1px solid rgba(76,175,135,0.3);
+}
+.job-section-label {
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--tg-accent);
+  margin-top: var(--space-2);
+  margin-bottom: var(--space-1);
+}
+.job-bullets {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--tg-text);
+  font-size: 0.75rem;
+}
+.job-bullets li::before {
+  content: "·";
+  color: var(--tg-accent);
+  margin-right: 6px;
+  font-weight: 700;
+}
+.job-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid rgba(255,255,255,0.05);
+}
+.job-posted { font-size: 0.65rem; color: var(--tg-text-muted); }
+
+/* ============ ANNOTATIONS ============ */
+.annotations-section {
+  max-width: 1160px;
+  margin: 0 auto;
+  padding: 0 var(--space-8) var(--space-12);
+}
+.annotations-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: var(--space-4);
+}
+@media (max-width: 768px) {
+  .annotations-section { padding: 0 var(--space-4) var(--space-10); }
+}
+.annotation-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  padding: var(--space-5);
+}
+.annotation-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: color-mix(in oklch, var(--color-primary) 15%, transparent);
+  color: var(--color-primary);
+  font-size: 0.75rem;
+  font-weight: 700;
+  margin-bottom: var(--space-3);
+}
+.annotation-card h3 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin-bottom: var(--space-2);
+  color: var(--color-text);
+}
+.annotation-card p {
+  font-size: 0.82rem;
+  color: var(--color-text-muted);
+  line-height: 1.6;
+}
+.change-from, .change-to {
+  font-size: 0.75rem;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-full);
+  margin-top: var(--space-2);
+  display: inline-block;
+}
+.change-from { background: rgba(220,80,80,0.12); color: #e07070; }
+.change-to { background: rgba(76,175,135,0.12); color: #4caf87; }
+
+/* ============ VERDICT SECTION ============ */
+.verdict-section {
+  max-width: 1160px;
+  margin: 0 auto;
+  padding: 0 var(--space-8) var(--space-12);
+}
+.verdict-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-6);
+}
+@media (max-width: 768px) {
+  .verdict-grid { grid-template-columns: 1fr; }
+  .verdict-section { padding: 0 var(--space-4) var(--space-10); }
+}
+.verdict-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-xl);
+  padding: var(--space-6);
+}
+.verdict-card h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin-bottom: var(--space-4);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.verdict-card ul {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.verdict-card li {
+  font-size: 0.85rem;
+  color: var(--color-text-muted);
+  padding-left: var(--space-5);
+  position: relative;
+}
+.verdict-card li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.agree li::before { background: var(--tg-green); }
+.add li::before { background: var(--tg-accent); }
+.verdict-card li strong { color: var(--color-text); font-weight: 500; }
+
+/* ============ THEME TOGGLE ============ */
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-full);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  font-size: 0.8rem;
+  font-family: var(--font-body);
+  transition: all 0.15s ease;
+}
+.theme-toggle:hover { color: var(--color-text); border-color: var(--color-primary); }
+
+/* ============ DIVIDER ============ */
+.section-divider {
+  border: none;
+  border-top: 1px solid var(--color-divider);
+  margin: 0 var(--space-8) var(--space-10);
+  max-width: 1160px;
+  margin-inline: auto;
+}
+</style>
+</head>
+<body>
+
+<!-- HEADER -->
+<header class="page-header">
+  <div class="logo-mark">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+      <line x1="9" y1="10" x2="15" y2="10"/>
+    </svg>
+    JobAlert UX Review
+  </div>
+  <button class="theme-toggle" data-theme-toggle aria-label="Toggle theme">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+    Toggle theme
+  </button>
+</header>
+
+<!-- HERO -->
+<section class="hero-section">
+  <div class="pill">
+    <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="8"/></svg>
+    UX Analysis
+  </div>
+  <h1>JobAlert Bot — Before vs. After</h1>
+  <p>ChatGPT's diagnosis is accurate. Here's an interactive side-by-side showing what the redesign looks like inside real Telegram constraints.</p>
+</section>
+
+<!-- COMPARISON -->
+<section class="comparison-section">
+  <p class="section-label">Telegram UI — Side-by-Side Comparison</p>
+  <div class="phones-grid">
+
+    <!-- ===== BEFORE ===== -->
+    <div class="phone-column">
+      <div class="column-label before">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+        Current State
+      </div>
+      <div class="phone-shell">
+        <div class="phone-notch"><div class="phone-notch-bar"></div></div>
+        <!-- TG Header -->
+        <div class="tg-header">
+          <div class="tg-avatar">J</div>
+          <div class="tg-header-info">
+            <div class="tg-header-name">JobAlert</div>
+            <div class="tg-header-status">bot</div>
+          </div>
+        </div>
+        <!-- Chat -->
+        <div class="tg-chat">
+          <div class="tg-msg-user">Help<div class="tg-msg-time">6:46 PM ✓✓</div></div>
+          <div class="tg-msg-bot">
+            <strong>JobAlert</strong><br>Home<br><br>
+            Best path:<br>
+            search jobs → list → next → why → draft → skip &lt;reason&gt; or apply<br><br>
+            Use next to review one fresh match at a time.
+            <div class="tg-msg-time">6:46 PM</div>
+          </div>
+        </div>
+        <!-- Keyboard — current (overloaded) -->
+        <div class="tg-keyboard">
+          <div class="kb-row">
+            <button class="kb-btn">Home</button>
+            <button class="kb-btn">Start</button>
+            <button class="kb-btn">Review</button>
+          </div>
+          <div class="kb-row">
+            <button class="kb-btn">Follow-up</button>
+            <button class="kb-btn">Send</button>
+            <button class="kb-btn">Tools</button>
+          </div>
+          <div class="kb-row">
+            <button class="kb-btn">Search</button>
+            <button class="kb-btn">List</button>
+          </div>
+          <div class="kb-row">
+            <button class="kb-btn">Next</button>
+            <button class="kb-btn">Why</button>
+          </div>
+          <div class="kb-row">
+            <button class="kb-btn">Draft</button>
+            <button class="kb-btn">Apply</button>
+          </div>
+        </div>
+        <div class="tg-input-bar">
+          <div class="tg-input-pill">Message</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== AFTER ===== -->
+    <div class="phone-column">
+      <div class="column-label after">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="9 12 11 14 15 10"/></svg>
+        Redesigned
+      </div>
+      <div class="phone-shell">
+        <div class="phone-notch"><div class="phone-notch-bar"></div></div>
+        <!-- TG Header -->
+        <div class="tg-header">
+          <div class="tg-avatar" style="background:linear-gradient(135deg,#5ba4cf,#2b5278)">JA</div>
+          <div class="tg-header-info">
+            <div class="tg-header-name">JobAlert</div>
+            <div class="tg-header-status" style="color:#4caf87">● Active</div>
+          </div>
+        </div>
+        <!-- Chat -->
+        <div class="tg-chat">
+          <div class="tg-msg-user">Help<div class="tg-msg-time">6:46 PM ✓✓</div></div>
+          <div class="tg-msg-bot">
+            <strong style="color:#5ba4cf">JobAlert</strong> — AI Job Copilot<br><br>
+            <span style="color:#a0b8cc">Fresh AI-matched roles for Teja</span><br><br>
+            <strong>→</strong> Next · Review a curated match<br>
+            <strong>→</strong> Why · Fit breakdown<br>
+            <strong>→</strong> Draft · Cover letter<br>
+            <strong>→</strong> Apply · Submit & track
+            <div class="tg-msg-time">6:46 PM</div>
+          </div>
+        </div>
+        <!-- Keyboard — redesigned (focused) -->
+        <div class="tg-keyboard">
+          <div class="kb-row">
+            <button class="kb-btn primary full">⟶ Next Match</button>
+            <button class="kb-btn">⋯ More</button>
+          </div>
+          <div class="kb-row">
+            <button class="kb-btn">🔍 Search</button>
+            <button class="kb-btn">📋 List</button>
+            <button class="kb-btn">Follow-up</button>
+          </div>
+          <div class="kb-row">
+            <button class="kb-btn">Why</button>
+            <button class="kb-btn success">✓ Apply</button>
+            <button class="kb-btn muted">Skip</button>
+          </div>
+        </div>
+        <div class="tg-input-bar">
+          <div class="tg-input-pill">Message</div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<hr class="section-divider">
+
+<!-- JOB CARD COMPARISON -->
+<section class="comparison-section" style="padding-top:0">
+  <p class="section-label">Job Card — /next Command Redesign</p>
+  <div class="phones-grid">
+
+    <!-- Before /next -->
+    <div class="phone-column">
+      <div class="column-label before">Current /next output</div>
+      <div class="phone-shell">
+        <div class="phone-notch"><div class="phone-notch-bar"></div></div>
+        <div class="tg-header">
+          <div class="tg-avatar">J</div>
+          <div class="tg-header-info">
+            <div class="tg-header-name">JobAlert</div>
+            <div class="tg-header-status">bot</div>
+          </div>
+        </div>
+        <div class="tg-chat" style="max-height:350px">
+          <div class="tg-msg-bot">
+            <strong>Job Match Found:</strong><br><br>
+            Title: AI Engineer<br>
+            Company: OpenAI<br>
+            Location: Remote<br>
+            Match Score: 88<br>
+            Posted: 1 day ago<br>
+            Source: LinkedIn<br><br>
+            Why it matched:<br>
+            - RAG pipeline experience matches job requirement for retrieval-augmented generation and knowledge base building<br>
+            - Python + AWS alignment matches the tech stack requirements<br>
+            - Strong backend + LLM overlap detected<br><br>
+            Use /why for full fit analysis. Use /draft to generate cover letter. Use /apply to mark as applied.
+            <div class="tg-msg-time">6:48 PM</div>
+          </div>
+        </div>
+        <div class="tg-keyboard">
+          <div class="kb-row">
+            <button class="kb-btn">Why</button>
+            <button class="kb-btn">Draft</button>
+            <button class="kb-btn">Apply</button>
+            <button class="kb-btn">Skip</button>
+          </div>
+        </div>
+        <div class="tg-input-bar"><div class="tg-input-pill">Message</div></div>
+      </div>
+    </div>
+
+    <!-- After /next -->
+    <div class="phone-column">
+      <div class="column-label after">Redesigned match card</div>
+      <div class="phone-shell">
+        <div class="phone-notch"><div class="phone-notch-bar"></div></div>
+        <div class="tg-header">
+          <div class="tg-avatar" style="background:linear-gradient(135deg,#5ba4cf,#2b5278)">JA</div>
+          <div class="tg-header-info">
+            <div class="tg-header-name">JobAlert</div>
+            <div class="tg-header-status" style="color:#4caf87">● Active</div>
+          </div>
+        </div>
+        <div class="tg-chat" style="max-height:350px">
+          <div class="tg-msg-bot" style="padding:0;background:transparent;max-width:100%">
+            <div class="job-card">
+              <div class="job-card-title">AI Engineer</div>
+              <div class="job-card-meta">
+                Remote
+                <span style="color:rgba(255,255,255,0.15)">·</span>
+                OpenAI
+                <span class="match-badge">88% match</span>
+              </div>
+              <div class="job-section-label">Why you fit</div>
+              <ul class="job-bullets">
+                <li>RAG pipeline experience</li>
+                <li>Python + AWS alignment</li>
+                <li>LLM backend overlap</li>
+              </ul>
+              <div class="job-footer">
+                <span class="job-posted">Posted 1 day ago · LinkedIn</span>
+              </div>
+            </div>
+            <div class="tg-msg-time" style="padding:var(--space-1) var(--space-2)">6:48 PM</div>
+          </div>
+        </div>
+        <div class="tg-keyboard">
+          <div class="kb-row">
+            <button class="kb-btn">Why</button>
+            <button class="kb-btn">Draft</button>
+            <button class="kb-btn success">✓ Apply</button>
+            <button class="kb-btn muted">Skip</button>
+          </div>
+          <div class="kb-row">
+            <button class="kb-btn primary full">⟶ Next Match</button>
+          </div>
+        </div>
+        <div class="tg-input-bar"><div class="tg-input-pill">Message</div></div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<hr class="section-divider">
+
+<!-- ANNOTATIONS -->
+<section class="annotations-section">
+  <p class="section-label">6 Key Changes Explained</p>
+  <div class="annotations-grid">
+
+    <div class="annotation-card">
+      <div class="annotation-number">1</div>
+      <h3>Collapse the keyboard</h3>
+      <p>11 equal-weight buttons → 3–4 prioritized rows. Primary action dominates. Everything else behind <strong>More</strong>.</p>
+      <div class="change-from">Before: 5 rows, 11 buttons, no hierarchy</div>
+      <div class="change-to">After: 3 rows, primary elevated</div>
+    </div>
+
+    <div class="annotation-card">
+      <div class="annotation-number">2</div>
+      <h3>Job card format</h3>
+      <p>Structured card with visual hierarchy: title → match % badge → company → bullets → posted date. Scannable in under 3 seconds.</p>
+      <div class="change-from">Before: wall-of-text prose block</div>
+      <div class="change-to">After: scannable card with clear sections</div>
+    </div>
+
+    <div class="annotation-card">
+      <div class="annotation-number">3</div>
+      <h3>Home screen copy</h3>
+      <p>Replace the "best path" documentation language with a product-oriented dashboard: name, role, four primary commands clearly labeled.</p>
+      <div class="change-from">Before: "Use next to review one fresh match..."</div>
+      <div class="change-to">After: "Fresh AI-matched roles for Teja"</div>
+    </div>
+
+    <div class="annotation-card">
+      <div class="annotation-number">4</div>
+      <h3>Visual differentiation</h3>
+      <p>Apply gets a success-green tint, Skip gets muted styling, Next gets a primary-color call-to-action weight. Color communicates intent without extra text.</p>
+      <div class="change-from">Before: every button identical weight</div>
+      <div class="change-to">After: color + weight hierarchy</div>
+    </div>
+
+    <div class="annotation-card">
+      <div class="annotation-number">5</div>
+      <h3>Match badge on card</h3>
+      <p>88% match displayed as a compact inline badge next to the job title. User instantly knows relevance before reading anything else.</p>
+      <div class="change-from">Before: "Match Score: 88" buried in prose</div>
+      <div class="change-to">After: prominent badge at the top of card</div>
+    </div>
+
+    <div class="annotation-card">
+      <div class="annotation-number">6</div>
+      <h3>Next at the bottom</h3>
+      <p>After reviewing a job card, "Next Match" sits at the bottom — the natural continuation action. Thumb-reach placement on mobile.</p>
+      <div class="change-from">Before: Next hidden among equal buttons</div>
+      <div class="change-to">After: prominent bottom CTA after card</div>
+    </div>
+
+  </div>
+</section>
+
+<hr class="section-divider">
+
+<!-- VERDICT -->
+<section class="verdict-section">
+  <p class="section-label">My Assessment vs. ChatGPT</p>
+  <div class="verdict-grid">
+
+    <div class="verdict-card agree">
+      <h3>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#4caf87" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+        Fully agree with ChatGPT
+      </h3>
+      <ul>
+        <li><strong>Too many equal-priority buttons</strong> is the #1 UX problem. Cognitive overload is real even at 11 buttons.</li>
+        <li><strong>Job card redesign</strong> is the highest-ROI change. Structured card vs. prose block is a massive readability improvement.</li>
+        <li><strong>Home screen copy</strong> needs to be product-oriented, not command-manual language.</li>
+        <li><strong>No backend changes needed</strong> for these wins — pure message formatting + keyboard JSON config.</li>
+        <li><strong>Progressive disclosure</strong> via "More" is the right pattern for Telegram's limited UI.</li>
+      </ul>
+    </div>
+
+    <div class="verdict-card add">
+      <h3>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#5ba4cf" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        I'd add to ChatGPT's plan
+      </h3>
+      <ul>
+        <li><strong>Match % badge placement</strong> matters more than copy. Put 88% on line 1 of the card, not buried in bullets.</li>
+        <li><strong>Context-sensitive keyboards</strong>: keyboard should change based on state (browsing vs. reviewing a card vs. drafting).</li>
+        <li><strong>Inline emoji as icons</strong> (⟶ Next, ✓ Apply) improves scannability in Telegram's monospace-adjacent font without any custom markup.</li>
+        <li><strong>Bot status indicator</strong> ("● Active") sets a product tone immediately — small but worth doing.</li>
+        <li><strong>Skip confirmation flow</strong>: "Skip" should ask for a reason (1-tap: too senior / wrong stack / already applied) — this trains your matching engine passively.</li>
+      </ul>
+    </div>
+
+  </div>
+</section>
+
+<script>
+(function(){
+  const toggle = document.querySelector('[data-theme-toggle]');
+  const root = document.documentElement;
+  toggle && toggle.addEventListener('click', () => {
+    const current = root.getAttribute('data-theme');
+    const next = current === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+  });
+})();
+</script>
+</body>
+</html>

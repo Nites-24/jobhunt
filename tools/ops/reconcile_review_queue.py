@@ -20,7 +20,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 REGION = "us-east-1"
 TABLE_NAME = "Jobsearch"
-SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "90"))
+SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "80"))
 MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "14"))
 ALLOWED_SOURCES = {
     source.strip().lower()

@@ -11,7 +11,7 @@ ACTION REQUIRED:
   The job-processor now handles:
     - S3 memory context (config/, data/, prompts/) with warm-start caching
     - Bedrock Converse API with forced tool-calling for deterministic scores
-    - SNS notifications for 90%+ matches
+    - SNS notifications for 80%+ matches
     - Proper batchItemFailures for SQS retry
 
 This file is kept for reference only.

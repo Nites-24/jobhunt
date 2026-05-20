@@ -236,12 +236,12 @@ class TestAIEngineerAgent:
             "LLM infrastructure, and I have done similar work, reducing GPU costs "
             "by 33% and resolving 87% of support tickets autonomously.\n\n"
             "My projects RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ) "
-            "handles multi-step reasoning, and Rivulet (https://rivulet.info) does "
-            "tool orchestration with human oversight.\n\n"
+            "is a retirement planning and financial decision support app, and "
+            "Rivulet (https://rivulet.info) is a personal life management app.\n\n"
             "Would 20 minutes this week work to connect?\n\n"
             "Best,\n"
             "Teja Gopal Reddy Vaka\n"
-            "Senior AI Engineer\n"
+            "AI Engineer\n"
             "https://linkedin.com/in/tejagopalreddyvaka/"
         )
 

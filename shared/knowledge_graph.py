@@ -13,7 +13,7 @@ from typing import Iterable
 
 DEFAULT_GRAPH = {
     "candidate_name": "Teja Gopal Reddy Vaka",
-    "target_role": "Senior AI Engineer",
+    "target_role": "AI Engineer",
     "focus_areas": [
         "RAG pipelines",
         "LLM orchestration",
@@ -31,12 +31,12 @@ DEFAULT_GRAPH = {
     "projects": [
         {
             "name": "RetireIQ",
-            "summary": "multi-step financial reasoning",
+            "summary": "retirement planning and financial decision support app",
             "url": "https://huggingface.co/spaces/vakaTeja/RetireIQ",
         },
         {
             "name": "Rivulet",
-            "summary": "tool orchestration with human oversight",
+            "summary": "personal life management app",
             "url": "https://rivulet.info",
         },
     ],
@@ -45,9 +45,11 @@ DEFAULT_GRAPH = {
         "87% autonomous ticket resolution",
     ],
     "preferences": [
-        "San Francisco Bay Area",
-        "onsite or hybrid",
+        "currently in Wichita, Kansas",
+        "open to remote, hybrid, or onsite",
+        "open to any location",
         "open to relocate",
+        "CPT student",
     ],
 }
 
@@ -76,21 +78,23 @@ PROJECT_PATTERNS = [
     (
         "RetireIQ",
         r"\bretireiq\b",
-        "multi-step financial reasoning",
+        "retirement planning and financial decision support app",
         "https://huggingface.co/spaces/vakaTeja/RetireIQ",
     ),
     (
         "Rivulet",
         r"\brivulet\b",
-        "tool orchestration with human oversight",
+        "personal life management app",
         "https://rivulet.info",
     ),
 ]
 
 PREFERENCE_PATTERNS = [
-    ("San Francisco Bay Area", r"san francisco|bay area|south san francisco|ssf"),
-    ("onsite or hybrid", r"onsite|on-site|hybrid"),
+    ("currently in Wichita, Kansas", r"wichita|kansas"),
+    ("open to remote, hybrid, or onsite", r"remote|onsite|on-site|hybrid"),
+    ("open to any location", r"open to any location|all locations|any location|anywhere|relocat"),
     ("open to relocate", r"relocat"),
+    ("CPT student", r"\bcpt\b"),
 ]
 
 

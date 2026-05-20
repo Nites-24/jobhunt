@@ -11,7 +11,7 @@ This document breaks down the multi-agent architecture of the JobHunt pipeline: 
 * **Configured but blocked sources:** Google CSE credentials exist, but Google returns HTTP 403 until Custom Search JSON API is enabled for that Google Cloud project. JSearch is configured but currently rate-limited with HTTP 429.
 * **Safety controls:** Telegram `draft 1` previews outreach, `apply 1` moves a role to manual follow-up, and `send 1` is the only command that can send email. Real SMTP still requires `ALLOW_REAL_EMAIL_SEND=true` on the sender Lambda and `ALLOW_TELEGRAM_EMAIL_SEND=true` on the router Lambda.
 * **Operational controls:** Both SQS queues have DLQs. CloudWatch alarms cover Lambda errors/throttles, queue backlog, and DLQ messages.
-* **Current review policy:** only fresh, sourced, 90%+ matches enter the visible review queue.
+* **Current review policy:** only fresh, sourced, 80%+ matches enter the visible review queue.
 
 ## Why This Exists If Job Boards Already Exist
 

@@ -62,7 +62,7 @@ def set_env_vars(monkeypatch):
         "SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:123456789012:jobsearch-approvals",
         "S3_BUCKET_NAME": "job-search-pipeline-memory",
         "RESUME_KEY": "data/resume/Teja_Vaka.txt",
-        "SCORE_THRESHOLD": "90",
+        "SCORE_THRESHOLD": "80",
         "CONTEXT_FOLDERS": "config/,data/",
         # Router
         "TELEGRAM_SECRET_NAME": "telegram",
@@ -140,7 +140,8 @@ def s3_bucket():
             "Teja Gopal Reddy Vaka — Senior AI Engineer\n"
             "Skills: Python, PyTorch, AWS, LangChain, RAG, LLMs, Vector DBs\n"
             "Experience: Empower — 33% GPU cost reduction, 87% ticket resolution\n"
-            "Projects: RetireIQ (HuggingFace), Rivulet (rivulet.info)\n"
+            "Projects: RetireIQ (retirement planning and financial decision support), Rivulet (personal life management)\n"
+            "Location: Wichita, Kansas. Open to relocate. Open to remote, hybrid, or onsite roles in any location.\n"
         )
         client.put_object(
             Bucket="job-search-pipeline-memory",
@@ -196,7 +197,7 @@ def secrets():
 # ---------------------------------------------------------------------------
 SAMPLE_JOB = {
     "job_id": "test-job-001",
-    "title": "Senior AI Engineer",
+    "title": "AI Engineer",
     "company": "Anthropic",
     "location": "San Francisco, CA",
     "description": "Build next-gen LLM infrastructure. Requires Python, PyTorch, RAG experience.",

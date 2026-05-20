@@ -54,7 +54,7 @@ DYNAMODB_TABLE = "Jobsearch"
 S3_BUCKET = "job-search-pipeline-memory"
 RESUME_KEY = "data/resume/Teja_Vaka.txt"
 BEDROCK_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
-SCORE_THRESHOLD = 85
+SCORE_THRESHOLD = 80
 
 # Verify credentials exist
 if not os.environ.get("AWS_ACCESS_KEY_ID"):
@@ -203,7 +203,7 @@ def step3_score(jobs):
     except Exception as e:
         print(f"  WARNING: Could not load resume from S3: {e}")
         resume = (
-            "Teja Gopal Reddy Vaka, Senior AI Engineer. "
+            "Teja Gopal Reddy Vaka, AI Engineer. "
             "Python, PyTorch, AWS, RAG, LLMs, LangChain. "
             "33% GPU cost reduction, 87% autonomous ticket resolution."
         )
@@ -284,7 +284,7 @@ def step3_score(jobs):
         except Exception as e:
             print(f"  ERROR: {e}")
 
-    print(f"\n  Result: {len(scored_jobs)} jobs scored 90%+ (ready for approval)")
+    print(f"\n  Result: {len(scored_jobs)} jobs scored 80%+ (ready for approval)")
     return scored_jobs
 
 
@@ -295,7 +295,7 @@ def step4_router_sim(matched_jobs):
     print_header(4, "ROUTER -- Telegram Preview (what you would see)")
 
     if not matched_jobs:
-        print("  No jobs scored 90%+. Nothing to show in Telegram.")
+        print("  No jobs scored 80%+. Nothing to show in Telegram.")
         print("  Try lowering SCORE_THRESHOLD at the top of this script.")
         return []
 
@@ -412,7 +412,7 @@ def main():
 
     # Step 3: Score with Bedrock
     matched = step3_score(new_jobs)
-    wait_for_confirm(f"{len(matched)} jobs scored 90%+. Continue to preview?")
+    wait_for_confirm(f"{len(matched)} jobs scored 80%+. Continue to preview?")
 
     # Step 4: Router simulation
     matched = step4_router_sim(matched)
