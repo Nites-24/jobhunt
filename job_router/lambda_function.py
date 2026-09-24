@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import time
+import hmac
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
@@ -1870,6 +1871,26 @@ def _handle_callback_command(bot_token: str, chat_id: str, callback_query_id: st
     _answer_callback_query(bot_token, callback_query_id, "Unknown action")
 
 
+def _get_header(event: dict, header_name: str) -> str:
+    """Extract a header from an API Gateway event case-insensitively."""
+    headers = event.get("headers") or {}
+    target = header_name.lower()
+    for k, v in headers.items():
+        if k.lower() == target:
+            return str(v).strip()
+    return ""
+
+
+def _validate_webhook_secret(event: dict, expected_secret: str) -> bool:
+    """Validate Telegram secret token header using constant-time comparison."""
+    if not expected_secret:
+        return True
+    provided_token = _get_header(event, "X-Telegram-Bot-Api-Secret-Token")
+    if not provided_token:
+        return False
+    return hmac.compare_digest(provided_token, expected_secret)
+
+
 def lambda_handler(event, context):
     """
     Entry point for both SNS notifications and Telegram webhook commands.
@@ -1895,6 +1916,14 @@ def lambda_handler(event, context):
         return {"statusCode": 200, "body": "Alerts processed"}
 
     if "body" in event:
+        expected_secret = (
+            secrets.get("TELEGRAM_WEBHOOK_SECRET")
+            or os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+        )
+        if expected_secret and not _validate_webhook_secret(event, expected_secret):
+            logger.warning("UNAUTHORIZED_WEBHOOK_SECRET: missing or invalid secret token header")
+            return {"statusCode": 403, "body": "Forbidden: invalid secret token"}
+
         try:
             body = json.loads(event["body"]) if isinstance(event["body"], str) else event["body"]
             callback_query = body.get("callback_query")

@@ -25,9 +25,9 @@ from unittest.mock import patch, MagicMock, call
 from conftest import SAMPLE_JOB, MockContext
 
 
-def _make_telegram_event(text, chat_id="99999"):
+def _make_telegram_event(text, chat_id="99999", headers=None):
     """Create an API Gateway event mimicking a Telegram webhook."""
-    return {
+    event = {
         "body": json.dumps({
             "message": {
                 "text": text,
@@ -36,6 +36,9 @@ def _make_telegram_event(text, chat_id="99999"):
             }
         })
     }
+    if headers is not None:
+        event["headers"] = headers
+    return event
 
 
 def _make_sns_event(message_text):
@@ -1016,6 +1019,76 @@ class TestRouter:
 
         assert result["statusCode"] == 200
         mock_tg.assert_not_called()  # No response sent
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_webhook_secret_missing_rejected(self, mock_tg):
+        """When TELEGRAM_WEBHOOK_SECRET is set, requests without the header must be rejected with 403."""
+        mod, table = self._setup_infra()
+        mod._cached_secrets = {
+            "TELEGRAM_BOT_TOKEN": "123456:ABC-DEF",
+            "TELEGRAM_CHAT_ID": "99999",
+            "TELEGRAM_WEBHOOK_SECRET": "correct-secret-token",
+        }
+        mock_tg.return_value = True
+
+        event = _make_telegram_event("status")  # No headers
+        result = mod.lambda_handler(event, MockContext())
+
+        assert result["statusCode"] == 403
+        assert "Forbidden" in result["body"]
+        mock_tg.assert_not_called()
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_webhook_secret_invalid_rejected(self, mock_tg):
+        """Requests with an incorrect secret token header must be rejected with 403."""
+        mod, table = self._setup_infra()
+        mod._cached_secrets = {
+            "TELEGRAM_BOT_TOKEN": "123456:ABC-DEF",
+            "TELEGRAM_CHAT_ID": "99999",
+            "TELEGRAM_WEBHOOK_SECRET": "correct-secret-token",
+        }
+        mock_tg.return_value = True
+
+        event = _make_telegram_event("status", headers={"X-Telegram-Bot-Api-Secret-Token": "wrong-token"})
+        result = mod.lambda_handler(event, MockContext())
+
+        assert result["statusCode"] == 403
+        assert "Forbidden" in result["body"]
+        mock_tg.assert_not_called()
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_webhook_secret_valid_accepted(self, mock_tg):
+        """Requests with the correct secret token header must be processed."""
+        mod, table = self._setup_infra()
+        mod._cached_secrets = {
+            "TELEGRAM_BOT_TOKEN": "123456:ABC-DEF",
+            "TELEGRAM_CHAT_ID": "99999",
+            "TELEGRAM_WEBHOOK_SECRET": "correct-secret-token",
+        }
+        mock_tg.return_value = True
+
+        event = _make_telegram_event("status", headers={"X-Telegram-Bot-Api-Secret-Token": "correct-secret-token"})
+        result = mod.lambda_handler(event, MockContext())
+
+        assert result["statusCode"] == 200
+        mock_tg.assert_called_once()
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_webhook_secret_case_insensitive_header(self, mock_tg):
+        """Header comparison should be case-insensitive."""
+        mod, table = self._setup_infra()
+        mod._cached_secrets = {
+            "TELEGRAM_BOT_TOKEN": "123456:ABC-DEF",
+            "TELEGRAM_CHAT_ID": "99999",
+            "TELEGRAM_WEBHOOK_SECRET": "correct-secret-token",
+        }
+        mock_tg.return_value = True
+
+        event = _make_telegram_event("status", headers={"x-telegram-bot-api-secret-token": "correct-secret-token"})
+        result = mod.lambda_handler(event, MockContext())
+
+        assert result["statusCode"] == 200
+        mock_tg.assert_called_once()
 
     def test_decimal_serialization(self):
         """DecimalEncoder should handle DynamoDB Decimal types."""

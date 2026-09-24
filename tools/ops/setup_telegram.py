@@ -88,13 +88,17 @@ webhook_url = api_url  # Adjust if you have a specific route
 if current_url == webhook_url:
     print(f"\n  Webhook is already correctly set!")
 else:
+    secret_token = creds.get("TELEGRAM_WEBHOOK_SECRET") or creds.get("secret_token") or os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
     print(f"\n  Setting webhook to: {webhook_url}")
     set_url = f"https://api.telegram.org/bot{bot_token}/setWebhook?url={urllib.request.quote(webhook_url)}"
+    if secret_token:
+        set_url += f"&secret_token={urllib.request.quote(secret_token)}"
+        print("  Using Telegram secret_token for header authentication.")
     req = urllib.request.Request(set_url)
     with urllib.request.urlopen(req, timeout=10) as resp:
         result = json.loads(resp.read().decode("utf-8"))
         if result.get("ok"):
-            print(f"  Webhook SET successfully!")
+            print("  Webhook SET successfully!")
         else:
             print(f"  FAILED: {result}")
 
