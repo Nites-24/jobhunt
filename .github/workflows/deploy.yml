@@ -1,0 +1,289 @@
+# ============================================================================
+# Deploy — Selective Lambda Deployment with Safety Gates
+# ============================================================================
+# Triggered manually or on push to main after CI passes. Deploys only the
+# Lambdas whose code actually changed to minimize blast radius.
+#
+# Safety gates:
+#   1. CI must pass first (tests + evals)
+#   2. Manual approval required for production
+#   3. Post-deploy health verification
+#   4. Automatic rollback on verification failure
+#
+# Production safety rules from AGENTS.md:
+#   - Real email sending remains gated by both env flags
+#   - No live ingestion as first diagnostic step
+#   - Deploy does not auto-run ingestion
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      lambdas:
+        description: "Lambdas to deploy (comma-separated, or 'all')"
+        required: true
+        default: "all"
+        type: string
+      skip_approval:
+        description: "Skip manual approval (use only for hotfixes)"
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    paths:
+      - "job_ingestor/**"
+      - "job_deduplicator/**"
+      - "job_processor/**"
+      - "job_router/**"
+      - "job_sender/**"
+      - "shared/**"
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  # -------------------------------------------------------------------
+  # Gate: CI must pass
+  # -------------------------------------------------------------------
+  ci-gate:
+    name: CI Gate
+    uses: ./.github/workflows/ci.yml
+
+  # -------------------------------------------------------------------
+  # Detect which Lambdas changed
+  # -------------------------------------------------------------------
+  detect-changes:
+    name: Detect Changed Lambdas
+    runs-on: ubuntu-latest
+    needs: ci-gate
+    outputs:
+      changed_lambdas: ${{ steps.detect.outputs.changed }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed Lambda directories
+        id: detect
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            INPUT="${{ github.event.inputs.lambdas }}"
+            if [ "$INPUT" = "all" ]; then
+              echo "changed=job_ingestor,job_deduplicator,job_processor,job_router,job_sender" >> "$GITHUB_OUTPUT"
+            else
+              echo "changed=$INPUT" >> "$GITHUB_OUTPUT"
+            fi
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CHANGED=""
+          for dir in job_ingestor job_deduplicator job_processor job_router job_sender shared; do
+            if git diff --name-only HEAD~1 HEAD | grep -q "^${dir}/"; then
+              case "$dir" in
+                shared)
+                  # shared/ change means all Lambdas need redeployment
+                  CHANGED="job_ingestor,job_deduplicator,job_processor,job_router,job_sender"
+                  break
+                  ;;
+                *)
+                  if [ -n "$CHANGED" ]; then
+                    CHANGED="${CHANGED},${dir}"
+                  else
+                    CHANGED="$dir"
+                  fi
+                  ;;
+              esac
+            fi
+          done
+
+          if [ -n "$CHANGED" ]; then
+            echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=" >> "$GITHUB_OUTPUT"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # -------------------------------------------------------------------
+  # Manual approval (skippable for hotfixes)
+  # -------------------------------------------------------------------
+  approve:
+    name: Production Approval
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true' && github.event.inputs.skip_approval != 'true'
+    environment: production
+    steps:
+      - name: Approval granted
+        run: echo "Deployment approved for ${{ needs.detect-changes.outputs.changed_lambdas }}"
+
+  # -------------------------------------------------------------------
+  # Deploy changed Lambdas
+  # -------------------------------------------------------------------
+  deploy:
+    name: Deploy Lambdas
+    runs-on: ubuntu-latest
+    needs: [detect-changes, approve]
+    if: always() && needs.detect-changes.outputs.has_changes == 'true' && (needs.approve.result == 'success' || needs.approve.result == 'skipped')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install boto3
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy changed Lambdas
+        run: |
+          python -c "
+          import os, io, zipfile, boto3
+
+          SHARED_DIR = 'shared'
+          LAMBDAS = {
+              'job_ingestor': 'job-ingestor',
+              'job_deduplicator': 'job-deduplicator',
+              'job_processor': 'job-processor',
+              'job_router': 'job-router',
+              'job_sender': 'job-sender',
+          }
+
+          changed = '${{ needs.detect-changes.outputs.changed_lambdas }}'.split(',')
+          client = boto3.client('lambda', region_name='${{ env.AWS_REGION }}')
+
+          for local_dir in changed:
+              local_dir = local_dir.strip()
+              func_name = LAMBDAS.get(local_dir)
+              if not func_name:
+                  print(f'SKIP: unknown directory {local_dir}')
+                  continue
+
+              buf = io.BytesIO()
+              with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                  for root, dirs, files in os.walk(local_dir):
+                      for f in files:
+                          if f.endswith('.py'):
+                              path = os.path.join(root, f)
+                              zf.write(path, os.path.relpath(path, local_dir))
+                  if os.path.exists(SHARED_DIR):
+                      for root, dirs, files in os.walk(SHARED_DIR):
+                          for f in files:
+                              if f.endswith('.py'):
+                                  path = os.path.join(root, f)
+                                  zf.write(path, os.path.relpath(path, '.'))
+              buf.seek(0)
+              zip_bytes = buf.read()
+
+              client.update_function_code(FunctionName=func_name, ZipFile=zip_bytes)
+              print(f'DEPLOYED: {local_dir} -> {func_name} ({len(zip_bytes)} bytes)')
+          "
+
+      - name: Record deployment
+        run: |
+          echo "## Deployment Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Commit:** ${{ github.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Lambdas:** ${{ needs.detect-changes.outputs.changed_lambdas }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Triggered by:** ${{ github.actor }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Time:** $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------------
+  # Post-deploy health verification
+  # -------------------------------------------------------------------
+  verify:
+    name: Post-Deploy Health Check
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: needs.deploy.result == 'success'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install boto3
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify Lambda health
+        run: |
+          python -c "
+          import boto3, sys
+
+          client = boto3.client('lambda', region_name='us-east-1')
+          functions = ['job-ingestor', 'job-deduplicator', 'job-processor', 'job-router', 'job-sender']
+          failed = []
+
+          for func in functions:
+              try:
+                  cfg = client.get_function_configuration(FunctionName=func)
+                  state = cfg.get('State', 'Unknown')
+                  update = cfg.get('LastUpdateStatus', 'Unknown')
+                  print(f'{func}: state={state} update_status={update}')
+                  if state != 'Active' or update not in ('Successful', 'InProgress'):
+                      failed.append(func)
+              except Exception as e:
+                  print(f'{func}: ERROR - {e}')
+                  failed.append(func)
+
+          if failed:
+              print(f'\\nFAILED: {failed}')
+              sys.exit(1)
+          print('\\nAll Lambdas healthy.')
+          "
+
+      - name: Verify SQS queues are clean
+        run: |
+          python -c "
+          import boto3, json, sys
+
+          sqs = boto3.client('sqs', region_name='us-east-1')
+          dlqs = ['job-raw-queue-dlq', 'job-filtered-queue-dlq']
+          issues = []
+
+          for q in dlqs:
+              try:
+                  url = sqs.get_queue_url(QueueName=q)['QueueUrl']
+                  attrs = sqs.get_queue_attributes(
+                      QueueUrl=url,
+                      AttributeNames=['ApproximateNumberOfMessages']
+                  )['Attributes']
+                  count = int(attrs.get('ApproximateNumberOfMessages', 0))
+                  print(f'{q}: {count} messages')
+                  if count > 0:
+                      issues.append(f'{q} has {count} messages')
+              except Exception as e:
+                  print(f'{q}: ERROR - {e}')
+
+          if issues:
+              print(f'\\nWARNING: {issues}')
+              # Don't fail — DLQ messages may be from before this deploy
+          print('\\nQueue check complete.')
+          "

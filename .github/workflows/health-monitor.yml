@@ -1,0 +1,257 @@
+# ============================================================================
+# Production Health Monitor — Lambda + Queue + DLQ Status
+# ============================================================================
+# Runs every 6 hours. Checks all 5 Lambdas, both SQS queues, both DLQs,
+# and CloudWatch alarms. Alerts if anything looks unhealthy.
+#
+# This is a read-only workflow — it never invokes Lambdas, never enqueues
+# messages, and never modifies DynamoDB. Safe to run on schedule.
+
+name: Health Monitor
+
+on:
+  schedule:
+    # Every 6 hours: 00:00, 06:00, 12:00, 18:00 UTC
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  health-check:
+    name: Production Health Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install boto3
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run health checks
+        id: health
+        run: |
+          python - <<'HEALTH_SCRIPT'
+          import boto3
+          import json
+          import sys
+          from datetime import datetime, timezone, timedelta
+
+          REGION = "us-east-1"
+          LAMBDAS = ["job-ingestor", "job-deduplicator", "job-processor", "job-router", "job-sender"]
+          QUEUES = ["job-raw-queue", "job-filtered-queue"]
+          DLQS = ["job-raw-queue-dlq", "job-filtered-queue-dlq"]
+
+          lambda_client = boto3.client("lambda", region_name=REGION)
+          sqs = boto3.client("sqs", region_name=REGION)
+          cloudwatch = boto3.client("cloudwatch", region_name=REGION)
+          logs_client = boto3.client("logs", region_name=REGION)
+
+          issues = []
+          report = []
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+          report.append("# 🏥 Production Health Report")
+          report.append(f"")
+          report.append(f"**Checked:** {now}")
+          report.append(f"")
+
+          # ---- Lambda Health ----
+          report.append("## Lambda Functions")
+          report.append("")
+          report.append("| Function | State | Last Update | Last Modified |")
+          report.append("|----------|-------|-------------|---------------|")
+
+          for func in LAMBDAS:
+              try:
+                  cfg = lambda_client.get_function_configuration(FunctionName=func)
+                  state = cfg.get("State", "Unknown")
+                  update = cfg.get("LastUpdateStatus", "Unknown")
+                  modified = cfg.get("LastModified", "Unknown")
+                  report.append(f"| {func} | {state} | {update} | {modified} |")
+                  if state != "Active":
+                      issues.append(f"Lambda {func} state is {state}")
+                  if update == "Failed":
+                      issues.append(f"Lambda {func} last update FAILED")
+              except Exception as e:
+                  report.append(f"| {func} | ERROR | - | - |")
+                  issues.append(f"Lambda {func}: {str(e)[:100]}")
+
+          report.append("")
+
+          # ---- SQS Queues ----
+          report.append("## SQS Queues")
+          report.append("")
+          report.append("| Queue | Visible | In-Flight | DLQ |")
+          report.append("|-------|---------|-----------|-----|")
+
+          for q in QUEUES + DLQS:
+              try:
+                  url = sqs.get_queue_url(QueueName=q)["QueueUrl"]
+                  attrs = sqs.get_queue_attributes(
+                      QueueUrl=url,
+                      AttributeNames=[
+                          "ApproximateNumberOfMessages",
+                          "ApproximateNumberOfMessagesNotVisible",
+                          "RedrivePolicy",
+                      ],
+                  )["Attributes"]
+                  visible = int(attrs.get("ApproximateNumberOfMessages", 0))
+                  inflight = int(attrs.get("ApproximateNumberOfMessagesNotVisible", 0))
+                  redrive = attrs.get("RedrivePolicy")
+                  dlq_label = "configured" if redrive else "none"
+                  report.append(f"| {q} | {visible} | {inflight} | {dlq_label} |")
+
+                  if q in DLQS and visible > 0:
+                      issues.append(f"DLQ {q} has {visible} messages — indicates pipeline failures")
+                  if q in QUEUES and visible > 100:
+                      issues.append(f"Queue {q} has {visible} pending — possible processing backlog")
+              except Exception as e:
+                  report.append(f"| {q} | ERROR | - | - |")
+                  issues.append(f"Queue {q}: {str(e)[:100]}")
+
+          report.append("")
+
+          # ---- Recent Errors (CloudWatch) ----
+          report.append("## Recent Lambda Errors (Last 6 Hours)")
+          report.append("")
+          report.append("| Function | Error Count |")
+          report.append("|----------|-------------|")
+
+          six_hours_ago = datetime.now(timezone.utc) - timedelta(hours=6)
+          for func in LAMBDAS:
+              try:
+                  response = cloudwatch.get_metric_statistics(
+                      Namespace="AWS/Lambda",
+                      MetricName="Errors",
+                      Dimensions=[{"Name": "FunctionName", "Value": func}],
+                      StartTime=six_hours_ago,
+                      EndTime=datetime.now(timezone.utc),
+                      Period=21600,  # 6 hours
+                      Statistics=["Sum"],
+                  )
+                  datapoints = response.get("Datapoints", [])
+                  error_count = int(sum(dp.get("Sum", 0) for dp in datapoints))
+                  report.append(f"| {func} | {error_count} |")
+                  if error_count > 10:
+                      issues.append(f"Lambda {func} had {error_count} errors in the last 6 hours")
+              except Exception as e:
+                  report.append(f"| {func} | N/A |")
+
+          report.append("")
+
+          # ---- Throttling (CloudWatch) ----
+          report.append("## Recent Throttles (Last 6 Hours)")
+          report.append("")
+          report.append("| Function | Throttle Count |")
+          report.append("|----------|----------------|")
+
+          for func in LAMBDAS:
+              try:
+                  response = cloudwatch.get_metric_statistics(
+                      Namespace="AWS/Lambda",
+                      MetricName="Throttles",
+                      Dimensions=[{"Name": "FunctionName", "Value": func}],
+                      StartTime=six_hours_ago,
+                      EndTime=datetime.now(timezone.utc),
+                      Period=21600,
+                      Statistics=["Sum"],
+                  )
+                  datapoints = response.get("Datapoints", [])
+                  throttle_count = int(sum(dp.get("Sum", 0) for dp in datapoints))
+                  report.append(f"| {func} | {throttle_count} |")
+                  if throttle_count > 5:
+                      issues.append(f"Lambda {func} throttled {throttle_count} times in the last 6 hours")
+              except Exception as e:
+                  report.append(f"| {func} | N/A |")
+
+          report.append("")
+
+          # ---- Invocation counts ----
+          report.append("## Invocation Volume (Last 6 Hours)")
+          report.append("")
+          report.append("| Function | Invocations |")
+          report.append("|----------|-------------|")
+
+          for func in LAMBDAS:
+              try:
+                  response = cloudwatch.get_metric_statistics(
+                      Namespace="AWS/Lambda",
+                      MetricName="Invocations",
+                      Dimensions=[{"Name": "FunctionName", "Value": func}],
+                      StartTime=six_hours_ago,
+                      EndTime=datetime.now(timezone.utc),
+                      Period=21600,
+                      Statistics=["Sum"],
+                  )
+                  datapoints = response.get("Datapoints", [])
+                  count = int(sum(dp.get("Sum", 0) for dp in datapoints))
+                  report.append(f"| {func} | {count} |")
+              except Exception as e:
+                  report.append(f"| {func} | N/A |")
+
+          report.append("")
+
+          # ---- Summary ----
+          report.append("## Health Verdict")
+          report.append("")
+          if issues:
+              report.append(f"⚠️ **{len(issues)} issue(s) detected:**")
+              report.append("")
+              for issue in issues:
+                  report.append(f"- {issue}")
+          else:
+              report.append("✅ **All systems healthy.** No issues detected.")
+
+          report.append("")
+
+          full_report = "\n".join(report)
+
+          with open("health_report.md", "w", encoding="utf-8") as f:
+              f.write(full_report)
+
+          print(full_report)
+
+          if issues:
+              print(f"\n{'='*60}")
+              print(f"HEALTH CHECK: {len(issues)} ISSUE(S) FOUND")
+              for issue in issues:
+                  print(f"  - {issue}")
+              print(f"{'='*60}")
+              # Exit 1 only for critical issues (DLQ messages or Lambda failures)
+              critical = [i for i in issues if "DLQ" in i or "FAILED" in i or "state is" in i]
+              if critical:
+                  sys.exit(1)
+          HEALTH_SCRIPT
+
+      - name: Upload health report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-report-${{ github.run_number }}
+          path: health_report.md
+          retention-days: 30
+
+      - name: Post summary
+        if: always()
+        run: |
+          if [ -f health_report.md ]; then
+            cat health_report.md >> "$GITHUB_STEP_SUMMARY"
+          fi

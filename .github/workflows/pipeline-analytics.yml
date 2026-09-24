@@ -1,0 +1,471 @@
+# ============================================================================
+# Pipeline Analytics — Production Metrics Report
+# ============================================================================
+# Scheduled daily. Connects to DynamoDB to pull production data from the last
+# 90 days and generates a comprehensive analytics report covering:
+#
+#   - Total jobs ingested, deduplicated, evaluated, matched, rejected
+#   - Source breakdown (HN, Adzuna, Google CSE, JSearch)
+#   - Deduplication rates and freshness enforcement
+#   - Score distribution and guardrail impact
+#   - Feedback loop health (positive / neutral / negative)
+#   - Week-over-week trends
+#
+# This replaces manual `export_feedback.py` and `feedback_summary.py` runs
+# with an automated daily report uploaded as a GitHub Actions artifact.
+
+name: Pipeline Analytics
+
+on:
+  schedule:
+    # Run daily at 06:00 UTC (01:00 AM CDT)
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Number of days to analyze (default: 90)"
+        required: false
+        default: "90"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  DYNAMODB_TABLE: Jobsearch
+
+jobs:
+  analytics:
+    name: Generate Pipeline Report
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate pipeline analytics report
+        id: report
+        env:
+          ANALYSIS_DAYS: ${{ github.event.inputs.days || '90' }}
+        run: |
+          python - <<'ANALYTICS_SCRIPT'
+          """
+          Pipeline Analytics Report Generator
+
+          Scans the DynamoDB Jobsearch table and produces a Markdown report
+          covering the last N days of production data. Measures:
+
+            - Ingestion volume by source and week
+            - Deduplication effectiveness
+            - Score distribution and match rates
+            - Guardrail rejection breakdown
+            - Feedback loop health
+            - Source freshness and quality
+          """
+
+          import boto3
+          import json
+          import os
+          import sys
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone, timedelta
+          from decimal import Decimal
+
+          TABLE = os.environ.get("DYNAMODB_TABLE", "Jobsearch")
+          REGION = os.environ.get("AWS_REGION", "us-east-1")
+          DAYS = int(os.environ.get("ANALYSIS_DAYS", "90"))
+          THRESHOLD = 80
+
+          dynamodb = boto3.resource("dynamodb", region_name=REGION)
+          table = dynamodb.Table(TABLE)
+
+          # ---- Scan all rows ----
+          print(f"Scanning {TABLE} for the last {DAYS} days...", file=sys.stderr)
+          cutoff = datetime.now(timezone.utc) - timedelta(days=DAYS)
+          cutoff_ts = int(cutoff.timestamp())
+
+          items = []
+          scan_args = {}
+          while True:
+              response = table.scan(**scan_args)
+              items.extend(response.get("Items", []))
+              if "LastEvaluatedKey" not in response:
+                  break
+              scan_args["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+
+          print(f"Total rows in table: {len(items)}", file=sys.stderr)
+
+          # ---- Helper ----
+          def safe_int(val, default=0):
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return default
+
+          def iso_to_ts(val):
+              if not val:
+                  return 0
+              try:
+                  raw = str(val).strip()
+                  if raw.isdigit():
+                      return int(raw)
+                  if raw.endswith("Z"):
+                      raw = raw[:-1] + "+00:00"
+                  dt = datetime.fromisoformat(raw)
+                  return int(dt.timestamp())
+              except Exception:
+                  return 0
+
+          def week_key(ts):
+              if ts <= 0:
+                  return "unknown"
+              dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+              return dt.strftime("%Y-W%U")
+
+          # ---- Filter to analysis window ----
+          recent = []
+          for item in items:
+              ingested_ts = iso_to_ts(item.get("ingested_at"))
+              evaluated_ts = safe_int(item.get("evaluated_at"))
+              feedback_ts = safe_int(item.get("user_feedback_at"))
+              ts = max(ingested_ts, evaluated_ts, feedback_ts)
+              if ts >= cutoff_ts:
+                  item["_analysis_ts"] = ts
+                  recent.append(item)
+
+          total = len(recent)
+          if total == 0:
+              print(f"No rows found in the last {DAYS} days.", file=sys.stderr)
+              # Write empty report
+              with open("pipeline_report.md", "w") as f:
+                  f.write(f"# Pipeline Analytics Report\n\nNo data found for the last {DAYS} days.\n")
+              sys.exit(0)
+
+          # ---- Status counts ----
+          status_counts = Counter()
+          source_counts = Counter()
+          source_status = defaultdict(lambda: Counter())
+          score_buckets = Counter()  # 0-9, 10-19, ..., 90-100
+          guardrail_reasons = Counter()
+          feedback_labels = Counter()
+          feedback_reasons = Counter()
+          weekly_ingested = Counter()
+          weekly_matched = Counter()
+          weekly_rejected = Counter()
+          work_modes = Counter()
+          has_email = 0
+          no_email = 0
+          has_source_link = 0
+          no_source_link = 0
+          has_posted_date = 0
+          no_posted_date = 0
+          stale_count = 0
+          fresh_count = 0
+          prefilter_rejected = 0
+
+          for item in recent:
+              status = str(item.get("status") or "UNKNOWN").strip().upper()
+              source = str(item.get("source") or "unknown").strip().lower()
+              score = safe_int(item.get("match_score"), -1)
+              reason = str(item.get("match_reason") or "")
+              feedback = str(item.get("user_feedback") or "").strip().lower()
+              feedback_reason = str(item.get("user_feedback_reason") or "").strip()
+              wk = week_key(item["_analysis_ts"])
+              work_mode = str(item.get("work_mode") or "unknown").strip().lower()
+
+              status_counts[status] += 1
+              source_counts[source] += 1
+              source_status[source][status] += 1
+              work_modes[work_mode] += 1
+              weekly_ingested[wk] += 1
+
+              if status == "PENDING_APPROVAL":
+                  weekly_matched[wk] += 1
+              elif status in ("REJECTED", "REJECTED_OLD"):
+                  weekly_rejected[wk] += 1
+
+              # Score distribution
+              if score >= 0:
+                  bucket = min(score // 10, 9) * 10
+                  label = f"{bucket}-{bucket+9}" if bucket < 90 else "90-100"
+                  score_buckets[label] += 1
+
+              # Guardrail analysis
+              if "Guardrail applied:" in reason:
+                  parts = reason.split("Guardrail applied:")[-1].strip().rstrip(".")
+                  for part in parts.split(","):
+                      part = part.strip()
+                      if part:
+                          guardrail_reasons[part] += 1
+
+              if "Rejected before LLM" in reason:
+                  prefilter_rejected += 1
+                  parts = reason.split(":")[-1].strip().rstrip(".")
+                  for part in parts.split(","):
+                      part = part.strip()
+                      if part:
+                          guardrail_reasons[f"pre-LLM: {part}"] += 1
+
+              # Source quality
+              url = str(item.get("url") or item.get("apply_url") or "")
+              if url.startswith("http"):
+                  has_source_link += 1
+              else:
+                  no_source_link += 1
+
+              posted = item.get("posted_at")
+              if posted:
+                  has_posted_date += 1
+                  posted_ts = iso_to_ts(posted)
+                  if posted_ts > 0:
+                      age_days = (datetime.now(timezone.utc) - datetime.fromtimestamp(posted_ts, tz=timezone.utc)).days
+                      if age_days > 14:
+                          stale_count += 1
+                      else:
+                          fresh_count += 1
+              else:
+                  no_posted_date += 1
+
+              # Recruiter email
+              email = str(item.get("recruiter_email") or "").strip()
+              if email:
+                  has_email += 1
+              else:
+                  no_email += 1
+
+              # Feedback
+              if feedback:
+                  if feedback in ("interested", "applied"):
+                      feedback_labels["positive"] += 1
+                  elif feedback in ("meh", "neutral", "maybe"):
+                      feedback_labels["neutral"] += 1
+                  else:
+                      feedback_labels["negative"] += 1
+
+                  if feedback_reason:
+                      feedback_reasons[feedback_reason.lower()[:80]] += 1
+
+          # ---- Build report ----
+          matched = status_counts.get("PENDING_APPROVAL", 0)
+          rejected = status_counts.get("REJECTED", 0) + status_counts.get("REJECTED_OLD", 0)
+          new_unscored = status_counts.get("NEW", 0)
+          match_rate = (matched / total * 100) if total > 0 else 0
+          dedup_rate_approx = (1 - total / max(total, 1)) * 100  # approximation
+
+          lines = []
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+          lines.append(f"# 📊 Pipeline Analytics Report")
+          lines.append(f"")
+          lines.append(f"**Generated:** {now}  ")
+          lines.append(f"**Analysis window:** Last {DAYS} days  ")
+          lines.append(f"**Score threshold:** {THRESHOLD}%  ")
+          lines.append(f"")
+
+          # Executive summary
+          lines.append(f"## Executive Summary")
+          lines.append(f"")
+          lines.append(f"| Metric | Count |")
+          lines.append(f"|--------|-------|")
+          lines.append(f"| Total jobs in window | **{total}** |")
+          lines.append(f"| Matched (≥{THRESHOLD}%) | **{matched}** |")
+          lines.append(f"| Rejected (<{THRESHOLD}%) | **{rejected}** |")
+          lines.append(f"| New/Unscored | {new_unscored} |")
+          lines.append(f"| Pre-LLM rejected | {prefilter_rejected} |")
+          lines.append(f"| Match rate | **{match_rate:.1f}%** |")
+          lines.append(f"| With recruiter email | {has_email} |")
+          lines.append(f"| Missing email | {no_email} |")
+          lines.append(f"")
+
+          # Status breakdown
+          lines.append(f"## Status Breakdown")
+          lines.append(f"")
+          lines.append(f"| Status | Count | % |")
+          lines.append(f"|--------|-------|---|")
+          for status, count in status_counts.most_common():
+              pct = count / total * 100 if total > 0 else 0
+              lines.append(f"| {status} | {count} | {pct:.1f}% |")
+          lines.append(f"")
+
+          # Source breakdown
+          lines.append(f"## Source Breakdown")
+          lines.append(f"")
+          lines.append(f"| Source | Total | Matched | Rejected | Match Rate |")
+          lines.append(f"|--------|-------|---------|----------|------------|")
+          for source, count in source_counts.most_common():
+              s_matched = source_status[source].get("PENDING_APPROVAL", 0)
+              s_rejected = source_status[source].get("REJECTED", 0) + source_status[source].get("REJECTED_OLD", 0)
+              s_rate = (s_matched / count * 100) if count > 0 else 0
+              lines.append(f"| {source} | {count} | {s_matched} | {s_rejected} | {s_rate:.1f}% |")
+          lines.append(f"")
+
+          # Score distribution
+          lines.append(f"## Score Distribution")
+          lines.append(f"")
+          lines.append(f"| Score Range | Count |")
+          lines.append(f"|-------------|-------|")
+          for bucket in ["0-9", "10-19", "20-29", "30-39", "40-49", "50-59", "60-69", "70-79", "80-89", "90-100"]:
+              count = score_buckets.get(bucket, 0)
+              bar = "█" * min(count, 50)
+              lines.append(f"| {bucket} | {count} {bar} |")
+          lines.append(f"")
+
+          # Guardrail impact
+          lines.append(f"## Guardrail Impact")
+          lines.append(f"")
+          if guardrail_reasons:
+              lines.append(f"| Guardrail Reason | Count |")
+              lines.append(f"|------------------|-------|")
+              for reason, count in guardrail_reasons.most_common(15):
+                  lines.append(f"| {reason} | {count} |")
+          else:
+              lines.append(f"No guardrail activations recorded.")
+          lines.append(f"")
+
+          # Source quality
+          lines.append(f"## Source Quality")
+          lines.append(f"")
+          lines.append(f"| Quality Signal | Present | Missing |")
+          lines.append(f"|----------------|---------|---------|")
+          lines.append(f"| Source link | {has_source_link} | {no_source_link} |")
+          lines.append(f"| Posted date | {has_posted_date} | {no_posted_date} |")
+          lines.append(f"| Recruiter email | {has_email} | {no_email} |")
+          lines.append(f"")
+          lines.append(f"| Freshness | Count |")
+          lines.append(f"|-----------|-------|")
+          lines.append(f"| Fresh (≤14 days) | {fresh_count} |")
+          lines.append(f"| Stale (>14 days) | {stale_count} |")
+          lines.append(f"| No date | {no_posted_date} |")
+          lines.append(f"")
+
+          # Work mode distribution
+          lines.append(f"## Work Mode Distribution")
+          lines.append(f"")
+          lines.append(f"| Work Mode | Count |")
+          lines.append(f"|-----------|-------|")
+          for mode, count in work_modes.most_common():
+              lines.append(f"| {mode} | {count} |")
+          lines.append(f"")
+
+          # Weekly trends
+          lines.append(f"## Weekly Trends")
+          lines.append(f"")
+          weeks = sorted(set(list(weekly_ingested.keys()) + list(weekly_matched.keys()) + list(weekly_rejected.keys())))
+          if weeks and weeks[0] == "unknown":
+              weeks.remove("unknown")
+              weeks.append("unknown")
+          lines.append(f"| Week | Ingested | Matched | Rejected | Match Rate |")
+          lines.append(f"|------|----------|---------|----------|------------|")
+          for wk in weeks:
+              ing = weekly_ingested.get(wk, 0)
+              mat = weekly_matched.get(wk, 0)
+              rej = weekly_rejected.get(wk, 0)
+              rate = (mat / ing * 100) if ing > 0 else 0
+              lines.append(f"| {wk} | {ing} | {mat} | {rej} | {rate:.1f}% |")
+          lines.append(f"")
+
+          # Feedback loop
+          lines.append(f"## Feedback Loop")
+          lines.append(f"")
+          total_feedback = sum(feedback_labels.values())
+          if total_feedback > 0:
+              lines.append(f"| Label | Count | % |")
+              lines.append(f"|-------|-------|---|")
+              for label in ["positive", "neutral", "negative"]:
+                  count = feedback_labels.get(label, 0)
+                  pct = count / total_feedback * 100 if total_feedback > 0 else 0
+                  lines.append(f"| {label} | {count} | {pct:.1f}% |")
+              lines.append(f"")
+
+              if feedback_reasons:
+                  lines.append(f"### Top Feedback Reasons")
+                  lines.append(f"")
+                  lines.append(f"| Reason | Count |")
+                  lines.append(f"|--------|-------|")
+                  for reason, count in feedback_reasons.most_common(10):
+                      lines.append(f"| {reason} | {count} |")
+          else:
+              lines.append(f"No user feedback captured in this window.")
+          lines.append(f"")
+
+          # Write report
+          report = "\n".join(lines)
+          with open("pipeline_report.md", "w", encoding="utf-8") as f:
+              f.write(report)
+
+          # Also write JSON for programmatic use
+          metrics = {
+              "generated_at": now,
+              "analysis_days": DAYS,
+              "total_jobs": total,
+              "matched": matched,
+              "rejected": rejected,
+              "match_rate_pct": round(match_rate, 1),
+              "prefilter_rejected": prefilter_rejected,
+              "by_status": dict(status_counts),
+              "by_source": dict(source_counts),
+              "by_score_bucket": dict(score_buckets),
+              "guardrail_reasons": dict(guardrail_reasons.most_common(15)),
+              "source_quality": {
+                  "has_link": has_source_link,
+                  "no_link": no_source_link,
+                  "has_date": has_posted_date,
+                  "no_date": no_posted_date,
+                  "fresh": fresh_count,
+                  "stale": stale_count,
+              },
+              "feedback": {
+                  "total": total_feedback,
+                  "labels": dict(feedback_labels),
+                  "top_reasons": dict(feedback_reasons.most_common(10)),
+              },
+              "weekly_trends": {
+                  wk: {
+                      "ingested": weekly_ingested.get(wk, 0),
+                      "matched": weekly_matched.get(wk, 0),
+                      "rejected": weekly_rejected.get(wk, 0),
+                  }
+                  for wk in weeks
+              },
+          }
+          with open("pipeline_metrics.json", "w", encoding="utf-8") as f:
+              json.dump(metrics, f, indent=2, default=str)
+
+          print(f"Report generated: {total} jobs analyzed across {len(weeks)} weeks")
+          print(f"  Matched: {matched} ({match_rate:.1f}%)")
+          print(f"  Rejected: {rejected}")
+          print(f"  Pre-LLM filtered: {prefilter_rejected}")
+          print(f"  Feedback entries: {total_feedback}")
+          ANALYTICS_SCRIPT
+
+      - name: Upload analytics report
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-analytics-${{ github.run_number }}
+          path: |
+            pipeline_report.md
+            pipeline_metrics.json
+          retention-days: 90
+
+      - name: Post summary to job step
+        run: |
+          if [ -f pipeline_report.md ]; then
+            cat pipeline_report.md >> "$GITHUB_STEP_SUMMARY"
+          fi

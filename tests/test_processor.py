@@ -11,6 +11,7 @@ Tests:
 """
 
 import json
+from datetime import datetime, timezone, timedelta
 import pytest
 import boto3
 from moto import mock_aws
@@ -191,7 +192,7 @@ class TestProcessor:
             "location": "Brazil, Colombia, Philippines",
             "source": "remotive",
             "is_remote": True,
-            "posted_at": "2026-04-16T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         table.put_item(Item={"job_id": "stale-remote", "status": "NEW"})
 
@@ -221,7 +222,7 @@ class TestProcessor:
             "description": "Build AI agents, knowledge graphs, multi-agent systems, evals, and simulations.",
             "url": "https://news.ycombinator.com/item?id=123",
             "apply_url": "https://news.ycombinator.com/item?id=123",
-            "posted_at": "2026-05-09T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         table.put_item(Item={"job_id": "hn-stale", "status": "NEW"})
 
@@ -246,7 +247,7 @@ class TestProcessor:
             "is_remote": True,
             "url": "",
             "apply_url": "",
-            "posted_at": "2026-05-12T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         table.put_item(Item={"job_id": "missing-source-low-threshold", "status": "NEW"})
 
@@ -269,7 +270,7 @@ class TestProcessor:
             "job_id": "no-source",
             "url": "",
             "apply_url": "",
-            "posted_at": "2026-05-12T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         table.put_item(Item={"job_id": "no-source", "status": "NEW"})
 
@@ -323,7 +324,7 @@ class TestProcessor:
             "description": "Build React marketing pages and CMS templates. No AI or ML work.",
             "url": "https://jobs.example.com/frontend-no-ai",
             "apply_url": "https://jobs.example.com/frontend-no-ai",
-            "posted_at": "2026-05-12T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         table.put_item(Item={"job_id": "frontend-no-ai", "status": "NEW"})
 

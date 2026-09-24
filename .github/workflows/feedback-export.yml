@@ -1,0 +1,92 @@
+# ============================================================================
+# Feedback Export — Automated Feedback Data Collection
+# ============================================================================
+# Runs weekly (Sunday at 07:00 UTC) to export Telegram feedback from DynamoDB
+# into eval-ready JSON. This feeds the feedback learning loop described in
+# AGENTS.md without ever auto-changing production behavior.
+#
+# Output:
+#   - feedback_export.json — raw eval-ready cases
+#   - feedback_summary.txt — human-readable preference patterns
+#   - Both uploaded as artifacts for offline review
+
+name: Feedback Export
+
+on:
+  schedule:
+    # Weekly on Sunday at 07:00 UTC
+    - cron: "0 7 * * 0"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max feedback rows to export"
+        required: false
+        default: "500"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  DYNAMODB_TABLE: Jobsearch
+
+jobs:
+  export:
+    name: Export Feedback Data
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Export feedback
+        env:
+          LIMIT: ${{ github.event.inputs.limit || '500' }}
+        run: |
+          python tools/ops/export_feedback.py \
+            --table "$DYNAMODB_TABLE" \
+            --limit "$LIMIT" \
+            --format json \
+            --output evals/feedback_export.json
+
+      - name: Generate feedback summary
+        run: |
+          python tools/ops/feedback_summary.py \
+            --input evals/feedback_export.json \
+            --top 10 | tee feedback_summary.txt
+
+      - name: Upload feedback artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: feedback-export-${{ github.run_number }}
+          path: |
+            evals/feedback_export.json
+            feedback_summary.txt
+          retention-days: 90
+
+      - name: Post summary
+        run: |
+          echo "## Weekly Feedback Export" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f feedback_summary.txt ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat feedback_summary.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi

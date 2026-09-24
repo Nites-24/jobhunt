@@ -10,6 +10,7 @@ import os
 import sys
 import pytest
 import boto3
+from datetime import datetime, timezone, timedelta
 from moto import mock_aws
 from unittest.mock import MagicMock
 
@@ -207,7 +208,7 @@ SAMPLE_JOB = {
     "salary": "$180,000 - $250,000",
     "is_remote": False,
     "employment_type": "FULLTIME",
-    "posted_at": "2026-05-10T12:00:00Z",
+    "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "recruiter_email": "hiring@anthropic.com",
     "recruiter_name": "Sarah Chen",
 }

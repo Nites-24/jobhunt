@@ -1,0 +1,290 @@
+# ============================================================================
+# Source Quality Audit — Check Source API Health and Data Freshness
+# ============================================================================
+# Runs daily. Checks whether each job source (HN, Adzuna, Google CSE, JSearch)
+# is actually contributing jobs, and whether the contributed jobs meet the
+# freshness and quality bar.
+#
+# This workflow does NOT call live source APIs. It reads from DynamoDB to
+# measure what each source has contributed over the last 7 days.
+#
+# Known issues this catches (from production logs):
+#   - Google CSE: HTTP 403 (API not enabled) + blank queries
+#   - JSearch: HTTP 429 (rate limited)
+#   - HN stale jobs older than HN_MAX_JOB_AGE_DAYS (3 days)
+#   - Jobs with missing source links or posted dates
+
+name: Source Quality Audit
+
+on:
+  schedule:
+    # Daily at 08:00 UTC
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  DYNAMODB_TABLE: Jobsearch
+
+jobs:
+  audit:
+    name: Source Quality Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install boto3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run source quality audit
+        run: |
+          python - <<'AUDIT_SCRIPT'
+          import boto3
+          import json
+          import os
+          import sys
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone, timedelta
+
+          TABLE = os.environ.get("DYNAMODB_TABLE", "Jobsearch")
+          REGION = os.environ.get("AWS_REGION", "us-east-1")
+          AUDIT_DAYS = 7
+          EXPECTED_SOURCES = ["hackernews", "adzuna", "google_cse", "jsearch"]
+
+          dynamodb = boto3.resource("dynamodb", region_name=REGION)
+          table = dynamodb.Table(TABLE)
+
+          cutoff = datetime.now(timezone.utc) - timedelta(days=AUDIT_DAYS)
+          cutoff_ts = int(cutoff.timestamp())
+
+          # Scan all items
+          items = []
+          scan_args = {}
+          while True:
+              response = table.scan(**scan_args)
+              items.extend(response.get("Items", []))
+              if "LastEvaluatedKey" not in response:
+                  break
+              scan_args["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+
+          def iso_to_ts(val):
+              if not val:
+                  return 0
+              try:
+                  raw = str(val).strip()
+                  if raw.isdigit():
+                      return int(raw)
+                  if raw.endswith("Z"):
+                      raw = raw[:-1] + "+00:00"
+                  dt = datetime.fromisoformat(raw)
+                  return int(dt.timestamp())
+              except Exception:
+                  return 0
+
+          def safe_int(val, default=0):
+              try:
+                  return int(val)
+              except (TypeError, ValueError):
+                  return default
+
+          # Filter to audit window
+          recent = []
+          for item in items:
+              ingested_ts = iso_to_ts(item.get("ingested_at"))
+              evaluated_ts = safe_int(item.get("evaluated_at"))
+              ts = max(ingested_ts, evaluated_ts)
+              if ts >= cutoff_ts:
+                  item["_ts"] = ts
+                  recent.append(item)
+
+          report = []
+          issues = []
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+          report.append("# 🔍 Source Quality Audit Report")
+          report.append(f"")
+          report.append(f"**Checked:** {now}  ")
+          report.append(f"**Window:** Last {AUDIT_DAYS} days  ")
+          report.append(f"**Total jobs in window:** {len(recent)}  ")
+          report.append(f"")
+
+          # Source volume
+          source_data = defaultdict(lambda: {
+              "total": 0, "matched": 0, "rejected": 0,
+              "has_url": 0, "no_url": 0,
+              "has_date": 0, "no_date": 0,
+              "fresh": 0, "stale": 0,
+              "has_email": 0, "no_email": 0,
+              "score_sum": 0, "score_count": 0,
+          })
+
+          for item in recent:
+              source = str(item.get("source") or "unknown").strip().lower()
+              status = str(item.get("status") or "").strip().upper()
+              score = safe_int(item.get("match_score"), -1)
+
+              d = source_data[source]
+              d["total"] += 1
+
+              if status == "PENDING_APPROVAL":
+                  d["matched"] += 1
+              elif status in ("REJECTED", "REJECTED_OLD"):
+                  d["rejected"] += 1
+
+              url = str(item.get("url") or item.get("apply_url") or "")
+              if url.startswith("http"):
+                  d["has_url"] += 1
+              else:
+                  d["no_url"] += 1
+
+              email = str(item.get("recruiter_email") or "").strip()
+              if email:
+                  d["has_email"] += 1
+              else:
+                  d["no_email"] += 1
+
+              posted = item.get("posted_at")
+              if posted:
+                  d["has_date"] += 1
+                  posted_ts = iso_to_ts(posted)
+                  if posted_ts > 0:
+                      age = (datetime.now(timezone.utc) - datetime.fromtimestamp(posted_ts, tz=timezone.utc)).days
+                      if age <= 14:
+                          d["fresh"] += 1
+                      else:
+                          d["stale"] += 1
+              else:
+                  d["no_date"] += 1
+
+              if score >= 0:
+                  d["score_sum"] += score
+                  d["score_count"] += 1
+
+          # Source health table
+          report.append("## Source Health Matrix")
+          report.append("")
+          report.append("| Source | Jobs | Matched | Rejected | Avg Score | URL% | Date% | Fresh% | Email% |")
+          report.append("|--------|------|---------|----------|-----------|------|-------|--------|--------|")
+
+          for source in EXPECTED_SOURCES:
+              d = source_data.get(source, {
+                  "total": 0, "matched": 0, "rejected": 0,
+                  "has_url": 0, "no_url": 0,
+                  "has_date": 0, "no_date": 0,
+                  "fresh": 0, "stale": 0,
+                  "has_email": 0, "no_email": 0,
+                  "score_sum": 0, "score_count": 0,
+              })
+              total = d["total"]
+              if total == 0:
+                  report.append(f"| {source} | **0** ⚠️ | - | - | - | - | - | - | - |")
+                  issues.append(f"Source '{source}' contributed 0 jobs in the last {AUDIT_DAYS} days")
+                  continue
+
+              avg_score = d["score_sum"] / d["score_count"] if d["score_count"] > 0 else 0
+              url_pct = d["has_url"] / total * 100
+              date_pct = d["has_date"] / total * 100
+              fresh_pct = d["fresh"] / max(d["has_date"], 1) * 100
+              email_pct = d["has_email"] / total * 100
+
+              report.append(
+                  f"| {source} | {total} | {d['matched']} | {d['rejected']} | "
+                  f"{avg_score:.0f} | {url_pct:.0f}% | {date_pct:.0f}% | "
+                  f"{fresh_pct:.0f}% | {email_pct:.0f}% |"
+              )
+
+              if url_pct < 90:
+                  issues.append(f"Source '{source}' has {url_pct:.0f}% source URL coverage (expected >90%)")
+              if date_pct < 70:
+                  issues.append(f"Source '{source}' has {date_pct:.0f}% posted date coverage (expected >70%)")
+              if total > 5 and d["matched"] == 0:
+                  issues.append(f"Source '{source}' contributed {total} jobs but 0 matched — possible quality issue")
+
+          # Other sources
+          other_sources = [s for s in source_data if s not in EXPECTED_SOURCES]
+          if other_sources:
+              report.append("")
+              report.append("### Other Sources")
+              report.append("")
+              for source in sorted(other_sources):
+                  d = source_data[source]
+                  report.append(f"- **{source}**: {d['total']} jobs, {d['matched']} matched")
+
+          report.append("")
+
+          # Deduplication estimate
+          all_time_total = len(items)
+          window_total = len(recent)
+          report.append("## Deduplication Metrics")
+          report.append("")
+          report.append(f"| Metric | Value |")
+          report.append(f"|--------|-------|")
+          report.append(f"| All-time rows in table | {all_time_total} |")
+          report.append(f"| Rows in audit window | {window_total} |")
+
+          # Count rows with NEW status that were never scored (true dedup candidates)
+          new_unscored = sum(1 for item in items if item.get("status") == "NEW" and not item.get("evaluated_at"))
+          report.append(f"| New/unscored (never evaluated) | {new_unscored} |")
+          report.append(f"")
+          report.append(f"> **Note:** Exact duplicate counts require CloudWatch log analysis of ")
+          report.append(f"> `DUPLICATE_SKIP` and `DUPLICATE_REQUEUED` events from the deduplicator Lambda.")
+          report.append(f"")
+
+          # Summary
+          report.append("## Audit Verdict")
+          report.append("")
+          if issues:
+              report.append(f"⚠️ **{len(issues)} issue(s) found:**")
+              report.append("")
+              for issue in issues:
+                  report.append(f"- {issue}")
+          else:
+              report.append("✅ **All sources healthy.** No quality issues detected.")
+
+          report.append("")
+
+          full_report = "\n".join(report)
+          with open("source_audit.md", "w", encoding="utf-8") as f:
+              f.write(full_report)
+          print(full_report)
+
+          # Warn but don't fail for source issues — they may be expected
+          if issues:
+              print(f"\n{'='*60}")
+              print(f"SOURCE AUDIT: {len(issues)} ISSUE(S)")
+              for issue in issues:
+                  print(f"  - {issue}")
+              print(f"{'='*60}")
+          AUDIT_SCRIPT
+
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-audit-${{ github.run_number }}
+          path: source_audit.md
+          retention-days: 30
+
+      - name: Post summary
+        if: always()
+        run: |
+          if [ -f source_audit.md ]; then
+            cat source_audit.md >> "$GITHUB_STEP_SUMMARY"
+          fi

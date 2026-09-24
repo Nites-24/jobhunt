@@ -63,24 +63,24 @@
     }
   },
   {
-    "id": "remote_nonlocal_role",
-    "label": "remote_nonlocal",
+    "id": "missing_date_role",
+    "label": "missing_date",
     "expected_status": "REJECTED",
     "expected_score_min": 0,
-    "expected_score_max": 80,
+    "expected_score_max": 70,
     "mock_model_score": 93,
     "job": {
-      "job_id": "eval-remote-nonlocal-role",
+      "job_id": "eval-missing-date-role",
       "title": "LLM Engineer",
-      "company": "Remote Global AI",
-      "location": "Remote, Brazil",
+      "company": "Fast Moving AI",
+      "location": "Remote",
       "description": "Build LLM inference APIs, RAG services, and Python AI tooling.",
       "url": "https://jobs.example.com/remote-llm",
       "apply_url": "https://jobs.example.com/remote-llm",
       "source": "adzuna",
       "is_remote": true,
       "employment_type": "FULL_TIME",
-      "posted_at": "2026-05-13T12:00:00Z"
+      "posted_at": ""
     }
   },
   {

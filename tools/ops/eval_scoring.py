@@ -7,6 +7,7 @@ jobs must not enter the review queue.
 """
 
 import argparse
+from datetime import datetime, timezone, timedelta
 import json
 import os
 import sys
@@ -33,7 +34,12 @@ def _evaluate_case(case: dict, threshold: int) -> dict:
     import lambda_function as processor
 
     processor.SCORE_THRESHOLD = threshold
-    job = case["job"]
+    job = dict(case["job"])
+    # Normalize posted_at relative to eval run time so offline evals do not expire over time
+    if case.get("label") == "stale_job":
+        job["posted_at"] = (datetime.now(timezone.utc) - timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    elif job.get("posted_at"):
+        job["posted_at"] = (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     mock_score = int(case["mock_model_score"])
     mock_reason = f"Mock model reason for {case['id']}."
 

@@ -16,6 +16,7 @@ Tests:
 
 import json
 import io
+from datetime import datetime, timezone, timedelta
 import pytest
 import boto3
 from decimal import Decimal
@@ -111,6 +112,7 @@ class TestRouter:
 
     def _insert_pending_jobs(self, table, count=3, with_email=False):
         """Insert sample PENDING_APPROVAL jobs."""
+        now = datetime.now(timezone.utc)
         for i in range(count):
             item = {
                 "job_id": f"pending-{i+1:03d}",
@@ -123,7 +125,7 @@ class TestRouter:
                 "match_reason": f"Strong match #{i+1}",
                 "status": "PENDING_APPROVAL",
                 "source": "hackernews",
-                "posted_at": "2026-05-12T12:00:00Z",
+                "posted_at": (now - timedelta(hours=2 + i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "url": f"https://company{i+1}.com/apply",
             }
             if with_email:
@@ -222,7 +224,7 @@ class TestRouter:
             "company": "Dry Ground AI",
             "status": "PENDING_APPROVAL",
             "source": "remotive",
-            "posted_at": "2026-04-21T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(days=25)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("92"),
             "url": "https://remotive.com/remote-jobs/artificial-intelligence/ai-engineer-2089958",
         })
@@ -250,7 +252,7 @@ class TestRouter:
             "company": "Cora AI",
             "status": "PENDING_APPROVAL",
             "source": "hackernews",
-            "posted_at": "2026-05-09T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("94"),
             "url": "https://news.ycombinator.com/item?id=123",
         })
@@ -277,7 +279,7 @@ class TestRouter:
             "company": "Northstar Revenue AI",
             "status": "PENDING_APPROVAL",
             "source": "tejajob",
-            "posted_at": "2026-05-12T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("94"),
         })
 
@@ -360,7 +362,7 @@ class TestRouter:
             "location": "Remote",
             "status": "MANUAL_APPLY",
             "source": "hackernews",
-            "posted_at": "2026-05-12T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("91"),
             "url": "https://news.ycombinator.com/item?id=123",
             "status_updated_at": 1778600000,
@@ -390,7 +392,7 @@ class TestRouter:
             "location": "Remote",
             "status": "MANUAL_APPLY",
             "source": "hackernews",
-            "posted_at": "2026-05-12T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("91"),
             "url": "https://news.ycombinator.com/item?id=123",
             "recruiter_email": "careers@cora.ai",
@@ -564,7 +566,7 @@ class TestRouter:
             "company": "Old Co",
             "status": "PENDING_APPROVAL",
             "source": "showcase",
-            "posted_at": "2026-05-12T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("94"),
         })
 
@@ -612,7 +614,7 @@ class TestRouter:
             "company": "Northstar Revenue AI",
             "status": "PENDING_APPROVAL",
             "source": "tejajob",
-            "posted_at": "2026-05-12T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("94"),
         })
 
@@ -801,7 +803,7 @@ class TestRouter:
             "location": "San Francisco, CA",
             "status": "PENDING_APPROVAL",
             "source": "hackernews",
-            "posted_at": "2026-05-12T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("95"),
             "url": "https://news.ycombinator.com/item?id=12345",
             "recruiter_email": "founders@sourceverified.ai",
@@ -814,7 +816,7 @@ class TestRouter:
             "location": "San Francisco, CA",
             "status": "PENDING_APPROVAL",
             "source": "jsearch",
-            "posted_at": "2026-05-12T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("72"),
             "url": "https://watchlist.example/jobs/ml-platform",
             "match_reason": "Good ML platform match but below the review threshold.",
@@ -850,7 +852,7 @@ class TestRouter:
             "location": "Remote",
             "status": "PENDING_APPROVAL",
             "source": "hackernews",
-            "posted_at": "2026-05-01T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("91"),
             "url": "https://archive.example/jobs/ai",
         })
@@ -877,7 +879,7 @@ class TestRouter:
             "location": "Remote",
             "status": "PENDING_APPROVAL",
             "source": "hackernews",
-            "posted_at": "2026-05-01T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("91"),
             "url": "https://archive.example/jobs/ai",
         })
@@ -904,7 +906,7 @@ class TestRouter:
             "location": "Wichita, Kansas",
             "status": "PENDING_APPROVAL",
             "source": "signal_test",
-            "posted_at": "2026-05-14T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("96"),
             "url": "https://example.com/signal-test-ai-engineer",
             "signal_test": True,
@@ -928,7 +930,7 @@ class TestRouter:
             "company": "Cora AI",
             "status": "PENDING_APPROVAL",
             "source": "hackernews",
-            "posted_at": "2026-05-09T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("94"),
             "url": "https://news.ycombinator.com/item?id=123",
         })
@@ -955,7 +957,7 @@ class TestRouter:
             "company": "Cora AI",
             "status": "PENDING_APPROVAL",
             "source": "hackernews",
-            "posted_at": "2026-05-09T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("94"),
             "url": "https://news.ycombinator.com/item?id=123",
         })
@@ -978,7 +980,7 @@ class TestRouter:
             "location": "Wichita, Kansas",
             "status": "PENDING_APPROVAL",
             "source": "signal_test",
-            "posted_at": "2026-05-14T12:00:00Z",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("96"),
             "url": "https://example.com/signal-test-ai-engineer",
             "signal_test": True,
