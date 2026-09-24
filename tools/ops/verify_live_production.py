@@ -121,6 +121,27 @@ def invoke_ingestor(lambda_client) -> None:
     print()
 
 
+def verify_schedule(events_client, lambda_client, rule_name: str = "job-search-daily-trigger") -> None:
+    print("EventBridge ingestion schedule")
+    print("------------------------------")
+    try:
+        from tools.ops.setup_cron import verify_ingestor_schedule
+        status = verify_ingestor_schedule(events_client, lambda_client, rule_name=rule_name)
+        if not status["rule_exists"]:
+            print(f"Rule '{rule_name}': MISSING")
+        else:
+            print(f"Rule:         {status['rule_name']}")
+            print(f"State:        {status['state']}")
+            print(f"Schedule:     {status['schedule_expression']}")
+            print(f"Target:       {status['target_arn'] or 'NOT CONFIGURED'}")
+            print(f"Target Input: {status['target_input'] or 'DEFAULT'}")
+            print(f"Permission:   {'CONFIGURED' if status['permission_configured'] else 'UNVERIFIED'}")
+            print(f"Healthy:      {'YES' if status['healthy'] else 'NO'}")
+    except Exception as e:
+        print(f"Rule check error: {e}")
+    print()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Verify the live AWS job pipeline.")
     parser.add_argument(
@@ -134,10 +155,12 @@ def main() -> int:
     lambda_client = session.client("lambda")
     sqs = session.client("sqs")
     cloudwatch = session.client("cloudwatch")
+    events_client = session.client("events")
 
     verify_lambdas(lambda_client)
     verify_queues(sqs)
     verify_alarms(cloudwatch)
+    verify_schedule(events_client, lambda_client)
     if args.invoke_ingestor:
         invoke_ingestor(lambda_client)
     return 0

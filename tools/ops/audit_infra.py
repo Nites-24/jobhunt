@@ -186,9 +186,32 @@ for s, c in sorted(status_counts.items()):
 
 
 # =====================================================================
-# 7. PIPELINE WIRING SUMMARY
+# 7. EVENTBRIDGE SCHEDULED TRIGGERS
 # =====================================================================
-section("7. PIPELINE WIRING SUMMARY")
+section("7. EVENTBRIDGE SCHEDULED TRIGGERS")
+
+try:
+    events_client = session.client("events")
+    from tools.ops.setup_cron import verify_ingestor_schedule
+    sched = verify_ingestor_schedule(events_client, lambda_client)
+    if not sched["rule_exists"]:
+        print(f"\n  Schedule Rule '{sched['rule_name']}': NOT FOUND")
+    else:
+        print(f"\n  Rule:         {sched['rule_name']}")
+        print(f"    State:        {sched['state']}")
+        print(f"    Schedule:     {sched['schedule_expression']}")
+        print(f"    Target:       {sched['target_arn']}")
+        print(f"    Target Input: {sched['target_input']}")
+        print(f"    Permission:   {'CONFIGURED' if sched['permission_configured'] else 'UNVERIFIED'}")
+        print(f"    Healthy:      {'YES' if sched['healthy'] else 'NO'}")
+except Exception as e:
+    print(f"\n  Error inspecting EventBridge triggers: {e}")
+
+
+# =====================================================================
+# 8. PIPELINE WIRING SUMMARY
+# =====================================================================
+section("8. PIPELINE WIRING SUMMARY")
 
 print("""
   Telegram "search jobs"

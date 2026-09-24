@@ -993,7 +993,8 @@ def lambda_handler(event, context):
             "sources": {"signal_test": 1},
             "source_errors": [],
         }
-    logger.info("INGESTOR_START | Using HN + Google CSE + Adzuna + JSearch")
+    trigger_source = (event.get("source") if isinstance(event, dict) else "") or "direct"
+    logger.info("INGESTOR_START | trigger=%s | Using HN + Google CSE + Adzuna + JSearch", trigger_source)
     hn_jobs = fetch_hacker_news_jobs()
     google_cse_jobs = fetch_google_cse_jobs()
     adzuna_jobs = fetch_adzuna_jobs()
@@ -1002,15 +1003,16 @@ def lambda_handler(event, context):
     logger.info("INGESTOR_YIELD_BY_SOURCE_QUERY | %s", json.dumps(_source_query_summary(all_jobs)))
 
     if not all_jobs:
-        return {"status": "success", "message": "No jobs found.", "jobs_ingested": 0}
+        return {"status": "success", "trigger": trigger_source, "message": "No jobs found.", "jobs_ingested": 0}
 
     sent_count = _send_to_sqs(all_jobs)
     logger.info(
-        "INGESTOR_COMPLETE | hn=%d | google_cse=%d | adzuna=%d | jsearch=%d | unique=%d | queued=%d",
-        len(hn_jobs), len(google_cse_jobs), len(adzuna_jobs), len(jsearch_jobs), len(all_jobs), sent_count,
+        "INGESTOR_COMPLETE | trigger=%s | hn=%d | google_cse=%d | adzuna=%d | jsearch=%d | unique=%d | queued=%d",
+        trigger_source, len(hn_jobs), len(google_cse_jobs), len(adzuna_jobs), len(jsearch_jobs), len(all_jobs), sent_count,
     )
     return {
         "status": "success",
+        "trigger": trigger_source,
         "jobs_fetched": len(all_jobs),
         "jobs_queued": sent_count,
         "source_errors": SOURCE_ERRORS[:10],

@@ -129,6 +129,32 @@ jobs:
 
           report.append("")
 
+          # ---- EventBridge Ingestion Schedule ----
+          report.append("## EventBridge Ingestion Schedule")
+          report.append("")
+          report.append("| Rule | State | Schedule | Target Lambda | Healthy |")
+          report.append("|------|-------|----------|---------------|---------|")
+
+          events = session.client("events")
+          rule_name = "job-search-daily-trigger"
+          try:
+              rule_resp = events.describe_rule(Name=rule_name)
+              targets_resp = events.list_targets_by_rule(Rule=rule_name)
+              targets = targets_resp.get("Targets", [])
+              target_arn = targets[0].get("Arn", "None") if targets else "None"
+              has_ingestor_target = any("job-ingestor" in t.get("Arn", "") for t in targets)
+              state = rule_resp.get("State", "UNKNOWN")
+              sched_expr = rule_resp.get("ScheduleExpression", "")
+              is_healthy = state == "ENABLED" and has_ingestor_target
+              report.append(f"| {rule_name} | {state} | {sched_expr} | {target_arn.split(':')[-1]} | {'✅ Yes' if is_healthy else '⚠️ No'} |")
+              if not is_healthy:
+                  issues.append(f"EventBridge rule {rule_name} is {state} or missing job-ingestor target")
+          except Exception as e:
+              report.append(f"| {rule_name} | NOT FOUND | - | - | ❌ Missing |")
+              issues.append(f"EventBridge rule {rule_name} not configured: {str(e)[:100]}")
+
+          report.append("")
+
           # ---- Recent Errors (CloudWatch) ----
           report.append("## Recent Lambda Errors (Last 6 Hours)")
           report.append("")
