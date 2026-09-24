@@ -15,6 +15,8 @@ import os
 import logging
 import time
 import re
+import urllib.parse
+import urllib.request
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -529,7 +531,7 @@ def _update_job_status(job_id: str, score: int, reason: str, status: str, email:
             ":mid": MODEL_ID,
             ":epv": JOB_EVAL_PROFILE_VERSION,
         }
-        
+
         if email:
             update_expr += ", recruiter_email = :re"
             expr_vals[":re"] = email
@@ -580,8 +582,6 @@ def _send_match_notification(job: Dict[str, Any], score: int, reason: str) -> No
 # ---------------------------------------------------------------------------
 # 7. HUNTER.IO ENRICHMENT
 # ---------------------------------------------------------------------------
-import urllib.parse
-import urllib.request
 _cached_hunter_key = None
 
 def _get_hunter_key() -> str:
@@ -675,14 +675,14 @@ def lambda_handler(event, context):
             if match_score >= SCORE_THRESHOLD:
                 status = "PENDING_APPROVAL"
                 stats["matched"] += 1
-                
+
                 email = job.get("recruiter_email", "")
                 if not email:
                     found_email = _find_hunter_email(job.get("company", ""))
                     if found_email:
                         email = found_email
                         logger.info("HUNTER_SUCCESS | job_id=%s | email=%s", job_id, email)
-                
+
                 _update_job_status(job_id, match_score, match_reason, status, email)
                 # Update the job object with the email so SNS uses it
                 job["recruiter_email"] = email

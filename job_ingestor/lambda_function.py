@@ -496,7 +496,7 @@ def fetch_hacker_news_jobs() -> list:
         req = urllib.request.Request(user_url)
         with urllib.request.urlopen(req, timeout=10) as resp:
             user_data = json.loads(resp.read().decode())
-        
+
         recent = user_data.get('submitted', [])[:5]
         target_id = None
         for item_id in recent:
@@ -507,19 +507,19 @@ def fetch_hacker_news_jobs() -> list:
                 if item_data and "Who is hiring" in item_data.get("title", ""):
                     target_id = item_data.get("id")
                     break
-        
+
         if not target_id:
             logger.error("No HN thread found.")
             return []
-            
+
         thread_url = f'https://hacker-news.firebaseio.com/v0/item/{target_id}.json'
         req2 = urllib.request.Request(thread_url)
         with urllib.request.urlopen(req2, timeout=5) as resp:
             thread_data = json.loads(resp.read().decode())
-        
+
         kids = thread_data.get('kids', [])
         logger.info("HN Thread found. Checking top %d comments for AI roles...", HN_MAX_COMMENTS)
-        
+
         hn_jobs = []
         enriched_count = 0
         for kid_id in kids[:HN_MAX_COMMENTS]:
@@ -539,7 +539,7 @@ def fetch_hacker_news_jobs() -> list:
                         hn_jobs.append(parsed)
             except Exception as e:
                 logger.warning("HN_COMMENT_SKIP | kid_id=%s | error=%s", kid_id, str(e))
-                
+
         logger.info("HN_LINK_ENRICHMENT | enriched=%d | jobs=%d", enriched_count, len(hn_jobs))
         return hn_jobs
     except Exception as e:
@@ -901,10 +901,10 @@ def lambda_handler(event, context):
     jsearch_jobs = fetch_jsearch_jobs()
     all_jobs = _dedupe_batch(hn_jobs + google_cse_jobs + adzuna_jobs + jsearch_jobs)
     logger.info("INGESTOR_YIELD_BY_SOURCE_QUERY | %s", json.dumps(_source_query_summary(all_jobs)))
-    
+
     if not all_jobs:
         return {"status": "success", "message": "No jobs found.", "jobs_ingested": 0}
-        
+
     sent_count = _send_to_sqs(all_jobs)
     logger.info(
         "INGESTOR_COMPLETE | hn=%d | google_cse=%d | adzuna=%d | jsearch=%d | unique=%d | queued=%d",
