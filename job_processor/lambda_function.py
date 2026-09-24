@@ -24,6 +24,7 @@ from typing import Tuple, Dict, Any, Optional
 from decimal import Decimal
 from datetime import datetime, timezone
 from shared.knowledge_graph import build_candidate_graph, render_candidate_graph
+from shared.url_validation import get_canonical_job_url
 
 # ---------------------------------------------------------------------------
 # 1. OBSERVABILITY
@@ -435,8 +436,7 @@ def _has_ai_signal(job: Dict[str, Any]) -> bool:
 
 
 def _has_source_link(job: Dict[str, Any]) -> bool:
-    source_url = str(job.get("url") or job.get("apply_url") or "").strip()
-    return source_url.startswith("http://") or source_url.startswith("https://")
+    return bool(get_canonical_job_url(job))
 
 
 def _blocking_score_cap(cap: int) -> int:
@@ -673,20 +673,32 @@ def lambda_handler(event, context):
 
             # Route based on threshold
             if match_score >= SCORE_THRESHOLD:
-                status = "PENDING_APPROVAL"
-                stats["matched"] += 1
+                if not _has_source_link(job):
+                    logger.warning(
+                        "APPROVAL_REJECTED_MISSING_URL | job_id=%s | score=%d",
+                        job_id,
+                        match_score,
+                    )
+                    status = "REJECTED"
+                    match_score = min(match_score, _blocking_score_cap(MISSING_SOURCE_SCORE_CAP))
+                    match_reason = f"{match_reason} Blocked from approval: missing or invalid canonical source link."
+                    stats["rejected"] += 1
+                    _update_job_status(job_id, match_score, match_reason, status)
+                else:
+                    status = "PENDING_APPROVAL"
+                    stats["matched"] += 1
 
-                email = job.get("recruiter_email", "")
-                if not email:
-                    found_email = _find_hunter_email(job.get("company", ""))
-                    if found_email:
-                        email = found_email
-                        logger.info("HUNTER_SUCCESS | job_id=%s | email=%s", job_id, email)
+                    email = job.get("recruiter_email", "")
+                    if not email:
+                        found_email = _find_hunter_email(job.get("company", ""))
+                        if found_email:
+                            email = found_email
+                            logger.info("HUNTER_SUCCESS | job_id=%s | email=%s", job_id, email)
 
-                _update_job_status(job_id, match_score, match_reason, status, email)
-                # Update the job object with the email so SNS uses it
-                job["recruiter_email"] = email
-                _send_match_notification(job, match_score, match_reason)
+                    _update_job_status(job_id, match_score, match_reason, status, email)
+                    # Update the job object with the email so SNS uses it
+                    job["recruiter_email"] = email
+                    _send_match_notification(job, match_score, match_reason)
             else:
                 status = "REJECTED"
                 stats["rejected"] += 1

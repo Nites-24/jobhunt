@@ -24,6 +24,8 @@ from typing import Any
 import boto3
 from boto3.dynamodb.conditions import Key
 
+from shared.url_validation import get_canonical_job_url, is_valid_canonical_url
+
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -151,8 +153,17 @@ def _source_label(job: dict) -> str:
     return source or "unknown"
 
 
+def _is_practice_job(job: dict) -> bool:
+    return str(job.get("source", "")).strip().lower() in {"showcase", "tejajob"}
+
+
 def _source_url(job: dict) -> str:
-    return str(job.get("url") or job.get("apply_url") or "").strip()
+    url = get_canonical_job_url(job)
+    if url:
+        return url
+    if _is_practice_job(job):
+        return str(job.get("url") or job.get("apply_url") or "").strip()
+    return ""
 
 
 def _work_mode_label(job: dict) -> str:
@@ -196,6 +207,8 @@ def _is_reviewable_job(job: dict) -> bool:
         return False
     if not _source_allowed(job):
         return False
+    if not _is_practice_job(job) and not _source_url(job):
+        return False
 
     age = _job_age_days(job)
     if age is None or age > _source_max_age_days(job):
@@ -209,6 +222,8 @@ def _is_fresh_allowed_pending_job(job: dict) -> bool:
     if job.get("status") != "PENDING_APPROVAL":
         return False
     if not _source_allowed(job):
+        return False
+    if not _is_practice_job(job) and not _source_url(job):
         return False
     age = _job_age_days(job)
     return age is not None and age <= _source_max_age_days(job)
@@ -542,6 +557,8 @@ def _hidden_pending_reason(job: dict) -> str:
         return "not pending review"
     if not _source_allowed(job):
         return "source is not allowed in the review queue"
+    if not _is_practice_job(job) and not _source_url(job):
+        return "missing or invalid canonical source link"
     age = _job_age_days(job)
     if age is None:
         return "missing posted date"
@@ -1181,6 +1198,14 @@ def _handle_apply(bot_token: str, chat_id: str, index: int | None = None) -> Non
     source_url = _source_url(job)
     is_practice = job.get("source") == "tejajob"
 
+    if not is_practice and not source_url:
+        _send_telegram(
+            bot_token,
+            chat_id,
+            f"Blocked: match #{resolved_index} ({job.get('company', 'Unknown')}) has no verifiable source link.",
+        )
+        return
+
     current = table.get_item(Key={"job_id": job_id}).get("Item", {})
     if current.get("status") != "PENDING_APPROVAL":
         _send_telegram(bot_token, chat_id, f"Job already {current.get('status', 'processed')}. Use 'list' to refresh.")
@@ -1354,6 +1379,15 @@ def _handle_explain(bot_token: str, chat_id: str, index: int | None = None) -> N
         _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
         return
 
+    source_url = _source_url(job)
+    if not _is_practice_job(job) and not source_url:
+        _send_telegram(
+            bot_token,
+            chat_id,
+            f"Blocked: match #{resolved_index} ({job.get('company', 'Unknown')}) has no verifiable source link.",
+        )
+        return
+
     _send_telegram(bot_token, chat_id, _format_job_explanation(job, resolved_index))
 
 
@@ -1416,6 +1450,15 @@ def _handle_draft(bot_token: str, chat_id: str, index: int | None = None) -> Non
     if not job or resolved_index is None:
         _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
         return
+
+    source_url = _source_url(job)
+    if not _is_practice_job(job) and not source_url:
+        _send_telegram(
+            bot_token,
+            chat_id,
+            f"Blocked: match #{resolved_index} ({job.get('company', 'Unknown')}) has no verifiable source link.",
+        )
+        return
     try:
         response = lambda_client.invoke(
             FunctionName=SENDER_LAMBDA,
@@ -1474,7 +1517,7 @@ def _handle_send(bot_token: str, chat_id: str, index: int = 1, confirmed: bool =
             f"Use apply {index} for the source link and manual follow-up.",
         )
         return
-    if not source_url.startswith(("http://", "https://")):
+    if not source_url or not is_valid_canonical_url(source_url):
         _send_telegram(bot_token, chat_id, "Blocked: this role has no verifiable source link.")
         return
     if not ALLOW_TELEGRAM_EMAIL_SEND:

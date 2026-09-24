@@ -1235,3 +1235,102 @@ class TestRouter:
 
         msg = mock_tg.call_args[0][2]
         assert msg == "Use a match number, for example: apply 1"
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_no_link_company_is_excluded_from_review_queue_and_list(self, mock_tg):
+        """Jobs without a valid canonical source URL must not appear in review queue or list."""
+        mod, table = self._setup_infra()
+        now = datetime.now(timezone.utc)
+
+        # Valid job
+        table.put_item(Item={
+            "job_id": "valid-job-1",
+            "title": "AI Engineer",
+            "company": "Valid Tech",
+            "match_score": Decimal("90"),
+            "status": "PENDING_APPROVAL",
+            "source": "hackernews",
+            "posted_at": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "url": "https://validtech.com/careers/ai",
+        })
+
+        # No Link Company with "Unavailable"
+        table.put_item(Item={
+            "job_id": "no-link-job-1",
+            "title": "AI Engineer",
+            "company": "No Link Company",
+            "match_score": Decimal("95"),
+            "status": "PENDING_APPROVAL",
+            "source": "hackernews",
+            "posted_at": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "url": "Unavailable",
+        })
+
+        # No Link Company with empty URL
+        table.put_item(Item={
+            "job_id": "no-link-job-2",
+            "title": "ML Engineer",
+            "company": "Empty Link Inc",
+            "match_score": Decimal("92"),
+            "status": "PENDING_APPROVAL",
+            "source": "hackernews",
+            "posted_at": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "url": "",
+        })
+
+        event = _make_telegram_event("list")
+        mod.lambda_handler(event, MockContext())
+
+        msg = mock_tg.call_args[0][2]
+        assert "Valid Tech" in msg
+        assert "No Link Company" not in msg
+        assert "Empty Link Inc" not in msg
+        assert "Review queue: 1 match(es) ready" in msg
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_no_link_company_appears_in_backlog_with_missing_source_link_reason(self, mock_tg):
+        """Jobs with missing or invalid URLs are documented in the backlog archive."""
+        mod, table = self._setup_infra()
+        now = datetime.now(timezone.utc)
+
+        table.put_item(Item={
+            "job_id": "no-link-1",
+            "title": "AI Engineer",
+            "company": "No Link Company",
+            "match_score": Decimal("88"),
+            "status": "PENDING_APPROVAL",
+            "source": "hackernews",
+            "posted_at": (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "url": "Unavailable",
+        })
+
+        event = _make_telegram_event("backlog")
+        mod.lambda_handler(event, MockContext())
+
+        msg = mock_tg.call_args[0][2]
+        assert "No Link Company" in msg
+        assert "Hidden because: missing or invalid canonical source link" in msg
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_apply_and_draft_blocked_when_job_lacks_canonical_url(self, mock_tg):
+        """Direct apply or draft calls must explicitly block opportunities without valid URLs."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+
+        bad_job = {
+            "job_id": "bad-url-job",
+            "title": "AI Engineer",
+            "company": "No Link Company",
+            "url": "Unavailable",
+            "source": "hackernews",
+            "status": "PENDING_APPROVAL",
+        }
+
+        with patch.object(mod, "_get_pending_jobs", return_value=[bad_job]):
+            mod._handle_draft("token", "99999", index=1)
+            msg = mock_tg.call_args[0][2]
+            assert "Blocked: match #1 (No Link Company) has no verifiable source link." in msg
+
+            mod._handle_apply("token", "99999", index=1)
+            msg = mock_tg.call_args[0][2]
+            assert "Blocked: match #1 (No Link Company) has no verifiable source link." in msg

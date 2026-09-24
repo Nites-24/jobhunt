@@ -283,6 +283,29 @@ class TestProcessor:
         assert "missing verifiable source link" in item["match_reason"]
         mock_bedrock.converse.assert_not_called()
 
+    @patch("job_processor.lambda_function.bedrock")
+    def test_unavailable_or_malformed_url_rejected_and_blocked_from_approval(self, mock_bedrock):
+        """No Link Company with 'Unavailable' or malformed scheme must be rejected and blocked from approval."""
+        mod, table, s3, sns = self._setup_infra()
+        no_link_job = {
+            **SAMPLE_JOB,
+            "job_id": "no-link-co",
+            "company": "No Link Company",
+            "url": "Unavailable",
+            "apply_url": "N/A",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        table.put_item(Item={"job_id": "no-link-co", "status": "NEW"})
+
+        result = mod.lambda_handler(make_sqs_event([no_link_job]), MockContext())
+
+        assert result["batchItemFailures"] == []
+        item = table.get_item(Key={"job_id": "no-link-co"})["Item"]
+        assert item["status"] == "REJECTED"
+        assert int(item["match_score"]) <= 40
+        assert "missing verifiable source link" in item["match_reason"]
+        mock_bedrock.converse.assert_not_called()
+
     @patch("job_processor.lambda_function._find_hunter_email", return_value="")
     @patch("job_processor.lambda_function._send_match_notification")
     @patch("job_processor.lambda_function.bedrock")
