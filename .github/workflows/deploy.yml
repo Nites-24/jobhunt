@@ -30,15 +30,6 @@ on:
         required: false
         default: false
         type: boolean
-  push:
-    branches: [main]
-    paths:
-      - "job_ingestor/**"
-      - "job_deduplicator/**"
-      - "job_processor/**"
-      - "job_router/**"
-      - "job_sender/**"
-      - "shared/**"
 
 permissions:
   contents: read

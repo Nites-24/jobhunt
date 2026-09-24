@@ -24,6 +24,7 @@ on:
       - "docs/**"
       - "*.md"
       - ".gitignore"
+  workflow_call:
 
 permissions:
   contents: read
