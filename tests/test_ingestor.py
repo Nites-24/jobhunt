@@ -1,7 +1,7 @@
 import json
 import importlib
 import os
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import boto3
 from moto import mock_aws
@@ -331,3 +331,54 @@ class TestIngestor:
         assert body["source"] == "signal_test"
         assert body["signal_test"] is True
         assert body["work_mode"] == "onsite"
+
+    def test_ssrf_rejects_non_https(self):
+        """HTTP, file, and ftp schemes must be blocked."""
+        import job_ingestor.lambda_function as mod
+        assert mod._is_safe_public_url("http://example.com/job")[0] is False
+        assert mod._is_safe_public_url("file:///etc/passwd")[0] is False
+        assert mod._is_safe_public_url("ftp://example.com/job")[0] is False
+
+    def test_ssrf_rejects_private_and_metadata_ips(self):
+        """Private RFC1918, loopback, and AWS metadata IPs must be blocked."""
+        import job_ingestor.lambda_function as mod
+        assert mod._is_safe_public_url("https://127.0.0.1/admin")[0] is False
+        assert mod._is_safe_public_url("https://localhost/job")[0] is False
+        assert mod._is_safe_public_url("https://169.254.169.254/latest/meta-data/")[0] is False
+        assert mod._is_safe_public_url("https://10.0.0.1/internal")[0] is False
+        assert mod._is_safe_public_url("https://172.16.0.1/internal")[0] is False
+        assert mod._is_safe_public_url("https://192.168.1.1/internal")[0] is False
+        assert mod._is_safe_public_url("https://[::1]/internal")[0] is False
+
+    def test_ssrf_rejects_non_standard_ports(self):
+        """Non-standard ports like 8080, 22, 6379 must be blocked."""
+        import job_ingestor.lambda_function as mod
+        assert mod._is_safe_public_url("https://example.com:8080/job")[0] is False
+        assert mod._is_safe_public_url("https://example.com:22/job")[0] is False
+
+    @patch("socket.getaddrinfo")
+    def test_ssrf_allows_public_https(self, mock_dns):
+        """Public HTTPS endpoints resolving to public IPs must be permitted."""
+        import job_ingestor.lambda_function as mod
+        mock_dns.return_value = [
+            (2, 0, 6, '', ('93.184.216.34', 443))
+        ]
+        is_safe, reason = mod._is_safe_public_url("https://example.com/careers/ai")
+        assert is_safe is True
+        assert reason == "OK"
+
+    def test_fetch_linked_page_context_blocks_ssrf(self):
+        """_fetch_linked_page_context must return empty string for unsafe URLs."""
+        import job_ingestor.lambda_function as mod
+        assert mod._fetch_linked_page_context("http://169.254.169.254/latest/meta-data/") == ""
+        assert mod._fetch_linked_page_context("https://127.0.0.1:8000/") == ""
+
+    def test_safe_redirect_handler_blocks_unsafe_redirect(self):
+        """SafeRedirectHandler must abort redirect when target is unsafe."""
+        import job_ingestor.lambda_function as mod
+        handler = mod.SafeRedirectHandler(max_redirects=2)
+        mock_req = MagicMock()
+        result = handler.redirect_request(
+            mock_req, None, 302, "Found", {}, "http://169.254.169.254/latest/meta-data/"
+        )
+        assert result is None  # Blocked!

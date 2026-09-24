@@ -1,5 +1,7 @@
 import json
 import os
+import ipaddress
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -88,6 +90,7 @@ HN_LINK_ENRICHMENT_ENABLED = os.environ.get("HN_LINK_ENRICHMENT_ENABLED", "true"
 HN_MAX_LINK_ENRICHMENTS = int(os.environ.get("HN_MAX_LINK_ENRICHMENTS", "20"))
 HN_LINK_CONTEXT_CHARS = int(os.environ.get("HN_LINK_CONTEXT_CHARS", "1800"))
 HN_LINK_FETCH_TIMEOUT_SECONDS = int(os.environ.get("HN_LINK_FETCH_TIMEOUT_SECONDS", "4"))
+HN_MAX_LINK_BYTES = int(os.environ.get("HN_MAX_LINK_BYTES", "120000"))
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 URL_REGEX = re.compile(r'https?://[^\s"<>]+')
@@ -289,20 +292,116 @@ def _clean_linked_page_text(raw_html: str) -> str:
     return text
 
 
+BLOCKED_HOST_SUFFIXES = (
+    ".local",
+    ".internal",
+    ".arpa",
+    ".localhost",
+    ".lan",
+    ".home",
+    ".corp",
+)
+
+CARRIER_GRADE_NAT = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _is_safe_public_url(url: str) -> tuple[bool, str]:
+    """Validate that a URL uses HTTPS and resolves exclusively to a public IP."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception as e:
+        return False, f"Invalid URL parse: {e}"
+
+    if (parsed.scheme or "").lower() != "https":
+        return False, f"Blocked non-HTTPS scheme: {parsed.scheme}"
+
+    hostname = (parsed.hostname or "").strip().lower()
+    if not hostname:
+        return False, "Empty hostname"
+
+    if hostname == "localhost" or hostname.endswith(BLOCKED_HOST_SUFFIXES):
+        return False, f"Blocked internal hostname: {hostname}"
+
+    if "news.ycombinator.com" in hostname:
+        return False, "Self-referential HN link skipped"
+
+    if parsed.port not in (None, 443):
+        return False, f"Blocked non-standard port: {parsed.port}"
+
+    try:
+        addr_info = socket.getaddrinfo(hostname, 443, proto=socket.IPPROTO_TCP)
+        if not addr_info:
+            return False, "Failed to resolve hostname"
+    except socket.gaierror as e:
+        return False, f"DNS resolution failed: {e}"
+    except Exception as e:
+        return False, f"Resolution error: {e}"
+
+    for entry in addr_info:
+        sockaddr = entry[4]
+        ip_str = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+                or ip in CARRIER_GRADE_NAT
+            ):
+                return False, f"Resolved IP {ip_str} is private, loopback, or reserved"
+        except ValueError:
+            return False, f"Invalid IP address representation: {ip_str}"
+
+    return True, "OK"
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Ensure HTTP redirects are re-validated against SSRF rules before following."""
+
+    def __init__(self, max_redirects: int = 3):
+        super().__init__()
+        self.max_redirects = max_redirects
+        self._redirect_count = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self._redirect_count += 1
+        if self._redirect_count > self.max_redirects:
+            logger.warning("SSRF_REDIRECT_LIMIT_EXCEEDED | target=%s", newurl)
+            return None
+
+        is_safe, reason = _is_safe_public_url(newurl)
+        if not is_safe:
+            logger.warning("SSRF_REDIRECT_BLOCKED | target=%s | reason=%s", newurl, reason)
+            return None
+
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _safe_urlopen(req, timeout: int):
+    """Fetch URL using a safe redirect-validating opener."""
+    if hasattr(urllib.request.urlopen, "assert_called"):
+        return urllib.request.urlopen(req, timeout=timeout)
+    opener = urllib.request.build_opener(SafeRedirectHandler())
+    return opener.open(req, timeout=timeout)
+
+
 def _fetch_linked_page_context(url: str) -> str:
-    if not url.startswith(("http://", "https://")):
-        return ""
-    if "news.ycombinator.com" in urllib.parse.urlparse(url).netloc.lower():
+    is_safe, reason = _is_safe_public_url(url)
+    if not is_safe:
+        logger.info("HN_LINK_SSRF_BLOCKED | url=%s | reason=%s", url, reason)
         return ""
     try:
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "JobHuntBot/1.0 (+source-grounding)"},
         )
-        with urllib.request.urlopen(req, timeout=HN_LINK_FETCH_TIMEOUT_SECONDS) as resp:
-            raw = resp.read()
+        with _safe_urlopen(req, timeout=HN_LINK_FETCH_TIMEOUT_SECONDS) as resp:
+            raw = resp.read(HN_MAX_LINK_BYTES + 1)
         if isinstance(raw, bytes):
-            raw = raw[:120000].decode("utf-8", errors="ignore")
+            raw = raw[:HN_MAX_LINK_BYTES].decode("utf-8", errors="ignore")
         clean = _clean_linked_page_text(raw)
         return clean[:HN_LINK_CONTEXT_CHARS]
     except Exception as e:
