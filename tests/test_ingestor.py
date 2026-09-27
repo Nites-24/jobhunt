@@ -382,3 +382,128 @@ class TestIngestor:
             mock_req, None, 302, "Found", {}, "http://169.254.169.254/latest/meta-data/"
         )
         assert result is None  # Blocked!
+
+    def test_load_board_registry_json_and_text(self):
+        """Registry parser supports both JSON array and pipe-delimited text."""
+        import job_ingestor.lambda_function as mod
+        with patch.dict(os.environ, {"TEST_BOARDS": '[{"slug":"acme","company":"Acme AI"}]'}):
+            reg = mod._load_board_registry("TEST_BOARDS")
+            assert len(reg) == 1
+            assert reg[0] == {"slug": "acme", "company": "Acme AI"}
+
+        with patch.dict(os.environ, {"TEST_BOARDS": "acme|Acme AI,other|Other Co"}):
+            reg = mod._load_board_registry("TEST_BOARDS")
+            assert len(reg) == 2
+            assert reg[0] == {"slug": "acme", "company": "Acme AI"}
+            assert reg[1] == {"slug": "other", "company": "Other Co"}
+
+    def test_target_role_filter(self):
+        """Target role filter matches AI/ML engineering and rejects non-technical roles."""
+        import job_ingestor.lambda_function as mod
+        assert mod._is_target_role("Senior AI Engineer") is True
+        assert mod._is_target_role("LLM Platform Engineer", "Python AWS Bedrock") is True
+        assert mod._is_target_role("Machine Learning Researcher") is True
+        assert mod._is_target_role("Accountant", "Manage finances at an AI startup") is False
+        assert mod._is_target_role("Technical Recruiter", "Hire AI engineers") is False
+
+    @patch("urllib.request.urlopen")
+    def test_greenhouse_fetch_and_normalize(self, mock_urlopen):
+        """Greenhouse jobs are fetched, filtered, and normalized with deterministic job_id."""
+        import job_ingestor.lambda_function as mod
+        mock_urlopen.return_value = _mock_response({"jobs": [
+            {
+                "id": 101,
+                "title": "AI Engineer",
+                "content": "Build RAG and LLM systems with Python.",
+                "updated_at": "2026-09-24T10:00:00Z",
+                "absolute_url": "https://boards.greenhouse.io/acme/jobs/101",
+                "location": {"name": "Wichita, KS"},
+            },
+            {
+                "id": 102,
+                "title": "Accountant",
+                "content": "Manage invoices.",
+                "updated_at": "2026-09-24T10:00:00Z",
+                "absolute_url": "https://boards.greenhouse.io/acme/jobs/102",
+                "location": {"name": "Remote"},
+            },
+        ]})
+
+        with patch.object(mod, "GREENHOUSE_ENABLED", True), \
+             patch.object(mod, "GREENHOUSE_BOARDS", [{"slug": "acme", "company": "Acme AI"}]):
+            jobs = mod.fetch_greenhouse_jobs()
+
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job["job_id"] == "greenhouse_acme_101"
+        assert job["company"] == "Acme AI"
+        assert job["source"] == "greenhouse"
+        assert job["source_provider"] == "Greenhouse Job Board API"
+        assert job["apply_url"] == "https://boards.greenhouse.io/acme/jobs/101"
+
+    @patch("urllib.request.urlopen")
+    def test_lever_fetch_and_normalize(self, mock_urlopen):
+        """Lever jobs canonicalize work_mode to 'onsite' and parse millisecond epoch dates."""
+        import job_ingestor.lambda_function as mod
+        mock_urlopen.return_value = _mock_response([
+            {
+                "id": "l-101",
+                "text": "Applied AI Engineer",
+                "descriptionPlain": "Build production ML and agent systems.",
+                "hostedUrl": "https://jobs.lever.co/acme/l-101",
+                "applyUrl": "https://jobs.lever.co/acme/l-101/apply",
+                "categories": {"location": "San Francisco, CA", "commitment": "Full-time"},
+                "workplaceType": "on-site",
+                "createdAt": 1778500000000,
+            }
+        ])
+
+        with patch.object(mod, "LEVER_ENABLED", True), \
+             patch.object(mod, "LEVER_SITES", [{"slug": "acme", "company": "Acme AI"}]):
+            jobs = mod.fetch_lever_jobs()
+
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job["job_id"] == "lever_acme_l-101"
+        assert job["work_mode"] == "onsite"
+        assert job["posted_at"].endswith("Z")
+        assert "T" in job["posted_at"]
+        assert job["apply_url"].endswith("/apply")
+
+    @patch("urllib.request.urlopen")
+    def test_ashby_fetch_and_normalize(self, mock_urlopen):
+        """Ashby jobs drop unlisted postings and preserve remote flag."""
+        import job_ingestor.lambda_function as mod
+        mock_urlopen.return_value = _mock_response({"jobs": [
+            {
+                "title": "RAG Engineer",
+                "location": "Remote, US",
+                "descriptionPlain": "Build retrieval pipelines.",
+                "publishedAt": "2026-09-24T09:00:00Z",
+                "jobUrl": "https://jobs.ashbyhq.com/acme/r-101",
+                "applyUrl": "https://jobs.ashbyhq.com/acme/r-101/application",
+                "isRemote": True,
+                "workplaceType": "remote",
+                "isListed": True,
+            },
+            {
+                "title": "Stealth AI Engineer",
+                "location": "Remote",
+                "descriptionPlain": "Internal draft.",
+                "publishedAt": "2026-09-24T09:00:00Z",
+                "jobUrl": "https://jobs.ashbyhq.com/acme/r-102",
+                "isListed": False,
+            },
+        ]})
+
+        with patch.object(mod, "ASHBY_ENABLED", True), \
+             patch.object(mod, "ASHBY_BOARDS", [{"slug": "acme", "company": "Acme AI"}]):
+            jobs = mod.fetch_ashby_jobs()
+
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job["source"] == "ashby"
+        assert job["is_remote"] is True
+        assert job["source_provider"] == "Ashby Job Postings API"
+        assert job["posted_at"] == "2026-09-24T09:00:00Z"
+

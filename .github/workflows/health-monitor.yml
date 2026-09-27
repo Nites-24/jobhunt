@@ -135,7 +135,7 @@ jobs:
           report.append("| Rule | State | Schedule | Target Lambda | Healthy |")
           report.append("|------|-------|----------|---------------|---------|")
 
-          events = session.client("events")
+          events = boto3.client("events", region_name=REGION)
           rule_name = "job-search-daily-trigger"
           try:
               rule_resp = events.describe_rule(Name=rule_name)

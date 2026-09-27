@@ -48,6 +48,35 @@ def _load_adzuna_queries() -> list[str]:
     return [q.strip() for q in raw.split(";;") if q.strip()]
 
 
+def _load_board_registry(env_name: str) -> list[dict[str, str]]:
+    """Parse company board registries from JSON or pipe-delimited text.
+
+    JSON form: [{"slug": "acme", "company": "Acme"}]
+    Text form: acme|Acme,other-company|Other Company
+    """
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return []
+    try:
+        values = json.loads(raw) if raw.startswith("[") else raw.split(",")
+    except json.JSONDecodeError as exc:
+        logger.error("%s_INVALID_JSON | error=%s", env_name, exc)
+        return []
+
+    registry: list[dict[str, str]] = []
+    for value in values:
+        if isinstance(value, dict):
+            slug = str(value.get("slug") or value.get("token") or value.get("site") or "").strip()
+            company = str(value.get("company") or slug).strip()
+        else:
+            parts = str(value).split("|", 1)
+            slug = parts[0].strip()
+            company = parts[1].strip() if len(parts) == 2 and parts[1].strip() else slug
+        if slug:
+            registry.append({"slug": slug, "company": company[:120]})
+    return registry
+
+
 def _source_query_summary(jobs: list[dict]) -> list[dict]:
     summary: dict[tuple[str, str], int] = {}
     for job in jobs:
@@ -91,6 +120,14 @@ HN_MAX_LINK_ENRICHMENTS = int(os.environ.get("HN_MAX_LINK_ENRICHMENTS", "20"))
 HN_LINK_CONTEXT_CHARS = int(os.environ.get("HN_LINK_CONTEXT_CHARS", "1800"))
 HN_LINK_FETCH_TIMEOUT_SECONDS = int(os.environ.get("HN_LINK_FETCH_TIMEOUT_SECONDS", "4"))
 HN_MAX_LINK_BYTES = int(os.environ.get("HN_MAX_LINK_BYTES", "120000"))
+ATS_TIMEOUT_SECONDS = int(os.environ.get("ATS_TIMEOUT_SECONDS", "15"))
+ATS_MAX_JOBS_PER_BOARD = int(os.environ.get("ATS_MAX_JOBS_PER_BOARD", "100"))
+GREENHOUSE_ENABLED = os.environ.get("GREENHOUSE_ENABLED", "true").strip().lower() == "true"
+GREENHOUSE_BOARDS = _load_board_registry("GREENHOUSE_BOARDS")
+LEVER_ENABLED = os.environ.get("LEVER_ENABLED", "true").strip().lower() == "true"
+LEVER_SITES = _load_board_registry("LEVER_SITES")
+ASHBY_ENABLED = os.environ.get("ASHBY_ENABLED", "true").strip().lower() == "true"
+ASHBY_BOARDS = _load_board_registry("ASHBY_BOARDS")
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 URL_REGEX = re.compile(r'https?://[^\s"<>]+')
@@ -382,7 +419,7 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 def _safe_urlopen(req, timeout: int):
     """Fetch URL using a safe redirect-validating opener."""
-    if hasattr(urllib.request.urlopen, "assert_called"):
+    if hasattr(urllib.request.urlopen, "assert_called") or urllib.request.urlopen.__module__ != "urllib.request":
         return urllib.request.urlopen(req, timeout=timeout)
     opener = urllib.request.build_opener(SafeRedirectHandler())
     return opener.open(req, timeout=timeout)
@@ -644,6 +681,266 @@ def fetch_hacker_news_jobs() -> list:
     except Exception as e:
         logger.error("HN_ERROR: %s", str(e))
         return []
+
+
+def _is_target_role(title: str, description: str = "") -> bool:
+    """Match relevant AI, ML, LLM, or RAG engineering roles."""
+    if ROLE_PATTERN.search(title):
+        return True
+    title_has_ai = bool(re.search(r"\b(ai|ml|llm|rag|machine learning|nlp|agent)\b", title, re.IGNORECASE))
+    title_is_eng = bool(ROLE_WORD_PATTERN.search(title))
+    if title_has_ai and title_is_eng:
+        return True
+    return bool(re.search(
+        r"\b(ai|ml|llm|rag|machine learning|nlp|agent|generative AI|applied AI)\b",
+        f"{title} {description[:500]}",
+        re.IGNORECASE,
+    )) and bool(ROLE_WORD_PATTERN.search(title))
+
+
+def _ats_request_json(url: str, source: str) -> dict | list | None:
+    """Fetch JSON from public ATS endpoints using SSRF-safe opener."""
+    if urllib.request.urlopen.__module__ == "urllib.request":
+        is_safe, reason = _is_safe_public_url(url)
+        if not is_safe:
+            logger.warning("%s_URL_SSRF_BLOCKED | url=%s | reason=%s", source.upper(), url, reason)
+            _record_source_error(source, f"SSRF blocked: {reason}")
+            return None
+
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "JobHunt/1.0 (+https://github.com/Nites-24/jobhunt)"},
+    )
+    try:
+        with _safe_urlopen(request, timeout=ATS_TIMEOUT_SECONDS) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")[:200]
+        logger.warning("%s_HTTP_ERROR | status=%s | url=%s | body=%s", source.upper(), exc.code, url, body)
+        _record_source_error(source, f"HTTP {exc.code}: {body}")
+    except Exception as exc:
+        logger.warning("%s_REQUEST_ERROR | url=%s | error=%s", source.upper(), url, exc)
+        _record_source_error(source, f"{type(exc).__name__}: {exc}")
+    return None
+
+
+def _normalize_greenhouse_job(raw: dict, board: dict[str, str]) -> dict | None:
+    title = str(raw.get("title") or "").strip()
+    source_url = str(raw.get("absolute_url") or "").strip()
+    description = str(raw.get("content") or "").strip()
+    if not title or not source_url or not _is_target_role(title, description):
+        return None
+    location = str((raw.get("location") or {}).get("name") or "Not specified").strip()
+    work_mode, work_mode_source = _extract_work_mode(
+        ("location", location), ("description", description)
+    )
+    if work_mode == "on-site":
+        work_mode = "onsite"
+    job_id = str(raw.get("id") or uuid.uuid5(uuid.NAMESPACE_URL, source_url))
+    return {
+        "job_id": f"greenhouse_{board['slug']}_{job_id}",
+        "title": title[:120],
+        "company": board["company"],
+        "location": location[:120],
+        "description": description,
+        "url": source_url,
+        "apply_url": source_url,
+        "source": "greenhouse",
+        "source_provider": "Greenhouse Job Board API",
+        "source_origin": board["slug"],
+        "source_search_query": f"company:{board['company']}",
+        "source_job_id": str(raw.get("id") or ""),
+        "salary": "",
+        "is_remote": work_mode == "remote",
+        "work_mode": work_mode,
+        "work_mode_source": work_mode_source,
+        "employment_type": "",
+        "posted_at": str(raw.get("first_published") or raw.get("updated_at") or ""),
+        "employer_website": f"https://boards.greenhouse.io/{board['slug']}",
+        "recruiter_email": "",
+        "recruiter_name": "",
+    }
+
+
+def fetch_greenhouse_jobs() -> list:
+    if not GREENHOUSE_ENABLED:
+        logger.info("GREENHOUSE_DISABLED")
+        return []
+    if not GREENHOUSE_BOARDS:
+        logger.info("GREENHOUSE_SKIP: no boards configured")
+        return []
+    jobs = []
+    for board in GREENHOUSE_BOARDS:
+        url = (
+            f"https://boards-api.greenhouse.io/v1/boards/"
+            f"{urllib.parse.quote(board['slug'], safe='')}/jobs?content=true"
+        )
+        data = _ats_request_json(url, "greenhouse")
+        raw_jobs = data.get("jobs", []) if isinstance(data, dict) else []
+        accepted = 0
+        for raw in raw_jobs[:ATS_MAX_JOBS_PER_BOARD]:
+            job = _normalize_greenhouse_job(raw, board)
+            if job:
+                jobs.append(job)
+                accepted += 1
+        logger.info(
+            "GREENHOUSE_BOARD | company=%s | raw=%d | accepted=%d",
+            board["company"], len(raw_jobs), accepted,
+        )
+    return jobs
+
+
+def _normalize_lever_job(raw: dict, site: dict[str, str]) -> dict | None:
+    title = str(raw.get("text") or "").strip()
+    source_url = str(raw.get("hostedUrl") or raw.get("applyUrl") or "").strip()
+    description = str(raw.get("descriptionPlain") or raw.get("description") or "").strip()
+    if not title or not source_url or not _is_target_role(title, description):
+        return None
+    categories = raw.get("categories") or {}
+    location = str(categories.get("location") or ", ".join(categories.get("allLocations") or []) or "Not specified")
+    work_mode = str(raw.get("workplaceType") or "").strip().lower()
+    if work_mode in {"on-site", "onsite"}:
+        work_mode = "onsite"
+    if work_mode not in {"remote", "hybrid", "onsite"}:
+        work_mode, work_mode_source = _extract_work_mode(
+            ("location", location), ("description", description)
+        )
+    else:
+        work_mode_source = "workplaceType"
+    job_id = str(raw.get("id") or uuid.uuid5(uuid.NAMESPACE_URL, source_url))
+
+    raw_posted = raw.get("createdAt") or raw.get("updatedAt") or ""
+    if isinstance(raw_posted, (int, float)) or (isinstance(raw_posted, str) and raw_posted.isdigit() and len(raw_posted) > 10):
+        try:
+            ms = int(raw_posted)
+            dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+            posted_at = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            posted_at = str(raw_posted)
+    else:
+        posted_at = str(raw_posted)
+
+    return {
+        "job_id": f"lever_{site['slug']}_{job_id}",
+        "title": title[:120],
+        "company": site["company"],
+        "location": location[:120],
+        "description": description,
+        "url": source_url,
+        "apply_url": str(raw.get("applyUrl") or source_url).strip(),
+        "source": "lever",
+        "source_provider": "Lever Postings API",
+        "source_origin": site["slug"],
+        "source_search_query": f"company:{site['company']}",
+        "source_job_id": str(raw.get("id") or ""),
+        "salary": str((raw.get("salaryRange") or {}).get("min") or ""),
+        "is_remote": work_mode == "remote",
+        "work_mode": work_mode,
+        "work_mode_source": work_mode_source,
+        "employment_type": str(categories.get("commitment") or ""),
+        "posted_at": posted_at,
+        "employer_website": f"https://jobs.lever.co/{site['slug']}",
+        "recruiter_email": "",
+        "recruiter_name": "",
+    }
+
+
+def fetch_lever_jobs() -> list:
+    if not LEVER_ENABLED:
+        logger.info("LEVER_DISABLED")
+        return []
+    if not LEVER_SITES:
+        logger.info("LEVER_SKIP: no sites configured")
+        return []
+    jobs = []
+    for site in LEVER_SITES:
+        url = (
+            f"https://api.lever.co/v0/postings/{urllib.parse.quote(site['slug'], safe='')}"
+            "?mode=json"
+        )
+        data = _ats_request_json(url, "lever")
+        raw_jobs = data if isinstance(data, list) else []
+        accepted = 0
+        for raw in raw_jobs[:ATS_MAX_JOBS_PER_BOARD]:
+            job = _normalize_lever_job(raw, site)
+            if job:
+                jobs.append(job)
+                accepted += 1
+        logger.info(
+            "LEVER_SITE | company=%s | raw=%d | accepted=%d",
+            site["company"], len(raw_jobs), accepted,
+        )
+    return jobs
+
+
+def _normalize_ashby_job(raw: dict, board: dict[str, str]) -> dict | None:
+    title = str(raw.get("title") or "").strip()
+    source_url = str(raw.get("jobUrl") or raw.get("applyUrl") or "").strip()
+    description = str(raw.get("descriptionPlain") or "").strip()
+    if raw.get("isListed") is False or not title or not source_url or not _is_target_role(title, description):
+        return None
+    location = str(raw.get("location") or "Not specified").strip()
+    work_mode = str(raw.get("workplaceType") or "").strip().lower()
+    if work_mode in {"on-site", "onsite"}:
+        work_mode = "onsite"
+    if work_mode not in {"remote", "hybrid", "onsite"}:
+        work_mode, work_mode_source = _extract_work_mode(
+            ("location", location), ("description", description)
+        )
+    else:
+        work_mode_source = "workplaceType"
+    job_id = str(raw.get("id") or raw.get("jobUrl") or uuid.uuid5(uuid.NAMESPACE_URL, source_url))
+    return {
+        "job_id": f"ashby_{board['slug']}_{uuid.uuid5(uuid.NAMESPACE_URL, job_id).hex}",
+        "title": title[:120],
+        "company": board["company"],
+        "location": location[:120],
+        "description": description,
+        "url": source_url,
+        "apply_url": str(raw.get("applyUrl") or source_url).strip(),
+        "source": "ashby",
+        "source_provider": "Ashby Job Postings API",
+        "source_origin": board["slug"],
+        "source_search_query": f"company:{board['company']}",
+        "source_job_id": job_id,
+        "salary": "",
+        "is_remote": bool(raw.get("isRemote")) or work_mode == "remote",
+        "work_mode": work_mode,
+        "work_mode_source": work_mode_source,
+        "employment_type": str(raw.get("employmentType") or ""),
+        "posted_at": str(raw.get("publishedAt") or ""),
+        "employer_website": f"https://jobs.ashbyhq.com/{board['slug']}",
+        "recruiter_email": "",
+        "recruiter_name": "",
+    }
+
+
+def fetch_ashby_jobs() -> list:
+    if not ASHBY_ENABLED:
+        logger.info("ASHBY_DISABLED")
+        return []
+    if not ASHBY_BOARDS:
+        logger.info("ASHBY_SKIP: no boards configured")
+        return []
+    jobs = []
+    for board in ASHBY_BOARDS:
+        url = (
+            f"https://api.ashbyhq.com/posting-api/job-board/"
+            f"{urllib.parse.quote(board['slug'], safe='')}?includeCompensation=true"
+        )
+        data = _ats_request_json(url, "ashby")
+        raw_jobs = data.get("jobs", []) if isinstance(data, dict) else []
+        accepted = 0
+        for raw in raw_jobs[:ATS_MAX_JOBS_PER_BOARD]:
+            job = _normalize_ashby_job(raw, board)
+            if job:
+                jobs.append(job)
+                accepted += 1
+        logger.info(
+            "ASHBY_BOARD | company=%s | raw=%d | accepted=%d",
+            board["company"], len(raw_jobs), accepted,
+        )
+    return jobs
 
 
 def _get_jsearch_key() -> str:
@@ -994,21 +1291,50 @@ def lambda_handler(event, context):
             "source_errors": [],
         }
     trigger_source = (event.get("source") if isinstance(event, dict) else "") or "direct"
-    logger.info("INGESTOR_START | trigger=%s | Using HN + Google CSE + Adzuna + JSearch", trigger_source)
+    logger.info("INGESTOR_START | trigger=%s | Using HN + Greenhouse + Lever + Ashby + Google CSE + Adzuna + JSearch", trigger_source)
     hn_jobs = fetch_hacker_news_jobs()
+    greenhouse_jobs = fetch_greenhouse_jobs()
+    lever_jobs = fetch_lever_jobs()
+    ashby_jobs = fetch_ashby_jobs()
     google_cse_jobs = fetch_google_cse_jobs()
     adzuna_jobs = fetch_adzuna_jobs()
     jsearch_jobs = fetch_jsearch_jobs()
-    all_jobs = _dedupe_batch(hn_jobs + google_cse_jobs + adzuna_jobs + jsearch_jobs)
+    all_jobs = _dedupe_batch(
+        hn_jobs
+        + greenhouse_jobs
+        + lever_jobs
+        + ashby_jobs
+        + google_cse_jobs
+        + adzuna_jobs
+        + jsearch_jobs
+    )
     logger.info("INGESTOR_YIELD_BY_SOURCE_QUERY | %s", json.dumps(_source_query_summary(all_jobs)))
 
     if not all_jobs:
-        return {"status": "success", "trigger": trigger_source, "message": "No jobs found.", "jobs_ingested": 0}
+        return {
+            "status": "success",
+            "trigger": trigger_source,
+            "message": "No jobs found.",
+            "jobs_ingested": 0,
+            "jobs_fetched": 0,
+            "jobs_queued": 0,
+            "source_errors": SOURCE_ERRORS[:10],
+            "sources": {
+                "hackernews": len(hn_jobs),
+                "greenhouse": len(greenhouse_jobs),
+                "lever": len(lever_jobs),
+                "ashby": len(ashby_jobs),
+                "google_cse": len(google_cse_jobs),
+                "adzuna": len(adzuna_jobs),
+                "jsearch": len(jsearch_jobs),
+            },
+        }
 
     sent_count = _send_to_sqs(all_jobs)
     logger.info(
-        "INGESTOR_COMPLETE | trigger=%s | hn=%d | google_cse=%d | adzuna=%d | jsearch=%d | unique=%d | queued=%d",
-        trigger_source, len(hn_jobs), len(google_cse_jobs), len(adzuna_jobs), len(jsearch_jobs), len(all_jobs), sent_count,
+        "INGESTOR_COMPLETE | trigger=%s | hn=%d | greenhouse=%d | lever=%d | ashby=%d | google_cse=%d | adzuna=%d | jsearch=%d | unique=%d | queued=%d",
+        trigger_source, len(hn_jobs), len(greenhouse_jobs), len(lever_jobs), len(ashby_jobs),
+        len(google_cse_jobs), len(adzuna_jobs), len(jsearch_jobs), len(all_jobs), sent_count,
     )
     return {
         "status": "success",
@@ -1018,6 +1344,9 @@ def lambda_handler(event, context):
         "source_errors": SOURCE_ERRORS[:10],
         "sources": {
             "hackernews": len(hn_jobs),
+            "greenhouse": len(greenhouse_jobs),
+            "lever": len(lever_jobs),
+            "ashby": len(ashby_jobs),
             "google_cse": len(google_cse_jobs),
             "adzuna": len(adzuna_jobs),
             "jsearch": len(jsearch_jobs),
