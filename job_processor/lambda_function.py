@@ -285,7 +285,7 @@ TOOL_CONFIG = {
         {
             "toolSpec": {
                 "name": "submit_evaluation",
-                "description": "Submit the final match score and justification for this job.",
+                "description": "Submit the final match score, summary justification, and structured match evidence for this job.",
                 "inputSchema": {
                     "json": {
                         "type": "object",
@@ -297,6 +297,16 @@ TOOL_CONFIG = {
                             "match_reason": {
                                 "type": "string",
                                 "description": "A concise 1-sentence justification for the score.",
+                            },
+                            "match_reasons": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "2-4 key matched candidate skills, project overlap, or technical capabilities.",
+                            },
+                            "missing_requirements": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Any missing requirements, skill gaps, or caveats noted in the job posting.",
                             },
                         },
                         "required": ["match_score", "match_reason"],
@@ -310,7 +320,7 @@ TOOL_CONFIG = {
 }
 
 
-def evaluate_job(job: Dict[str, Any], context: str) -> Tuple[int, str]:
+def evaluate_job(job: Dict[str, Any], context: str) -> Tuple[int, str, Dict[str, Any]]:
     """
     Score a job against the candidate profile using Bedrock Converse API
     with forced tool-calling for deterministic structured output.
@@ -320,6 +330,11 @@ def evaluate_job(job: Dict[str, Any], context: str) -> Tuple[int, str]:
     if len(description) > 6000:
         description = description[:6000] + "\n[TRUNCATED]"
 
+    work_mode = str(job.get('work_mode') or '').strip().lower()
+    work_mode_label = work_mode if work_mode in {'remote', 'hybrid', 'onsite'} else 'not stated'
+    work_mode_source = str(job.get('work_mode_source') or '').strip()
+    work_mode_evidence = work_mode_source if work_mode_source else 'not stated in source'
+
     prompt_text = (
         f"{context}\n\n"
         f"<job_to_evaluate>\n"
@@ -328,6 +343,7 @@ def evaluate_job(job: Dict[str, Any], context: str) -> Tuple[int, str]:
         f"Location: {job.get('location', 'Not specified')}\n"
         f"Employment Type: {job.get('employment_type', 'Not specified')}\n"
         f"Remote: {job.get('is_remote', 'Unknown')}\n"
+        f"Work mode: {work_mode_label} (evidence: {work_mode_evidence})\n"
         f"Description:\n{description}\n"
         f"</job_to_evaluate>"
     )
@@ -356,23 +372,54 @@ def evaluate_job(job: Dict[str, Any], context: str) -> Tuple[int, str]:
             if "toolUse" in block:
                 result = block["toolUse"]["input"]
                 score = int(result["match_score"])
-                reason = str(result["match_reason"])
-                # Clamp score to valid range
+                reason = str(result["match_reason"]).strip()
                 score = max(0, min(100, score))
-                return score, reason
+
+                raw_reasons = result.get("match_reasons") or []
+                reasons_list = [str(r).strip() for r in raw_reasons if str(r).strip()]
+                if not reasons_list and reason:
+                    reasons_list = [p.strip() for p in re.split(r"[;•\n]|\.\s+", reason) if p.strip()][:3]
+
+                raw_missing = result.get("missing_requirements") or []
+                missing_list = [str(m).strip() for m in raw_missing if str(m).strip()]
+
+                eval_details = {
+                    "match_score": score,
+                    "match_reasons": reasons_list,
+                    "missing_requirements": missing_list,
+                    "model_version": MODEL_ID,
+                }
+                return score, reason, eval_details
 
         logger.error("TOOL_CALL_MISSING: Model did not invoke submit_evaluation")
-        return 0, "Model failed to invoke evaluation tool."
+        return 0, "Model failed to invoke evaluation tool.", {
+            "match_score": 0,
+            "match_reasons": [],
+            "missing_requirements": ["Model failed to invoke evaluation tool."],
+            "model_version": MODEL_ID,
+        }
 
     except ClientError as e:
         error_code = e.response["Error"]["Code"]
         logger.error("BEDROCK_CLIENT_ERROR: %s — %s", error_code, str(e))
         if error_code == "ThrottlingException":
             raise  # Let SQS retry
-        return 0, f"Bedrock error: {error_code}"
+        err_msg = f"Bedrock error: {error_code}"
+        return 0, err_msg, {
+            "match_score": 0,
+            "match_reasons": [],
+            "missing_requirements": [err_msg],
+            "model_version": MODEL_ID,
+        }
     except Exception as e:
         logger.error("BEDROCK_EVAL_ERROR: %s", str(e))
-        return 0, f"Evaluation error: {str(e)}"
+        err_msg = f"Evaluation error: {str(e)}"
+        return 0, err_msg, {
+            "match_score": 0,
+            "match_reasons": [],
+            "missing_requirements": [err_msg],
+            "model_version": MODEL_ID,
+        }
 
 
 def _parse_posted_at(value: Any) -> Optional[datetime]:
@@ -444,7 +491,9 @@ def _blocking_score_cap(cap: int) -> int:
     return min(cap, max(0, SCORE_THRESHOLD - 1))
 
 
-def _apply_deterministic_guardrails(job: Dict[str, Any], score: int, reason: str) -> Tuple[int, str]:
+def _apply_deterministic_guardrails(
+    job: Dict[str, Any], score: int, reason: str, eval_details: Optional[Dict[str, Any]] = None
+) -> Tuple[int, str]:
     """
     Enforce hard product rules after model scoring.
 
@@ -470,8 +519,9 @@ def _apply_deterministic_guardrails(job: Dict[str, Any], score: int, reason: str
         return score, reason
 
     capped_score = min([score] + [cap for cap, _ in caps])
+    guardrail_reasons = [detail for _, detail in caps]
     if capped_score < score:
-        guardrail_text = ", ".join(detail for _, detail in caps)
+        guardrail_text = ", ".join(guardrail_reasons)
         reason = f"{reason} Guardrail applied: {guardrail_text}."
         logger.info(
             "SCORE_GUARDRAIL | job_id=%s | original=%d | capped=%d | reasons=%s",
@@ -480,6 +530,15 @@ def _apply_deterministic_guardrails(job: Dict[str, Any], score: int, reason: str
             capped_score,
             guardrail_text,
         )
+
+    if eval_details is not None:
+        eval_details["match_score"] = capped_score
+        current_missing = list(eval_details.get("missing_requirements", []))
+        for gr in guardrail_reasons:
+            if gr not in current_missing:
+                current_missing.append(gr)
+        eval_details["missing_requirements"] = current_missing
+
     return capped_score, reason
 
 
@@ -516,7 +575,14 @@ def _pre_llm_rejection(job: Dict[str, Any]) -> Optional[Tuple[int, str]]:
 # ---------------------------------------------------------------------------
 # 6. DYNAMO UPDATE + SNS NOTIFICATION
 # ---------------------------------------------------------------------------
-def _update_job_status(job_id: str, score: int, reason: str, status: str, email: str = "") -> None:
+def _update_job_status(
+    job_id: str,
+    score: int,
+    reason: str,
+    status: str,
+    email: str = "",
+    eval_details: Optional[Dict[str, Any]] = None,
+) -> None:
     """Update DynamoDB with evaluation results."""
     try:
         update_expr = (
@@ -531,6 +597,17 @@ def _update_job_status(job_id: str, score: int, reason: str, status: str, email:
             ":mid": MODEL_ID,
             ":epv": JOB_EVAL_PROFILE_VERSION,
         }
+
+        if eval_details:
+            if eval_details.get("match_reasons") is not None:
+                update_expr += ", match_reasons = :mrs"
+                expr_vals[":mrs"] = eval_details["match_reasons"]
+            if eval_details.get("missing_requirements") is not None:
+                update_expr += ", missing_requirements = :mrq"
+                expr_vals[":mrq"] = eval_details["missing_requirements"]
+            if eval_details.get("model_version"):
+                update_expr += ", model_version = :mv"
+                expr_vals[":mv"] = eval_details["model_version"]
 
         if email:
             update_expr += ", recruiter_email = :re"
@@ -554,14 +631,20 @@ def _send_match_notification(job: Dict[str, Any], score: int, reason: str) -> No
         logger.warning("SNS_SKIP: No SNS_TOPIC_ARN configured")
         return
 
+    wm = str(job.get('work_mode') or '').strip().lower()
+    wm_label = wm if wm in {'remote', 'hybrid', 'onsite'} else 'not stated'
+    wm_source = str(job.get('work_mode_source') or '').strip()
+    wm_evidence = wm_source if wm_source else 'not stated in source — verify before acting'
+    wm_marker = '⚠️ ' if wm_label == 'not stated' else ''
+
     msg = (
         f"NEW HIGH MATCH: {score}%\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
         f"Company: {job.get('company', 'Unknown')}\n"
         f"Role: {job.get('title', 'Unknown')}\n"
         f"Location: {job.get('location', 'Not specified')}\n"
-        f"Work mode: {job.get('work_mode', 'unknown') or 'unknown'}\n"
-        f"Work mode evidence: {job.get('work_mode_source', 'not found in source') or 'not found in source'}\n\n"
+        f"Work mode: {wm_marker}{wm_label}\n"
+        f"Work mode evidence: {wm_evidence}\n\n"
         f"AI Evaluation:\n{reason}\n\n"
         f"Apply: {job.get('url', 'N/A')}\n\n"
         f"Reply 'status' to audit source links, or 'list' to review matches."
@@ -650,6 +733,12 @@ def lambda_handler(event, context):
                 raw_score = 96
                 raw_reason = "Synthetic signal test seed routed through the live pipeline."
                 match_score, match_reason = raw_score, raw_reason
+                eval_details = {
+                    "match_score": match_score,
+                    "match_reasons": ["AI Engineer signal test", "Pipeline verification"],
+                    "missing_requirements": [],
+                    "model_version": "signal-test",
+                }
                 logger.info("SIGNAL_TEST_MATCH | job_id=%s | score=%d", job_id, match_score)
             else:
                 # Reject impossible matches before Bedrock to avoid burst throttling.
@@ -657,13 +746,22 @@ def lambda_handler(event, context):
                 if prefilter_result:
                     raw_score, raw_reason = prefilter_result
                     match_score, match_reason = raw_score, raw_reason
+                    eval_details = {
+                        "match_score": match_score,
+                        "match_reasons": [],
+                        "missing_requirements": [raw_reason],
+                        "model_version": "prefilter-guardrail",
+                    }
                     logger.info(
                         "PREFILTER_REJECT | job_id=%s | score=%d | reason=%s",
                         job_id, match_score, match_reason,
                     )
                 else:
-                    raw_score, raw_reason = evaluate_job(job, profile_context)
-                    match_score, match_reason = _apply_deterministic_guardrails(job, raw_score, raw_reason)
+                    raw_score, raw_reason, details = evaluate_job(job, profile_context)
+                    eval_details = details
+                    match_score, match_reason = _apply_deterministic_guardrails(
+                        job, raw_score, raw_reason, eval_details=eval_details
+                    )
             stats["evaluated"] += 1
 
             logger.info(
@@ -682,8 +780,11 @@ def lambda_handler(event, context):
                     status = "REJECTED"
                     match_score = min(match_score, _blocking_score_cap(MISSING_SOURCE_SCORE_CAP))
                     match_reason = f"{match_reason} Blocked from approval: missing or invalid canonical source link."
+                    if eval_details is not None:
+                        eval_details["match_score"] = match_score
+                        eval_details.setdefault("missing_requirements", []).append("missing or invalid canonical source link")
                     stats["rejected"] += 1
-                    _update_job_status(job_id, match_score, match_reason, status)
+                    _update_job_status(job_id, match_score, match_reason, status, eval_details=eval_details)
                 else:
                     status = "PENDING_APPROVAL"
                     stats["matched"] += 1
@@ -695,14 +796,14 @@ def lambda_handler(event, context):
                             email = found_email
                             logger.info("HUNTER_SUCCESS | job_id=%s | email=%s", job_id, email)
 
-                    _update_job_status(job_id, match_score, match_reason, status, email)
+                    _update_job_status(job_id, match_score, match_reason, status, email, eval_details=eval_details)
                     # Update the job object with the email so SNS uses it
                     job["recruiter_email"] = email
                     _send_match_notification(job, match_score, match_reason)
             else:
                 status = "REJECTED"
                 stats["rejected"] += 1
-                _update_job_status(job_id, match_score, match_reason, status)
+                _update_job_status(job_id, match_score, match_reason, status, eval_details=eval_details)
             source_query_results.append({
                 "source": source,
                 "query": query,

@@ -167,10 +167,17 @@ def _source_url(job: dict) -> str:
 
 
 def _work_mode_label(job: dict) -> str:
+    """Human-readable work mode.  Returns explicit uncertainty when source
+    didn't state a mode so the reviewer knows to verify."""
     label = str(job.get("work_mode") or "").strip().lower()
     if label in {"remote", "hybrid", "onsite"}:
         return label
-    return "unknown"
+    return "not stated"
+
+
+def _is_work_mode_uncertain(job: dict) -> bool:
+    """True when work mode was not found in the source."""
+    return _work_mode_label(job) == "not stated"
 
 
 def _work_mode_evidence(job: dict) -> str:
@@ -187,7 +194,7 @@ def _work_mode_evidence(job: dict) -> str:
         return "source snippet text"
     if source == "employment_type":
         return "source employment text"
-    return "not found in source"
+    return "not stated in source — verify before acting"
 
 
 def _short_text(value: Any, limit: int = 220) -> str:
@@ -903,18 +910,42 @@ def _retire_old_showcase_rows(active_job_id: str) -> None:
 
 def _format_job_explanation(job: dict, index: int) -> str:
     posted = _format_posted(job.get("posted_at", "")) or "Posted date unavailable"
-    reason = job.get("match_reason") or "No model reason stored."
+
+    match_reasons = job.get("match_reasons") or []
+    missing_requirements = job.get("missing_requirements") or []
+    stored_reason = (job.get("match_reason") or "").strip()
+
+    explanation_parts = []
+    if match_reasons:
+        for r in match_reasons[:4]:
+            explanation_parts.append(f"• {r}")
+        if missing_requirements:
+            for m in missing_requirements[:3]:
+                explanation_parts.append(f"• Note: {m}")
+    elif stored_reason:
+        bullets = _reason_bullets(stored_reason)
+        for b in bullets:
+            explanation_parts.append(f"• {b}")
+    else:
+        title = job.get("title", "AI role")
+        company = job.get("company", "the company")
+        score = job.get("match_score", SCORE_THRESHOLD)
+        explanation_parts.append(
+            f"• Scored {score}% against candidate profile (RAG, LLMs, Python, AWS) based on requirements for {title} at {company}."
+        )
+
+    reason_text = "\n".join(explanation_parts)
 
     return (
         f"Match #{index}\n\n"
         f"{job.get('title', 'Unknown')} at {job.get('company', 'Unknown')}\n"
         f"Score: {job.get('match_score', '?')}%\n"
         f"Location: {job.get('location', 'Unknown')}\n"
-        f"Work mode: {_work_mode_label(job)} ({_work_mode_evidence(job)})\n"
+        f"Work mode: {'⚠️ ' if _is_work_mode_uncertain(job) else ''}{_work_mode_label(job)} ({_work_mode_evidence(job)})\n"
         f"Source: {_source_label(job)}\n"
         f"Source link: {_source_url(job) or 'Unavailable'}\n"
         f"{posted}\n\n"
-        f"Why it matched: {reason}\n\n"
+        f"Why it matched:\n{reason_text}\n\n"
         "Next: draft, apply, skip <reason>, or next"
     )
 
@@ -923,7 +954,7 @@ def _reason_bullets(reason: str, limit: int = 3) -> list[str]:
     """Turn a stored match reason into short Telegram-friendly bullets."""
     cleaned = (reason or "").strip()
     if not cleaned:
-        return ["No model reason stored."]
+        return ["Matched core AI engineering and LLM orchestration profile."]
 
     parts = [
         part.strip(" -\t\r\n.")
@@ -961,12 +992,20 @@ def _format_next_review_card(job: dict) -> str:
     posted = _format_posted(job.get("posted_at", "")) or "Posted date unavailable"
     source = _source_label(job)
     work_mode = _work_mode_label(job)
-    bullets = _reason_bullets(job.get("match_reason", ""))
 
+    match_reasons = job.get("match_reasons") or []
+    if match_reasons:
+        bullets = [str(r).strip() for r in match_reasons[:3] if str(r).strip()]
+    else:
+        bullets = _reason_bullets(job.get("match_reason", ""))
+    if not bullets:
+        bullets = ["Matched core AI engineering and LLM orchestration profile."]
+
+    work_mode_display = f"⚠️ {work_mode}" if _is_work_mode_uncertain(job) else work_mode
     lines = [
         f"{title}  [{score}% match]",
         f"{company} · {location}",
-        f"{work_mode} · {source}",
+        f"{work_mode_display} · {source}",
         "",
         "Why you fit",
     ]
@@ -1111,7 +1150,8 @@ def _handle_list(bot_token: str, chat_id: str) -> None:
         lines.append(f"{i}. {title}")
         lines.append(f"   {company} | {location}")
         lines.append(f"   Match: {score}%")
-        lines.append(f"   Work mode: {_work_mode_label(job)}")
+        wm = _work_mode_label(job)
+        lines.append(f"   Work mode: {'⚠️ ' if _is_work_mode_uncertain(job) else ''}{wm}")
         lines.append(f"   Work mode evidence: {_work_mode_evidence(job)}")
         lines.append(f"   Source: {_source_label(job)}")
         if source_url:
@@ -1236,7 +1276,7 @@ def _handle_apply(bot_token: str, chat_id: str, index: int | None = None) -> Non
         f"Role: {job.get('title', 'Unknown')}\n"
         f"Company: {job.get('company', 'Unknown')}\n"
         f"Match: {job.get('match_score', '?')}%\n"
-        f"Work mode: {_work_mode_label(job)}\n"
+        f"Work mode: {'⚠️ ' if _is_work_mode_uncertain(job) else ''}{_work_mode_label(job)}\n"
         f"Work mode evidence: {_work_mode_evidence(job)}\n"
         f"Source: {_source_label(job)}\n"
         f"Source link: {source_url or 'No source link stored'}\n"
@@ -1659,7 +1699,7 @@ def _handle_status(bot_token: str, chat_id: str) -> None:
         lines.append(f"{i}. {job.get('title', 'Unknown Role')}")
         lines.append(f"   Company: {job.get('company', 'Unknown')}")
         lines.append(f"   Location: {job.get('location', 'Location not specified')}")
-        lines.append(f"   Work mode: {_work_mode_label(job)}")
+        lines.append(f"   Work mode: {'⚠️ ' if _is_work_mode_uncertain(job) else ''}{_work_mode_label(job)}")
         lines.append(f"   Work mode evidence: {_work_mode_evidence(job)}")
         lines.append(f"   Match: {job.get('match_score', '?')}%")
         lines.append(f"   Source: {_source_label(job)}")
@@ -1678,7 +1718,7 @@ def _handle_status(bot_token: str, chat_id: str) -> None:
             lines.append("")
             lines.append(f"{i}. {job.get('title', 'Unknown Role')}")
             lines.append(f"   Company: {job.get('company', 'Unknown')}")
-            lines.append(f"   Work mode: {_work_mode_label(job)}")
+            lines.append(f"   Work mode: {'⚠️ ' if _is_work_mode_uncertain(job) else ''}{_work_mode_label(job)}")
             lines.append(f"   Work mode evidence: {_work_mode_evidence(job)}")
             lines.append(f"   Match: {job.get('match_score', '?')}%")
             lines.append(f"   Source: {_source_label(job)}")

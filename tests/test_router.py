@@ -1334,3 +1334,146 @@ class TestRouter:
             mod._handle_apply("token", "99999", index=1)
             msg = mock_tg.call_args[0][2]
             assert "Blocked: match #1 (No Link Company) has no verifiable source link." in msg
+
+
+@mock_aws
+class TestWorkModeUncertainty:
+    """Fix #6: Explicit Work Mode Uncertainty.
+
+    Verify that unknown work modes surface explicit uncertainty rather than
+    silently displaying 'unknown'.
+    """
+
+    def _setup_infra(self):
+        """Reuse the same DynamoDB + secrets setup as TestRouter."""
+        import os
+        os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+
+        dynamo = boto3.resource("dynamodb", region_name="us-east-1")
+        table = dynamo.create_table(
+            TableName="Jobsearch",
+            KeySchema=[{"AttributeName": "job_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[
+                {"AttributeName": "job_id", "AttributeType": "S"},
+                {"AttributeName": "status", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "status-index",
+                    "KeySchema": [{"AttributeName": "status", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        table.meta.client.get_waiter("table_exists").wait(TableName="Jobsearch")
+
+        sm = boto3.client("secretsmanager", region_name="us-east-1")
+        sm.create_secret(
+            Name="telegram",
+            SecretString=json.dumps({
+                "TELEGRAM_BOT_TOKEN": "123456:ABC-DEF",
+                "TELEGRAM_CHAT_ID": "99999",
+            }),
+        )
+
+        import job_router.lambda_function as mod
+        mod.dynamodb = dynamo
+        mod.table = dynamo.Table("Jobsearch")
+        mod.secrets_client = sm
+        mod._cached_secrets = None
+        mod.ENABLE_PRACTICE_MODE = False
+        mod.ALLOW_TELEGRAM_EMAIL_SEND = False
+
+        return mod, table
+
+    def test_work_mode_label_known_values(self):
+        """Known work modes should pass through unchanged."""
+        mod, _ = self._setup_infra()
+        assert mod._work_mode_label({"work_mode": "remote"}) == "remote"
+        assert mod._work_mode_label({"work_mode": "hybrid"}) == "hybrid"
+        assert mod._work_mode_label({"work_mode": "onsite"}) == "onsite"
+        assert mod._work_mode_label({"work_mode": " Remote "}) == "remote"
+
+    def test_work_mode_label_unknown_values(self):
+        """Missing, empty, or unrecognized work modes should return 'not stated'."""
+        mod, _ = self._setup_infra()
+        assert mod._work_mode_label({}) == "not stated"
+        assert mod._work_mode_label({"work_mode": ""}) == "not stated"
+        assert mod._work_mode_label({"work_mode": None}) == "not stated"
+        assert mod._work_mode_label({"work_mode": "flexible"}) == "not stated"
+
+    def test_is_work_mode_uncertain(self):
+        """Uncertainty flag aligns with the label function."""
+        mod, _ = self._setup_infra()
+        assert mod._is_work_mode_uncertain({}) is True
+        assert mod._is_work_mode_uncertain({"work_mode": ""}) is True
+        assert mod._is_work_mode_uncertain({"work_mode": "remote"}) is False
+        assert mod._is_work_mode_uncertain({"work_mode": "onsite"}) is False
+
+    def test_work_mode_evidence_known_sources(self):
+        """Each source field maps to a human-readable evidence label."""
+        mod, _ = self._setup_infra()
+        assert mod._work_mode_evidence({"work_mode_source": "job_is_remote"}) == "source API remote flag"
+        assert mod._work_mode_evidence({"work_mode_source": "location"}) == "source location text"
+        assert mod._work_mode_evidence({"work_mode_source": "description"}) == "source job description"
+
+    def test_work_mode_evidence_missing_source(self):
+        """Missing source evidence returns an explicit verify-before-acting message."""
+        mod, _ = self._setup_infra()
+        result = mod._work_mode_evidence({})
+        assert "not stated in source" in result
+        assert "verify" in result.lower()
+
+    @patch("job_router.lambda_function._send_telegram")
+    @patch("job_router.lambda_function.lambda_client")
+    def test_review_card_shows_warning_for_uncertain_work_mode(self, mock_lambda, mock_tg):
+        """Review card should show ⚠️ marker when work mode is uncertain."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+
+        now = datetime.now(timezone.utc)
+        table.put_item(Item={
+            "job_id": "uncertain-wm-001",
+            "title": "ML Engineer",
+            "company": "TestCo",
+            "location": "Remote",
+            "work_mode": "",
+            "work_mode_source": "",
+            "match_score": Decimal("92"),
+            "match_reason": "Strong ML match",
+            "status": "PENDING_APPROVAL",
+            "source": "hackernews",
+            "posted_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "url": "https://testco.com/apply",
+        })
+
+        card = mod._format_next_review_card({
+            "title": "ML Engineer",
+            "company": "TestCo",
+            "location": "Remote",
+            "work_mode": "",
+            "work_mode_source": "",
+            "match_score": 92,
+            "source": "hackernews",
+        })
+        assert "⚠️" in card
+        assert "not stated" in card
+
+    @patch("job_router.lambda_function._send_telegram")
+    @patch("job_router.lambda_function.lambda_client")
+    def test_review_card_no_warning_for_known_work_mode(self, mock_lambda, mock_tg):
+        """Review card should NOT show ⚠️ when work mode is known."""
+        mod, _ = self._setup_infra()
+
+        card = mod._format_next_review_card({
+            "title": "AI Engineer",
+            "company": "GoodCo",
+            "location": "SF",
+            "work_mode": "remote",
+            "work_mode_source": "job_is_remote",
+            "match_score": 90,
+            "source": "adzuna",
+        })
+        assert "⚠️" not in card
+        assert "remote" in card

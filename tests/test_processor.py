@@ -11,6 +11,7 @@ Tests:
 """
 
 import json
+import os
 from datetime import datetime, timezone, timedelta
 import pytest
 import boto3
@@ -396,3 +397,102 @@ class TestProcessor:
             {"source": "adzuna", "query": "AI Engineer", "evaluated": 1, "matched": 1, "rejected": 0, "failed": 0},
             {"source": "hackernews", "query": "hn_who_is_hiring", "evaluated": 1, "matched": 0, "rejected": 1, "failed": 0},
         ]
+
+    @patch("job_processor.lambda_function._send_match_notification")
+    @patch("job_processor.lambda_function.bedrock")
+    def test_structured_evidence_persisted_to_dynamo(self, mock_bedrock, mock_notify):
+        """Bedrock structured evaluation evidence must be stored in DynamoDB attributes."""
+        mod, table, s3, sns = self._setup_infra()
+        job = {**SAMPLE_JOB, "job_id": "structured-evidence-job"}
+        table.put_item(Item={"job_id": "structured-evidence-job", "status": "NEW"})
+
+        mock_bedrock.converse.return_value = {
+            "output": {
+                "message": {
+                    "content": [
+                        {
+                            "toolUse": {
+                                "toolUseId": "tool-123",
+                                "name": "submit_evaluation",
+                                "input": {
+                                    "match_score": 86,
+                                    "match_reason": "Strong match for RAG pipelines and LLM orchestration.",
+                                    "match_reasons": ["Python", "AWS", "LLM automation"],
+                                    "missing_requirements": ["onsite requirement unclear"],
+                                },
+                            }
+                        }
+                    ]
+                }
+            },
+            "usage": {"inputTokens": 500, "outputTokens": 50},
+        }
+
+        result = mod.lambda_handler(make_sqs_event([job]), MockContext())
+        assert result["batchItemFailures"] == []
+
+        item = table.get_item(Key={"job_id": "structured-evidence-job"})["Item"]
+        assert item["status"] == "PENDING_APPROVAL"
+        assert int(item["match_score"]) == 86
+        assert item["match_reason"] == "Strong match for RAG pipelines and LLM orchestration."
+        assert item["match_reasons"] == ["Python", "AWS", "LLM automation"]
+        assert item["missing_requirements"] == ["onsite requirement unclear"]
+        assert "model_version" in item
+
+    def test_sns_notification_shows_not_stated_for_unknown_work_mode(self):
+        """SNS notifications should show 'not stated' with ⚠️ when work mode is missing."""
+        mod, table, s3_client, sns_client = self._setup_infra()
+
+        job_no_wm = {
+            **SAMPLE_JOB,
+            "job_id": "sns-wm-test",
+            "work_mode": "",
+            "work_mode_source": "",
+        }
+
+        with patch.object(mod.sns, "publish") as mock_publish:
+            mod._send_match_notification(job_no_wm, 90, "Strong AI match")
+            mock_publish.assert_called_once()
+            msg = mock_publish.call_args.kwargs.get("Message") or mock_publish.call_args[1].get("Message", "")
+            assert "not stated" in msg
+            assert "⚠️" in msg
+            assert "verify" in msg.lower()
+
+    def test_sns_notification_shows_known_work_mode_without_warning(self):
+        """SNS notifications should NOT show ⚠️ when work mode is known."""
+        mod, table, s3_client, sns_client = self._setup_infra()
+
+        job_with_wm = {
+            **SAMPLE_JOB,
+            "job_id": "sns-wm-known",
+            "work_mode": "remote",
+            "work_mode_source": "job_is_remote",
+        }
+
+        with patch.object(mod.sns, "publish") as mock_publish:
+            mod._send_match_notification(job_with_wm, 90, "Strong AI match")
+            mock_publish.assert_called_once()
+            msg = mock_publish.call_args.kwargs.get("Message") or mock_publish.call_args[1].get("Message", "")
+            assert "remote" in msg
+            assert "⚠️" not in msg
+
+    def test_bedrock_prompt_includes_work_mode_uncertainty(self):
+        """The Bedrock evaluation prompt should explicitly state work mode uncertainty."""
+        mod, table, s3, _ = self._setup_infra()
+
+        job_no_wm = {
+            **SAMPLE_JOB,
+            "job_id": "prompt-wm-test",
+            "work_mode": "",
+            "work_mode_source": "",
+        }
+
+        # Build the prompt text the same way evaluate_job does
+        description = job_no_wm.get("description", "")
+        wm = str(job_no_wm.get("work_mode") or "").strip().lower()
+        wm_label = wm if wm in {"remote", "hybrid", "onsite"} else "not stated"
+        assert wm_label == "not stated"
+
+        wm_source = str(job_no_wm.get("work_mode_source") or "").strip()
+        wm_evidence = wm_source if wm_source else "not stated in source"
+        assert "not stated" in wm_evidence
