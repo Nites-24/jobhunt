@@ -2319,3 +2319,113 @@ def test_telegram_http_error_logs_reason_without_message_body(monkeypatch, caplo
     assert "message is too long" in caplog.text
     assert "secret-token" not in caplog.text
     assert "private" not in caplog.text
+
+
+@pytest.fixture
+def real_callback_delivery_runtime():
+    """Exercise callback delivery through the real Telegram response wrappers."""
+    with mock_aws():
+        helper = TestRouterRegressionEdgeCases()
+        mod, table = helper._setup_infra()
+        _cold_callback_worker(mod)
+        helper._insert_pending_jobs(table, 3)
+        yield mod, table
+
+
+def test_failed_status_button_reply_retries_same_callback(real_callback_delivery_runtime):
+    mod, table = real_callback_delivery_runtime
+    sends = []
+
+    def telegram_api(_token, method, payload):
+        if method == "sendMessage":
+            sends.append(payload)
+            return len(sends) > 1
+        return True
+
+    event = _make_callback_event("cmd:status", callback_id="status-reply-failed")
+    with patch.object(mod, "_telegram_request", side_effect=telegram_api):
+        with pytest.raises(RuntimeError, match="delivery failed"):
+            mod.lambda_handler(event, MockContext())
+        assert table.get_item(Key={"job_id": "cb:status-reply-failed"})["Item"]["callback_status"] == "FAILED"
+        _cold_callback_worker(mod)
+        assert mod.lambda_handler(event, MockContext())["statusCode"] == 200
+
+    assert len(sends) >= 2
+    assert table.get_item(Key={"job_id": "cb:status-reply-failed"})["Item"]["callback_status"] == "COMPLETED"
+
+
+def test_failed_first_next_reply_retries_first_card(real_callback_delivery_runtime):
+    mod, table = real_callback_delivery_runtime
+    sends = []
+
+    def telegram_api(_token, method, payload):
+        if method == "sendMessage":
+            sends.append(payload)
+            return len(sends) > 1
+        return True
+
+    event = _make_callback_event("cmd:next", callback_id="next-reply-failed")
+    with patch.object(mod, "_telegram_request", side_effect=telegram_api):
+        with pytest.raises(RuntimeError, match="delivery failed"):
+            mod.lambda_handler(event, MockContext())
+        assert mod._get_active_review_job_id("99999") == "pending-001"
+        _cold_callback_worker(mod)
+        assert mod.lambda_handler(event, MockContext())["statusCode"] == 200
+
+    assert "AI Engineer Role 1" in sends[-1]["text"]
+    assert mod._get_active_review_job_id("99999") == "pending-001"
+    assert table.get_item(Key={"job_id": "cb:next-reply-failed"})["Item"]["callback_status"] == "COMPLETED"
+
+
+def test_failed_help_edit_retries_same_callback(real_callback_delivery_runtime):
+    mod, table = real_callback_delivery_runtime
+    edits = []
+
+    def telegram_api(_token, method, payload):
+        if method == "editMessageText":
+            edits.append(payload)
+            return len(edits) > 1
+        return True
+
+    event = _make_callback_event("help:more", callback_id="help-edit-failed")
+    with patch.object(mod, "_telegram_request", side_effect=telegram_api):
+        with pytest.raises(RuntimeError, match="delivery failed"):
+            mod.lambda_handler(event, MockContext())
+        assert table.get_item(Key={"job_id": "cb:help-edit-failed"})["Item"]["callback_status"] == "FAILED"
+        _cold_callback_worker(mod)
+        assert mod.lambda_handler(event, MockContext())["statusCode"] == 200
+
+    assert len(edits) == 2
+    assert table.get_item(Key={"job_id": "cb:help-edit-failed"})["Item"]["callback_status"] == "COMPLETED"
+
+
+def test_search_reply_failure_does_not_launch_search_twice(real_callback_delivery_runtime):
+    mod, table = real_callback_delivery_runtime
+    event = _make_callback_event("cmd:search jobs", callback_id="search-reply-failed")
+
+    def telegram_api(_token, method, _payload):
+        return method != "sendMessage"
+
+    with patch.object(mod, "_telegram_request", side_effect=telegram_api), \
+         patch.object(mod, "lambda_client") as invoke_client:
+        invoke_client.invoke.return_value = {"StatusCode": 202}
+        assert mod.lambda_handler(event, MockContext())["statusCode"] == 200
+        _cold_callback_worker(mod)
+        assert mod.lambda_handler(event, MockContext())["statusCode"] == 200
+        invoke_client.invoke.assert_called_once()
+
+    assert table.get_item(Key={"job_id": "cb:search-reply-failed"})["Item"]["callback_status"] == "COMPLETED"
+
+
+def test_edit_message_not_modified_counts_as_delivered(monkeypatch):
+    import urllib.error
+    import job_router.lambda_function as mod
+
+    def not_modified(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            "https://api.telegram.org/botsecret/editMessageText", 400, "Bad Request", {},
+            io.BytesIO(b'{"ok":false,"description":"Bad Request: message is not modified"}'),
+        )
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", not_modified)
+    assert mod._telegram_request("secret-token", "editMessageText", {"chat_id": "1", "message_id": 2, "text": "Help"})

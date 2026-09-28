@@ -70,6 +70,7 @@ _CALLBACK_DEDUP_TTL = 300
 _ACTION_TOKEN_CACHE: dict[str, str] = {}
 _JOB_ID_TO_TOKEN_CACHE: dict[str, str] = {}
 _ACTIVE_CALLBACK_CLAIM: ContextVar[tuple[str, str] | None] = ContextVar("active_callback_claim", default=None)
+_CALLBACK_DELIVERY_FAILED: ContextVar[bool] = ContextVar("callback_delivery_failed", default=False)
 
 
 def _get_or_create_action_token(job_id: str | None) -> str:
@@ -514,6 +515,13 @@ def _telegram_request(bot_token: str, method: str, payload: dict) -> bool:
             reason = e.read().decode("utf-8", errors="replace")[:300]
         except Exception:
             reason = "unavailable"
+        if method == "editMessageText" and e.code == 400:
+            try:
+                description = str(json.loads(reason).get("description", "")).lower()
+            except (ValueError, AttributeError):
+                description = ""
+            if "message is not modified" in description:
+                return True
         logger.error(
             "TELEGRAM_%s_ERROR: HTTP %s reason=%s payload_chars=%s",
             method.upper(), e.code, reason, len(str(payload.get("text", ""))),
@@ -564,6 +572,8 @@ def _send_telegram(
         if reply_markup and index == len(chunks) - 1:
             payload["reply_markup"] = reply_markup
         if not _telegram_request(bot_token, "sendMessage", payload):
+            if _ACTIVE_CALLBACK_CLAIM.get():
+                _CALLBACK_DELIVERY_FAILED.set(True)
             logger.error(
                 "TELEGRAM_MESSAGE_DELIVERY_FAILED part=%s/%s chars=%s",
                 index + 1, len(chunks), len(chunk),
@@ -586,7 +596,10 @@ def _edit_telegram_message(
         payload["parse_mode"] = parse_mode
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    return _telegram_request(bot_token, "editMessageText", payload)
+    delivered = _telegram_request(bot_token, "editMessageText", payload)
+    if not delivered and _ACTIVE_CALLBACK_CLAIM.get():
+        _CALLBACK_DELIVERY_FAILED.set(True)
+    return delivered
 
 
 def _answer_callback_query(bot_token: str, callback_query_id: str, text: str | None = None) -> bool:
@@ -2558,7 +2571,18 @@ def _handle_callback_command(bot_token: str, chat_id: str, callback_query_id: st
                 current = _get_active_review_job_id(chat_id)
                 state = _get_callback_state(callback_query_id)
                 if current and (current != target_job_id or (state and state.get("initial_review_unset"))):
-                    # The previous attempt already showed the first card or advanced.
+                    # The previous attempt changed the session, but its reply may
+                    # have failed. Re-show that card instead of silently skipping it.
+                    jobs = _get_pending_jobs(limit=20)
+                    current_index = _job_index_by_id(jobs, current)
+                    if current_index is not None:
+                        job = jobs[current_index]
+                        _send_telegram(
+                            bot_token, chat_id, _format_next_review_card(job),
+                            reply_markup=_build_review_card_keyboard(job.get("job_id")),
+                        )
+                    else:
+                        _send_telegram(bot_token, chat_id, "Review queue changed. Use list to refresh.")
                     return
             _handle_next(bot_token, chat_id)
             return
@@ -2686,11 +2710,20 @@ def lambda_handler(event, context):
                         _answer_callback_query(bot_token, callback_query_id, "Open a fresh review card")
                         return {"statusCode": 400, "body": "Callback target unavailable; open a fresh review card"}
                     claim_token = _ACTIVE_CALLBACK_CLAIM.set((callback_query_id, owner))
+                    delivery_token = _CALLBACK_DELIVERY_FAILED.set(False)
                     try:
                         claimed = _get_callback_state(callback_query_id)
                         _handle_callback_command(bot_token, chat_id, callback_query_id, data, message_id,
                                                  pinned_target=claimed.get("target_job_id") if claimed else None,
                                                  retrying=previous is not None)
+                        if _CALLBACK_DELIVERY_FAILED.get():
+                            action = data.split(":")[1].strip().lower() if data.startswith("cmd:") else ""
+                            retryable = data.startswith("help:") or action in {
+                                "list", "status", "backlog", "followups", "why", "draft", "apply", "skip", "next",
+                            }
+                            if retryable:
+                                raise RuntimeError("Telegram callback reply delivery failed")
+                            logger.error("TELEGRAM_CALLBACK_REPLY_FAILED action=%s; action will not repeat", action)
                         state_now = _get_callback_state(callback_query_id)
                         if state_now and state_now.get("status") == "IN_PROGRESS":
                             _record_callback_state(callback_query_id, "COMPLETED", chat_id=incoming_chat_id, action=data)
@@ -2704,6 +2737,7 @@ def lambda_handler(event, context):
                         logger.error("CALLBACK_PROCESSING_ERROR: %s", str(exc))
                         raise
                     finally:
+                        _CALLBACK_DELIVERY_FAILED.reset(delivery_token)
                         _ACTIVE_CALLBACK_CLAIM.reset(claim_token)
                 return {"statusCode": 200}
 
