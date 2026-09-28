@@ -46,7 +46,7 @@ TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "Jobsearch")
 SENDER_LAMBDA = os.environ.get("SENDER_LAMBDA_NAME", "job-sender")
 INGESTOR_LAMBDA = os.environ.get("INGESTOR_LAMBDA_NAME", "job-ingestor")
 SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "80"))
-MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "14"))
+MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "1"))
 HN_MAX_JOB_AGE_DAYS = int(os.environ.get("HN_MAX_JOB_AGE_DAYS", "3"))
 LIST_FETCH_LIMIT = int(os.environ.get("LIST_FETCH_LIMIT", "100"))
 ENABLE_PRACTICE_MODE = os.environ.get("ENABLE_PRACTICE_MODE", "false").strip().lower() == "true"

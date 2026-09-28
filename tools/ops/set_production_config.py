@@ -23,7 +23,7 @@ TARGET_ENV = {
     },
     "job-router": {
         "SCORE_THRESHOLD": "80",
-        "MAX_JOB_AGE_DAYS": "14",
+        "MAX_JOB_AGE_DAYS": "1",
         "ENABLE_PRACTICE_MODE": "false",
         "ALLOW_TELEGRAM_EMAIL_SEND": "true",
     },

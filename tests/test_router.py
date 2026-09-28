@@ -2450,3 +2450,42 @@ def test_edit_message_not_modified_counts_as_delivered(monkeypatch):
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", not_modified)
     assert mod._telegram_request("secret-token", "editMessageText", {"chat_id": "1", "message_id": 2, "text": "Help"})
+
+
+def test_one_day_freshness_rule_filters_stale_jobs_from_review_queue(monkeypatch):
+    """Confirm jobs older than 1 day are filtered out of reviewable queue when MAX_JOB_AGE_DAYS=1."""
+    import time
+    from datetime import datetime, timezone, timedelta
+    import job_router.lambda_function as mod
+
+    monkeypatch.setattr(mod, "MAX_JOB_AGE_DAYS", 1)
+
+    now = datetime.now(timezone.utc)
+    fresh_time = (now - timedelta(hours=6)).isoformat()
+    stale_time = (now - timedelta(days=2)).isoformat()
+
+    fresh_job = {
+        "job_id": "fresh-001",
+        "title": "Fresh AI Engineer",
+        "company": "Acme Fresh",
+        "source": "adzuna",
+        "url": "https://jobs.adzuna.com/details/fresh-1",
+        "status": "PENDING_APPROVAL",
+        "match_score": 85,
+        "posted_at": fresh_time,
+    }
+    stale_job = {
+        "job_id": "stale-001",
+        "title": "Stale AI Engineer",
+        "company": "Acme Stale",
+        "source": "adzuna",
+        "url": "https://jobs.adzuna.com/details/stale-1",
+        "status": "PENDING_APPROVAL",
+        "match_score": 90,
+        "posted_at": stale_time,
+    }
+
+    assert mod._is_reviewable_job(fresh_job) is True
+    assert mod._is_reviewable_job(stale_job) is False
+    assert "older than the 1-day freshness rule" in mod._hidden_pending_reason(stale_job)
+
