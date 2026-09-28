@@ -16,6 +16,9 @@ Tests:
 
 import json
 import io
+import ast
+import textwrap
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import pytest
 import boto3
@@ -50,12 +53,14 @@ def _make_sns_event(message_text):
     }
 
 
-def _make_callback_event(data, chat_id="99999", message_id=321):
+def _make_callback_event(data, chat_id="99999", message_id=321, callback_id=None):
     """Create an API Gateway event mimicking a Telegram callback query."""
+    import uuid
+    cb_id = callback_id or f"cb-{uuid.uuid4().hex[:8]}"
     return {
         "body": json.dumps({
             "callback_query": {
-                "id": "callback-001",
+                "id": cb_id,
                 "data": data,
                 "message": {
                     "message_id": message_id,
@@ -108,6 +113,7 @@ class TestRouter:
         mod.table = dynamo.Table("Jobsearch")
         mod.secrets_client = sm
         mod._cached_secrets = None  # Reset cache
+        mod._PROCESSED_CALLBACK_IDS.clear()
         mod.ENABLE_PRACTICE_MODE = False
         mod.ALLOW_TELEGRAM_EMAIL_SEND = False
 
@@ -504,11 +510,12 @@ class TestRouter:
 
         mod.lambda_handler(_make_telegram_event("next"), MockContext())
         assert "[92% match]" in mock_tg.call_args[0][2]
-        assert "AI Engineer Role 3" in mock_tg.call_args[0][2]
-        keyboard = mock_tg.call_args.kwargs["reply_markup"]["keyboard"]
-        assert keyboard[0][0]["text"] == "Why"
-        assert keyboard[0][2]["text"] == "Apply"
-        assert keyboard[1][0]["text"] == "Next Match"
+        markup = mock_tg.call_args.kwargs["reply_markup"]
+        assert "keyboard" not in markup
+        inline_kb = markup["inline_keyboard"]
+        assert inline_kb[0][0]["text"] == "Why"
+        assert inline_kb[0][2]["text"] == "✓ Apply"
+        assert inline_kb[1][0]["text"] == "→ Next Match"
 
         mod.lambda_handler(_make_telegram_event("next"), MockContext())
         assert "AI Engineer Role 2" in mock_tg.call_args[0][2]
@@ -1477,3 +1484,838 @@ class TestWorkModeUncertainty:
         })
         assert "⚠️" not in card
         assert "remote" in card
+
+
+@mock_aws
+class TestRouterRegressionEdgeCases:
+    """Regression tests covering confirmed edge cases: repeated taps, old cards,
+    delivery failure tracking, malformed webhooks, header redaction, and send gates.
+    """
+
+    def _setup_infra(self):
+        import os
+        os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+
+        dynamo = boto3.resource("dynamodb", region_name="us-east-1")
+        table = dynamo.create_table(
+            TableName="Jobsearch",
+            KeySchema=[{"AttributeName": "job_id", "KeyType": "HASH"}],
+            AttributeDefinitions=[
+                {"AttributeName": "job_id", "AttributeType": "S"},
+                {"AttributeName": "status", "AttributeType": "S"},
+            ],
+            GlobalSecondaryIndexes=[
+                {
+                    "IndexName": "status-index",
+                    "KeySchema": [{"AttributeName": "status", "KeyType": "HASH"}],
+                    "Projection": {"ProjectionType": "ALL"},
+                }
+            ],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        table.meta.client.get_waiter("table_exists").wait(TableName="Jobsearch")
+
+        sm = boto3.client("secretsmanager", region_name="us-east-1")
+        sm.create_secret(
+            Name="telegram",
+            SecretString=json.dumps({
+                "TELEGRAM_BOT_TOKEN": "123456:ABC-DEF",
+                "TELEGRAM_CHAT_ID": "99999",
+            }),
+        )
+
+        import job_router.lambda_function as mod
+        mod.dynamodb = dynamo
+        mod.table = dynamo.Table("Jobsearch")
+        mod.secrets_client = sm
+        mod._cached_secrets = None
+        mod._PROCESSED_CALLBACK_IDS.clear()
+        mod.ENABLE_PRACTICE_MODE = False
+        mod.ALLOW_TELEGRAM_EMAIL_SEND = False
+        mod.REQUIRE_TELEGRAM_WEBHOOK_SECRET = False
+
+        return mod, table
+
+    def _insert_pending_jobs(self, table, count=2):
+        now = datetime.now(timezone.utc)
+        for i in range(count):
+            table.put_item(Item={
+                "job_id": f"pending-{i+1:03d}",
+                "title": f"AI Engineer Role {i+1}",
+                "company": f"Company{i+1}",
+                "location": "San Francisco, CA",
+                "work_mode": "remote",
+                "work_mode_source": "location",
+                "match_score": Decimal(str(95 - i)),
+                "match_reason": f"Strong match #{i+1}",
+                "status": "PENDING_APPROVAL",
+                "source": "hackernews",
+                "posted_at": (now - timedelta(hours=1 + i)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "url": f"https://company{i+1}.com/apply",
+            })
+
+    def test_malformed_webhook_inputs_return_400(self):
+        """Malformed JSON or non-object bodies must return HTTP 400 without crashing."""
+        mod, _ = self._setup_infra()
+
+        # null body
+        resp = mod.lambda_handler({"body": "null"}, MockContext())
+        assert resp["statusCode"] == 400
+        assert "Bad Request" in resp["body"]
+
+        # empty array body
+        resp = mod.lambda_handler({"body": "[]"}, MockContext())
+        assert resp["statusCode"] == 400
+        assert "Bad Request" in resp["body"]
+
+        # non-dict message
+        resp = mod.lambda_handler({"body": json.dumps({"message": "string not dict"})}, MockContext())
+        assert resp["statusCode"] == 400
+
+        # non-dict callback_query
+        resp = mod.lambda_handler({"body": json.dumps({"callback_query": "string not dict"})}, MockContext())
+        assert resp["statusCode"] == 400
+
+    @patch("job_router.lambda_function._send_telegram")
+    def test_numeric_message_text_does_not_crash(self, mock_tg):
+        """Numeric message.text must be safely coerced to str without AttributeError."""
+        mod, _ = self._setup_infra()
+        mock_tg.return_value = True
+
+        event = {"body": json.dumps({"message": {"text": 12345, "chat": {"id": 99999}}})}
+        resp = mod.lambda_handler(event, MockContext())
+        assert resp["statusCode"] == 200
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_duplicate_callback_replay_does_not_advance_to_second_job(self, mock_tg, mock_ack):
+        """Replaying the exact same callback ID must be rejected as duplicate and not modify job 2."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        mock_ack.return_value = True
+        self._insert_pending_jobs(table, 2)
+
+        # First tap on apply
+        event = _make_callback_event("cmd:apply", callback_id="same-cb-id-123")
+        resp1 = mod.lambda_handler(event, MockContext())
+        assert resp1["statusCode"] == 200
+
+        item1 = table.get_item(Key={"job_id": "pending-001"}).get("Item")
+        item2 = table.get_item(Key={"job_id": "pending-002"}).get("Item")
+        assert item1["status"] == "MANUAL_APPLY"
+        assert item2["status"] == "PENDING_APPROVAL"
+
+        # Replay EXACT same callback event
+        resp2 = mod.lambda_handler(event, MockContext())
+        assert resp2["statusCode"] == 200
+        assert "Duplicate callback ignored" in resp2.get("body", "")
+
+        # Verify job 2 is STILL PENDING_APPROVAL!
+        item2_after = table.get_item(Key={"job_id": "pending-002"}).get("Item")
+        assert item2_after["status"] == "PENDING_APPROVAL"
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_apply_bound_to_job_id_is_idempotent_and_isolated(self, mock_tg, mock_ack):
+        """Tapping apply bound to job 1 repeatedly re-delivers job 1 and never touches job 2."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        mock_ack.return_value = True
+        self._insert_pending_jobs(table, 2)
+
+        # First tap: cmd:apply:pending-001
+        event1 = _make_callback_event("cmd:apply:pending-001", callback_id="cb-tap-1")
+        mod.lambda_handler(event1, MockContext())
+
+        item1 = table.get_item(Key={"job_id": "pending-001"}).get("Item")
+        item2 = table.get_item(Key={"job_id": "pending-002"}).get("Item")
+        assert item1["status"] == "MANUAL_APPLY"
+        assert item2["status"] == "PENDING_APPROVAL"
+
+        # Second tap: cmd:apply:pending-001 with new callback ID (user tapped card 1 again)
+        event2 = _make_callback_event("cmd:apply:pending-001", callback_id="cb-tap-2")
+        mod.lambda_handler(event2, MockContext())
+
+        # Follow-up info re-delivered
+        msg = mock_tg.call_args[0][2]
+        assert "Manual follow-up already selected (re-delivered)" in msg
+        assert "Company1" in msg
+
+        # Job 2 is COMPLETELY UNTOUCHED!
+        item2_after = table.get_item(Key={"job_id": "pending-002"}).get("Item")
+        assert item2_after["status"] == "PENDING_APPROVAL"
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_old_card_actions_do_not_affect_pending_jobs(self, mock_tg, mock_ack):
+        """Actions on stale cards (already REJECTED/APPLIED) must inform user and not touch pending jobs."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        mock_ack.return_value = True
+        self._insert_pending_jobs(table, 1)
+
+        # Insert an old rejected job
+        table.put_item(Item={
+            "job_id": "old-stale-001",
+            "title": "Old AI Role",
+            "company": "Old Corp",
+            "status": "REJECTED",
+            "source": "hackernews",
+            "url": "https://oldcorp.com/apply",
+        })
+
+        # User taps Apply on the old card
+        event = _make_callback_event("cmd:apply:old-stale-001", callback_id="old-card-tap")
+        mod.lambda_handler(event, MockContext())
+
+        msg = mock_tg.call_args[0][2]
+        assert "Job already REJECTED" in msg
+        assert "Old cards do not affect current matches" in msg
+
+        # Pending job 1 is STILL PENDING_APPROVAL!
+        item1 = table.get_item(Key={"job_id": "pending-001"}).get("Item")
+        assert item1["status"] == "PENDING_APPROVAL"
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_delivery_failure_tracks_delivery_status_and_allows_idempotent_retry(self, mock_tg, mock_ack):
+        """When Telegram message fails to deliver, record DELIVERY_FAILED and allow idempotent retry."""
+        mod, table = self._setup_infra()
+        mock_ack.return_value = True
+        self._insert_pending_jobs(table, 2)
+
+        # Delivery fails on first attempt
+        mock_tg.return_value = False
+        event1 = _make_callback_event("cmd:apply:pending-001", callback_id="fail-attempt-1")
+        mod.lambda_handler(event1, MockContext())
+
+        item1 = table.get_item(Key={"job_id": "pending-001"}).get("Item")
+        assert item1["status"] == "MANUAL_APPLY"
+        assert item1["delivery_status"] == "DELIVERY_FAILED"
+        assert "telegram send failed" in item1["delivery_error"]
+
+        # Now delivery succeeds on retry
+        mock_tg.return_value = True
+        event2 = _make_callback_event("cmd:apply:pending-001", callback_id="retry-attempt-2")
+        mod.lambda_handler(event2, MockContext())
+
+        item1_after = table.get_item(Key={"job_id": "pending-001"}).get("Item")
+        assert item1_after["status"] == "MANUAL_APPLY"
+        assert item1_after["delivery_status"] == "DELIVERED"
+        assert item1_after["delivery_error"] == ""
+
+        # Pending job 2 was not touched
+        item2 = table.get_item(Key={"job_id": "pending-002"}).get("Item")
+        assert item2["status"] == "PENDING_APPROVAL"
+
+    def test_auth_headers_redacted_from_logging(self, caplog):
+        """Authentication and secret tokens must be scrubbed from logs."""
+        import logging
+        mod, _ = self._setup_infra()
+
+        event = {
+            "headers": {
+                "X-Telegram-Bot-Api-Secret-Token": "SUPER_SECRET_TOKEN_XYZ",
+                "Authorization": "Bearer SECRET_AUTH_KEY",
+                "Host": "api.telegram.org",
+            },
+            "body": json.dumps({"message": {"text": "list", "chat": {"id": 99999}}}),
+        }
+
+        with caplog.at_level(logging.INFO), patch.object(mod, "_send_telegram", return_value=True):
+            mod.lambda_handler(event, MockContext())
+
+        log_output = caplog.text
+        assert "SUPER_SECRET_TOKEN_XYZ" not in log_output
+        assert "SECRET_AUTH_KEY" not in log_output
+        assert "[REDACTED]" in log_output
+
+    def test_webhook_secret_enforcement(self):
+        """When webhook secret is required, invalid or missing secrets must return 403."""
+        mod, _ = self._setup_infra()
+        mod.REQUIRE_TELEGRAM_WEBHOOK_SECRET = True
+        mod._cached_secrets = {
+            "TELEGRAM_BOT_TOKEN": "123456:ABC-DEF",
+            "TELEGRAM_CHAT_ID": "99999",
+            "TELEGRAM_WEBHOOK_SECRET": "test-webhook-secret-token",
+        }
+
+        # Missing secret header
+        event_missing = {
+            "headers": {"Host": "api.gateway.com"},
+            "body": json.dumps({"message": {"text": "list", "chat": {"id": 99999}}}),
+        }
+        resp = mod.lambda_handler(event_missing, MockContext())
+        assert resp["statusCode"] == 403
+
+        # Invalid secret header
+        event_invalid = {
+            "headers": {"X-Telegram-Bot-Api-Secret-Token": "wrong-token"},
+            "body": json.dumps({"message": {"text": "list", "chat": {"id": 99999}}}),
+        }
+        resp = mod.lambda_handler(event_invalid, MockContext())
+        assert resp["statusCode"] == 403
+
+        # Valid secret header
+        event_valid = {
+            "headers": {"X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret-token"},
+            "body": json.dumps({"message": {"text": "help", "chat": {"id": 99999}}}),
+        }
+        with patch.object(mod, "_send_telegram", return_value=True):
+            resp = mod.lambda_handler(event_valid, MockContext())
+        assert resp["statusCode"] == 200
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_two_apply_taps_with_different_callback_ids_do_not_move_two_different_jobs(self, mock_tg, mock_ack):
+        """Two Apply taps with different callback IDs must NOT move two different jobs."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        mock_ack.return_value = True
+        self._insert_pending_jobs(table, 2)
+
+        # Set active review job to pending-001 as if user is viewing card 1
+        mod._set_active_review_job("99999", "pending-001")
+
+        # First tap with callback ID 1: moves pending-001 to MANUAL_APPLY
+        event1 = _make_callback_event("cmd:apply", callback_id="cb-tap-first")
+        mod.lambda_handler(event1, MockContext())
+
+        item1 = table.get_item(Key={"job_id": "pending-001"}).get("Item")
+        item2 = table.get_item(Key={"job_id": "pending-002"}).get("Item")
+        assert item1["status"] == "MANUAL_APPLY"
+        assert item2["status"] == "PENDING_APPROVAL"
+
+        # Second tap with completely DIFFERENT callback ID 2
+        event2 = _make_callback_event("cmd:apply", callback_id="cb-tap-second")
+        mod.lambda_handler(event2, MockContext())
+
+        # Verify pending-002 was NOT moved!
+        item2_after = table.get_item(Key={"job_id": "pending-002"}).get("Item")
+        assert item2_after["status"] == "PENDING_APPROVAL"
+
+        # Verify user was notified that the active match was re-delivered
+        msg = mock_tg.call_args[0][2]
+        assert "Manual follow-up already selected" in msg
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_replaying_unbound_callback_after_cache_cleared_does_not_move_another_job(self, mock_tg, mock_ack):
+        """Replaying an unbound callback even after clearing the dedup cache must NOT move another job."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        mock_ack.return_value = True
+        self._insert_pending_jobs(table, 2)
+
+        # Set active review job to pending-001
+        mod._set_active_review_job("99999", "pending-001")
+
+        # Apply job 1
+        event = _make_callback_event("cmd:apply", callback_id="unbound-apply-cb")
+        mod.lambda_handler(event, MockContext())
+
+        assert table.get_item(Key={"job_id": "pending-001"}).get("Item")["status"] == "MANUAL_APPLY"
+        assert table.get_item(Key={"job_id": "pending-002"}).get("Item")["status"] == "PENDING_APPROVAL"
+
+        # Simulate cache expiry or different container by clearing the cache
+        mod._PROCESSED_CALLBACK_IDS.clear()
+        mod._CALLBACK_STATES.clear()
+
+        # Replay the same event
+        mod.lambda_handler(event, MockContext())
+
+        # Job 2 MUST NOT be touched!
+        item2_after = table.get_item(Key={"job_id": "pending-002"}).get("Item")
+        assert item2_after["status"] == "PENDING_APPROVAL"
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_replaying_unbound_callback_after_navigation_and_cache_clear_does_not_move_job_2(self, mock_tg, mock_ack):
+        """Replaying an unbound callback after navigating to job 2 and clearing memory cache must NOT move job 2."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        mock_ack.return_value = True
+        self._insert_pending_jobs(table, 3)
+
+        # Step 1: Submit unbound cmd:apply with callback ID old-unbound-event
+        event_apply = _make_callback_event("cmd:apply", callback_id="old-unbound-event")
+        mod.lambda_handler(event_apply, MockContext())
+
+        assert table.get_item(Key={"job_id": "pending-001"}).get("Item")["status"] == "MANUAL_APPLY"
+        assert table.get_item(Key={"job_id": "pending-002"}).get("Item")["status"] == "PENDING_APPROVAL"
+
+        # Step 2: Submit Next - review session advances to pending-002
+        event_next = _make_telegram_event("next")
+        mod.lambda_handler(event_next, MockContext())
+        assert mod._get_active_review_job_id("99999") == "pending-002"
+
+        # Step 3: Clear the in-memory callback cache (simulating cold start / container recycle)
+        mod._PROCESSED_CALLBACK_IDS.clear()
+        mod._CALLBACK_STATES.clear()
+
+        # Step 4: Replay the original callback old-unbound-event
+        resp = mod.lambda_handler(event_apply, MockContext())
+        assert resp["statusCode"] == 200
+
+        # Verify final states: pending-001 is MANUAL_APPLY, pending-002 and pending-003 stay PENDING_APPROVAL
+        assert table.get_item(Key={"job_id": "pending-001"}).get("Item")["status"] == "MANUAL_APPLY"
+        assert table.get_item(Key={"job_id": "pending-002"}).get("Item")["status"] == "PENDING_APPROVAL"
+        assert table.get_item(Key={"job_id": "pending-003"}).get("Item")["status"] == "PENDING_APPROVAL"
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_unbound_apply_with_failed_delivery_recovers_on_retry(self, mock_tg, mock_ack):
+        """An unbound Apply retry after delivery failure must re-deliver follow-up details."""
+        mod, table = self._setup_infra()
+        mock_ack.return_value = True
+        self._insert_pending_jobs(table, 1)
+
+        # First attempt: Telegram delivery fails
+        mock_tg.return_value = False
+        event = _make_callback_event("cmd:apply", callback_id="unbound-retry-fail")
+        mod.lambda_handler(event, MockContext())
+
+        item = table.get_item(Key={"job_id": "pending-001"}).get("Item")
+        assert item["status"] == "MANUAL_APPLY"
+        assert item["delivery_status"] == "DELIVERY_FAILED"
+
+        # Second attempt: retry the unbound callback now that delivery works
+        mock_tg.return_value = True
+        mod.lambda_handler(event, MockContext())
+
+        # Verify delivery status recovered to DELIVERED
+        item_after = table.get_item(Key={"job_id": "pending-001"}).get("Item")
+        assert item_after["status"] == "MANUAL_APPLY"
+        assert item_after["delivery_status"] == "DELIVERED"
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_non_delivery_processing_exception_does_not_poison_callback_cache(self, mock_tg, mock_ack):
+        """A transient exception during handler processing must NOT poison the callback dedup cache."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        mock_ack.return_value = True
+        self._insert_pending_jobs(table, 1)
+
+        event = _make_callback_event("cmd:apply:pending-001", callback_id="transient-fail-cb")
+
+        # Inject a transient RuntimeError on the first attempt
+        with patch.object(mod, "_update_job_status", side_effect=RuntimeError("transient db timeout")):
+            with pytest.raises(RuntimeError):
+                mod.lambda_handler(event, MockContext())
+
+        # Job is still pending because the update failed
+        assert table.get_item(Key={"job_id": "pending-001"}).get("Item")["status"] == "PENDING_APPROVAL"
+
+        # Replaying the same callback must NOT be rejected as a duplicate; it should execute and succeed
+        resp = mod.lambda_handler(event, MockContext())
+        assert resp["statusCode"] == 200
+        assert table.get_item(Key={"job_id": "pending-001"}).get("Item")["status"] == "MANUAL_APPLY"
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_action_tokens_enforce_telegram_64_byte_limit_for_long_ats_ids(self, mock_tg, mock_ack):
+        """Action tokens must strictly keep callback data <= 64 bytes even for long ATS job IDs."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        mock_ack.return_value = True
+
+        long_ats_id = "greenhouse_super-long-organization-name-enterprise-edition_a1b2c3d4-e5f6-7890-abcd-ef1234567890-extra-long-suffix"
+        assert len(long_ats_id) > 100
+
+        table.put_item(Item={
+            "job_id": long_ats_id,
+            "title": "Staff AI Engineer",
+            "company": "Super Long Org",
+            "match_score": Decimal("95"),
+            "status": "PENDING_APPROVAL",
+            "source": "greenhouse",
+            "posted_at": datetime.now(timezone.utc).isoformat(),
+            "url": "https://boards.greenhouse.io/superlong/jobs/1",
+        })
+
+        keyboard = mod._build_review_card_keyboard(long_ats_id)
+        assert "inline_keyboard" in keyboard
+        assert "keyboard" not in keyboard
+
+        for row in keyboard["inline_keyboard"]:
+            for button in row:
+                cb_data = button["callback_data"]
+                cb_bytes = cb_data.encode("utf-8")
+                # Telegram limit: 1-64 bytes
+                assert 1 <= len(cb_bytes) <= 64, f"Payload {cb_data} exceeded 64 bytes: {len(cb_bytes)}"
+
+        # Verify clicking the tokenized button resolves the full job ID and mutates state
+        token = mod._get_or_create_action_token(long_ats_id)
+        event_apply = _make_callback_event(f"cmd:apply:{token}", callback_id="cb-long-token")
+        resp = mod.lambda_handler(event_apply, MockContext())
+        assert resp["statusCode"] == 200
+
+        item = table.get_item(Key={"job_id": long_ats_id}).get("Item")
+        assert item["status"] == "MANUAL_APPLY"
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_excluded_or_low_score_job_cannot_be_acted_on_via_bound_apply(self, mock_tg, mock_ack):
+        """A 2020 job with score 1, excluded from review, must be rejected when targeted by bound Apply."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        mock_ack.return_value = True
+
+        # Insert historical 2020 job with score 1
+        table.put_item(Item={
+            "job_id": "old-2020-job",
+            "title": "Ancient AI Engineer",
+            "company": "Past Corp",
+            "match_score": Decimal("1"),
+            "status": "PENDING_APPROVAL",
+            "source": "hackernews",
+            "posted_at": "2020-01-01T00:00:00Z",
+            "url": "https://pastcorp.com/jobs/1",
+        })
+
+        # Attempt to apply via bound callback
+        event = _make_callback_event("cmd:apply:old-2020-job", callback_id="old-apply-tap")
+        mod.lambda_handler(event, MockContext())
+
+        # Verify job was NOT updated to MANUAL_APPLY
+        item = table.get_item(Key={"job_id": "old-2020-job"}).get("Item")
+        assert item["status"] == "PENDING_APPROVAL"
+
+        # Verify blocked message explaining why
+        msg = mock_tg.call_args[0][2]
+        assert "Blocked: this role is not reviewable" in msg
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_competing_apply_and_skip_sequence_does_not_overwrite_manual_apply(self, mock_tg, mock_ack):
+        """A simulated competing Apply/Skip sequence must NOT overwrite MANUAL_APPLY with NOT_INTERESTED."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        mock_ack.return_value = True
+        self._insert_pending_jobs(table, 1)
+
+        # 1. Apply succeeds and transitions job to MANUAL_APPLY
+        event_apply = _make_callback_event("cmd:apply:pending-001", callback_id="cb-compete-apply")
+        mod.lambda_handler(event_apply, MockContext())
+
+        item = table.get_item(Key={"job_id": "pending-001"}).get("Item")
+        assert item["status"] == "MANUAL_APPLY"
+
+        # 2. Competing Skip arrives for the same job
+        event_skip = _make_callback_event("cmd:skip:pending-001", callback_id="cb-compete-skip")
+        mod.lambda_handler(event_skip, MockContext())
+
+        # Verify status was NOT overwritten!
+        item_after = table.get_item(Key={"job_id": "pending-001"}).get("Item")
+        assert item_after["status"] == "MANUAL_APPLY"
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_replaying_same_callback_id_after_delivery_failure_retries_delivery(self, mock_tg, mock_ack):
+        """Replaying the exact same callback ID after delivery failure must make a delivery retry attempt."""
+        mod, table = self._setup_infra()
+        mock_ack.return_value = True
+        self._insert_pending_jobs(table, 1)
+
+        # First attempt: Telegram delivery fails
+        mock_tg.return_value = False
+        event = _make_callback_event("cmd:apply:pending-001", callback_id="retry-same-id-999")
+        mod.lambda_handler(event, MockContext())
+
+        assert mock_tg.call_count == 1
+        item = table.get_item(Key={"job_id": "pending-001"}).get("Item")
+        assert item["status"] == "MANUAL_APPLY"
+        assert item["delivery_status"] == "DELIVERY_FAILED"
+
+        # Replay the EXACT SAME callback event now that network is back
+        mock_tg.return_value = True
+        mod.lambda_handler(event, MockContext())
+
+        # Delivery attempt MUST have been made again (call_count incremented to 2)
+        assert mock_tg.call_count == 2
+        item_after = table.get_item(Key={"job_id": "pending-001"}).get("Item")
+        assert item_after["status"] == "MANUAL_APPLY"
+        assert item_after["delivery_status"] == "DELIVERED"
+
+    @patch("job_router.lambda_function._answer_callback_query")
+    @patch("job_router.lambda_function._send_telegram")
+    def test_displayed_review_cards_attach_bound_review_keyboard(self, mock_tg, mock_ack):
+        """Displayed review cards in Next, Why, and Draft must attach bound inline keyboards with NO reply keyboard."""
+        mod, table = self._setup_infra()
+        mock_tg.return_value = True
+        mock_ack.return_value = True
+        self._insert_pending_jobs(table, 1)
+
+        token = mod._get_or_create_action_token("pending-001")
+
+        # 1. Test Next Match card has bound inline keyboard and NO reply keyboard
+        event_next = _make_telegram_event("next")
+        mod.lambda_handler(event_next, MockContext())
+
+        last_call_kwargs = mock_tg.call_args[1]
+        assert "reply_markup" in last_call_kwargs
+        assert "keyboard" not in last_call_kwargs["reply_markup"]
+        assert "resize_keyboard" not in last_call_kwargs["reply_markup"]
+        inline_kb = last_call_kwargs["reply_markup"].get("inline_keyboard", [])
+        assert len(inline_kb) > 0
+        assert inline_kb[0][0]["callback_data"] == f"cmd:why:{token}"
+        assert inline_kb[0][1]["callback_data"] == f"cmd:draft:{token}"
+        assert inline_kb[0][2]["callback_data"] == f"cmd:apply:{token}"
+        assert inline_kb[0][3]["callback_data"] == f"cmd:skip:{token}"
+
+        # 2. Test Why (explain) card
+        event_why = _make_telegram_event("why")
+        mod.lambda_handler(event_why, MockContext())
+        last_call_kwargs = mock_tg.call_args[1]
+        assert "reply_markup" in last_call_kwargs
+        assert "keyboard" not in last_call_kwargs["reply_markup"]
+        inline_kb_why = last_call_kwargs["reply_markup"].get("inline_keyboard", [])
+        assert inline_kb_why[0][0]["callback_data"] == f"cmd:why:{token}"
+
+        # 3. Test Draft card
+        with patch.object(mod.lambda_client, "invoke") as mock_invoke:
+            mock_invoke.return_value = {
+                "Payload": io.BytesIO(json.dumps({
+                    "status": "preview",
+                    "email": {"subject": "Test Subj", "body": "Test Body"}
+                }).encode("utf-8"))
+            }
+            event_draft = _make_telegram_event("draft")
+            mod.lambda_handler(event_draft, MockContext())
+            last_call_kwargs = mock_tg.call_args[1]
+            assert "reply_markup" in last_call_kwargs
+            assert "keyboard" not in last_call_kwargs["reply_markup"]
+            inline_kb_draft = last_call_kwargs["reply_markup"].get("inline_keyboard", [])
+            assert inline_kb_draft[0][0]["callback_data"] == f"cmd:why:{token}"
+
+
+@pytest.fixture
+def durable_callback_runtime():
+    """Real router handlers and Moto storage; only external delivery is mocked."""
+    with mock_aws():
+        helper = TestRouterRegressionEdgeCases()
+        mod, table = helper._setup_infra()
+        for cache in (mod._PROCESSED_CALLBACK_IDS, mod._CALLBACK_STATES,
+                      mod._ACTION_TOKEN_CACHE, mod._JOB_ID_TO_TOKEN_CACHE):
+            cache.clear()
+        helper._insert_pending_jobs(table, 3)
+        with patch.object(mod, "_send_telegram", return_value=True) as send, \
+             patch.object(mod, "_answer_callback_query", return_value=True):
+            yield mod, table, send
+
+
+def _cold_callback_worker(mod):
+    for cache in (mod._PROCESSED_CALLBACK_IDS, mod._CALLBACK_STATES,
+                  mod._ACTION_TOKEN_CACHE, mod._JOB_ID_TO_TOKEN_CACHE):
+        cache.clear()
+
+
+def test_durable_failed_apply_next_cold_retry_keeps_original_target(durable_callback_runtime):
+    mod, table, send = durable_callback_runtime
+    event = _make_callback_event("cmd:apply", callback_id="durable-failed-next")
+    send.return_value = False
+    mod.lambda_handler(event, MockContext())
+    send.return_value = True
+    mod.lambda_handler(_make_telegram_event("next"), MockContext())
+    _cold_callback_worker(mod)
+    mod.lambda_handler(event, MockContext())
+    first = table.get_item(Key={"job_id": "pending-001"})["Item"]
+    second = table.get_item(Key={"job_id": "pending-002"})["Item"]
+    state = table.get_item(Key={"job_id": "cb:durable-failed-next"})["Item"]
+    assert first["delivery_status"] == "DELIVERED"
+    assert second["status"] == "PENDING_APPROVAL"
+    assert state["target_job_id"] == "pending-001"
+    assert state["callback_status"] == "COMPLETED"
+
+
+@pytest.mark.parametrize("operation", ["get_item", "put_item"])
+def test_durable_storage_failure_stops_before_job_mutation(durable_callback_runtime, operation):
+    mod, table, send = durable_callback_runtime
+    original = getattr(mod.table, operation)
+
+    def fail_callback_storage(**kwargs):
+        key = kwargs.get("Item", kwargs.get("Key", {})).get("job_id", "")
+        if key.startswith("cb:"):
+            raise RuntimeError("injected callback database outage")
+        return original(**kwargs)
+
+    with patch.object(mod.table, operation, side_effect=fail_callback_storage):
+        response = mod.lambda_handler(_make_callback_event("cmd:apply", callback_id="storage-outage"), MockContext())
+    assert response["statusCode"] == 503
+    assert table.get_item(Key={"job_id": "pending-001"})["Item"]["status"] == "PENDING_APPROVAL"
+    send.assert_not_called()
+
+
+def test_durable_overlapping_workers_claim_only_once(durable_callback_runtime):
+    mod, _, _ = durable_callback_runtime
+    event = _make_callback_event("cmd:next", callback_id="overlapping-workers")
+    original_put = mod.table.put_item
+    dispatched = False
+
+    def second_worker_before_first_claim(**kwargs):
+        nonlocal dispatched
+        if kwargs.get("Item", {}).get("job_id") == "cb:overlapping-workers" and not dispatched:
+            dispatched = True
+            mod.lambda_handler(event, MockContext())
+        return original_put(**kwargs)
+
+    with patch.object(mod.table, "put_item", side_effect=second_worker_before_first_claim), \
+         patch.object(mod, "_handle_callback_command") as handle:
+        mod.lambda_handler(event, MockContext())
+    assert handle.call_count == 1
+
+
+@pytest.mark.parametrize("action", ["apply", "skip"])
+def test_durable_actual_job_update_error_is_retryable(durable_callback_runtime, action):
+    mod, table, _ = durable_callback_runtime
+    event = _make_callback_event(f"cmd:{action}:pending-001", callback_id="job-write-error")
+    original_update = mod.table.update_item
+
+    def fail_job_write(**kwargs):
+        if kwargs.get("Key", {}).get("job_id") == "pending-001":
+            raise RuntimeError("injected actual job update timeout")
+        return original_update(**kwargs)
+
+    with patch.object(mod.table, "update_item", side_effect=fail_job_write):
+        with pytest.raises(RuntimeError):
+            mod.lambda_handler(event, MockContext())
+    assert table.get_item(Key={"job_id": "cb:job-write-error"})["Item"]["callback_status"] == "FAILED"
+    _cold_callback_worker(mod)
+    mod.lambda_handler(event, MockContext())
+    expected = "MANUAL_APPLY" if action == "apply" else "NOT_INTERESTED"
+    assert table.get_item(Key={"job_id": "pending-001"})["Item"]["status"] == expected
+
+
+def test_durable_failed_token_write_is_not_cached_or_advertised(durable_callback_runtime):
+    mod, table, _ = durable_callback_runtime
+    with patch.object(mod.table, "put_item", side_effect=RuntimeError("token write outage")):
+        with pytest.raises(RuntimeError):
+            mod._build_review_card_keyboard("pending-001")
+    assert "pending-001" not in mod._JOB_ID_TO_TOKEN_CACHE
+    token = mod._get_or_create_action_token("pending-001")
+    assert table.get_item(Key={"job_id": f"tok:{token}"})["Item"]["target_job_id"] == "pending-001"
+    _cold_callback_worker(mod)
+    mod.lambda_handler(_make_callback_event(f"cmd:apply:{token}", callback_id="cold-token"), MockContext())
+    assert table.get_item(Key={"job_id": "pending-001"})["Item"]["status"] == "MANUAL_APPLY"
+
+
+def test_durable_token_read_outage_does_not_fall_back_to_job_id(durable_callback_runtime):
+    mod, _, _ = durable_callback_runtime
+    token = mod._get_or_create_action_token("pending-001")
+    _cold_callback_worker(mod)
+    with patch.object(mod.table, "get_item", side_effect=RuntimeError("token read outage")):
+        with pytest.raises(RuntimeError):
+            mod._resolve_action_token(token)
+
+
+def test_durable_in_progress_retry_is_not_acknowledged_as_complete(durable_callback_runtime):
+    mod, table, _ = durable_callback_runtime
+    import time
+    table.put_item(Item={"job_id": "cb:busy", "callback_status": "IN_PROGRESS",
+                         "updated_at": int(time.time()), "lease_until": int(time.time()) + 900,
+                         "claim_owner": "another-worker", "action_data": "cmd:next"})
+    response = mod.lambda_handler(_make_callback_event("cmd:next", callback_id="busy"), MockContext())
+    assert response["statusCode"] == 503
+
+
+def test_durable_first_next_retry_does_not_skip_first_card(durable_callback_runtime):
+    mod, table, _ = durable_callback_runtime
+    event = _make_callback_event("cmd:next", callback_id="first-next-crash")
+    original_record = mod._record_callback_state
+
+    def fail_completion_once(callback_id, status, *args, **kwargs):
+        if status == "COMPLETED":
+            raise RuntimeError("injected completion failure after card delivery")
+        return original_record(callback_id, status, *args, **kwargs)
+
+    with patch.object(mod, "_record_callback_state", side_effect=fail_completion_once):
+        with pytest.raises(RuntimeError):
+            mod.lambda_handler(event, MockContext())
+    assert mod._get_active_review_job_id("99999") == "pending-001"
+    assert table.get_item(Key={"job_id": "cb:first-next-crash"})["Item"]["callback_status"] == "FAILED"
+    _cold_callback_worker(mod)
+    mod.lambda_handler(event, MockContext())
+    assert mod._get_active_review_job_id("99999") == "pending-001"
+    mod.lambda_handler(_make_callback_event("cmd:next", callback_id="second-next"), MockContext())
+    assert mod._get_active_review_job_id("99999") == "pending-002"
+
+
+def test_durable_legacy_failed_unbound_action_without_target_is_refused(durable_callback_runtime):
+    mod, table, _ = durable_callback_runtime
+    table.put_item(Item={"job_id": "cb:legacy-unsafe", "callback_status": "FAILED", "updated_at": 1})
+    response = mod.lambda_handler(_make_callback_event("cmd:apply", callback_id="legacy-unsafe"), MockContext())
+    assert response["statusCode"] == 400
+    assert table.get_item(Key={"job_id": "pending-001"})["Item"]["status"] == "PENDING_APPROVAL"
+
+
+def test_durable_review_journey_no_outreach_and_retry_after_navigation(durable_callback_runtime):
+    mod, table, send = durable_callback_runtime
+    mod.lambda_handler(_make_telegram_event("next"), MockContext())
+    token = mod._get_or_create_action_token("pending-001")
+    mod.lambda_handler(_make_callback_event(f"cmd:why:{token}", callback_id="journey-why"), MockContext())
+    preview = {"status": "preview", "email": {"subject": "Preview", "body": "Grounded draft"}}
+    with patch.object(mod.lambda_client, "invoke", return_value={"Payload": io.BytesIO(json.dumps(preview).encode())}) as invoke:
+        mod.lambda_handler(_make_callback_event(f"cmd:draft:{token}", callback_id="journey-draft"), MockContext())
+        assert json.loads(invoke.call_args.kwargs["Payload"])["preview_only"] is True
+        assert invoke.call_args.kwargs["FunctionName"] == mod.SENDER_LAMBDA
+    send.return_value = False
+    apply = _make_callback_event(f"cmd:apply:{token}", callback_id="journey-apply")
+    mod.lambda_handler(apply, MockContext())
+    send.return_value = True
+    mod.lambda_handler(_make_callback_event("cmd:next", callback_id="journey-next"), MockContext())
+    _cold_callback_worker(mod)
+    mod.lambda_handler(apply, MockContext())
+    assert table.get_item(Key={"job_id": "pending-001"})["Item"]["delivery_status"] == "DELIVERED"
+    assert table.get_item(Key={"job_id": "pending-002"})["Item"]["status"] == "PENDING_APPROVAL"
+
+
+def test_monitor_detects_missing_three_hour_windows_and_empty_telemetry():
+    source = (Path(__file__).resolve().parents[1] / ".github/workflows/health-monitor.yml").read_text(encoding="utf-8")
+    script = textwrap.dedent(source.split("python - <<'HEALTH_SCRIPT'\n", 1)[1].split("HEALTH_SCRIPT", 1)[0])
+    tree = ast.parse(script)
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "missed_ingestor_windows")
+    scope = {"datetime": datetime}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "health-monitor", "exec"), scope)
+    check = scope["missed_ingestor_windows"]
+    end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    start = end - timedelta(hours=24)
+    one_run = [{"Timestamp": end - timedelta(hours=1), "Sum": 1}]
+    regular_runs = [{"Timestamp": start + timedelta(hours=2 + 3 * i), "Sum": 1} for i in range(8)]
+    assert check(one_run, start, end) >= 6
+    assert check(regular_runs, start, end) == 0
+    assert check([], start, end) is None
+
+
+def test_telegram_long_messages_are_chunked_and_keyboard_stays_on_last(monkeypatch):
+    import job_router.lambda_function as mod
+    sent = []
+    monkeypatch.setattr(mod, "_telegram_request", lambda token, method, payload: sent.append(payload) or True)
+    text = "\n".join(f"{i}. {'x' * 320}" for i in range(20))
+
+    assert mod._send_telegram("token", "chat", text, reply_markup={"keyboard": [["Home"]]}) is True
+    assert len(sent) > 1
+    assert all(len(item["text"]) <= mod.TELEGRAM_SAFE_MESSAGE_CHARS for item in sent)
+    assert "reply_markup" not in sent[0]
+    assert sent[-1]["reply_markup"] == {"keyboard": [["Home"]]}
+    assert "".join(item["text"] for item in sent).replace("\n", "")
+
+
+def test_telegram_http_error_logs_reason_without_message_body(monkeypatch, caplog):
+    import logging
+    import urllib.error
+    import job_router.lambda_function as mod
+
+    def fail(*_args, **_kwargs):
+        raise urllib.error.HTTPError(
+            "https://api.telegram.org/botsecret/sendMessage", 400, "Bad Request",
+            {}, io.BytesIO(b'{"ok":false,"description":"Bad Request: message is too long"}'),
+        )
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fail)
+    with caplog.at_level(logging.ERROR):
+        assert mod._telegram_request("secret-token", "sendMessage", {"chat_id": "1", "text": "private"}) is False
+    assert "message is too long" in caplog.text
+    assert "secret-token" not in caplog.text
+    assert "private" not in caplog.text

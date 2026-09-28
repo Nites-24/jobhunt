@@ -64,7 +64,42 @@ jobs:
           cloudwatch = boto3.client("cloudwatch", region_name=REGION)
           logs_client = boto3.client("logs", region_name=REGION)
 
-          issues = []
+          class Severity:
+              INFO = "INFO"
+              WARNING = "WARNING"
+              CRITICAL = "CRITICAL"
+
+          class HealthIssue:
+              def __init__(self, component: str, severity: str, message: str):
+                  self.component = component
+                  self.severity = severity
+                  self.message = message
+
+              def is_critical(self) -> bool:
+                  return self.severity == Severity.CRITICAL
+
+              def __str__(self) -> str:
+                  icon = "🔴" if self.severity == Severity.CRITICAL else ("⚠️" if self.severity == Severity.WARNING else "ℹ️")
+                  return f"{icon} [{self.severity}] {self.component}: {self.message}"
+
+          def missed_ingestor_windows(datapoints, start, end):
+              """Count 3-hour gaps, including missing CloudWatch datapoints."""
+              observed = sorted(
+                  dp["Timestamp"] for dp in datapoints
+                  if dp.get("Sum", 0) > 0 and isinstance(dp.get("Timestamp"), datetime)
+              )
+              if not observed:
+                  return None  # A summary count exists, but interval telemetry is unavailable.
+              missed = 0
+              previous = start
+              for timestamp in observed + [end]:
+                  seconds = (timestamp - previous).total_seconds()
+                  if seconds > 10800 + 900:  # 3-hour schedule + 15-minute metric delay.
+                      missed += max(1, int((seconds - 900) // 10800))
+                  previous = timestamp
+              return missed
+
+          issues: list[HealthIssue] = []
           report = []
           now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -87,12 +122,12 @@ jobs:
                   modified = cfg.get("LastModified", "Unknown")
                   report.append(f"| {func} | {state} | {update} | {modified} |")
                   if state != "Active":
-                      issues.append(f"Lambda {func} state is {state}")
+                      issues.append(HealthIssue(func, Severity.CRITICAL, f"state is {state} (expected Active)"))
                   if update == "Failed":
-                      issues.append(f"Lambda {func} last update FAILED")
+                      issues.append(HealthIssue(func, Severity.CRITICAL, "last update FAILED"))
               except Exception as e:
                   report.append(f"| {func} | ERROR | - | - |")
-                  issues.append(f"Lambda {func}: {str(e)[:100]}")
+                  issues.append(HealthIssue(func, Severity.CRITICAL, f"configuration error: {str(e)[:100]}"))
 
           report.append("")
 
@@ -120,12 +155,12 @@ jobs:
                   report.append(f"| {q} | {visible} | {inflight} | {dlq_label} |")
 
                   if q in DLQS and visible > 0:
-                      issues.append(f"DLQ {q} has {visible} messages — indicates pipeline failures")
+                      issues.append(HealthIssue(q, Severity.CRITICAL, f"has {visible} messages in DLQ indicating failed pipeline executions"))
                   if q in QUEUES and visible > 100:
-                      issues.append(f"Queue {q} has {visible} pending — possible processing backlog")
+                      issues.append(HealthIssue(q, Severity.WARNING, f"has {visible} pending messages indicating backlog"))
               except Exception as e:
                   report.append(f"| {q} | ERROR | - | - |")
-                  issues.append(f"Queue {q}: {str(e)[:100]}")
+                  issues.append(HealthIssue(q, Severity.CRITICAL, f"queue error: {str(e)[:100]}"))
 
           report.append("")
 
@@ -137,6 +172,7 @@ jobs:
 
           events = boto3.client("events", region_name=REGION)
           rule_name = "job-search-daily-trigger"
+          sched_expr = ""
           try:
               rule_resp = events.describe_rule(Name=rule_name)
               targets_resp = events.list_targets_by_rule(Rule=rule_name)
@@ -148,10 +184,10 @@ jobs:
               is_healthy = state == "ENABLED" and has_ingestor_target
               report.append(f"| {rule_name} | {state} | {sched_expr} | {target_arn.split(':')[-1]} | {'✅ Yes' if is_healthy else '⚠️ No'} |")
               if not is_healthy:
-                  issues.append(f"EventBridge rule {rule_name} is {state} or missing job-ingestor target")
+                  issues.append(HealthIssue(rule_name, Severity.CRITICAL, f"rule is {state} or missing job-ingestor target"))
           except Exception as e:
               report.append(f"| {rule_name} | NOT FOUND | - | - | ❌ Missing |")
-              issues.append(f"EventBridge rule {rule_name} not configured: {str(e)[:100]}")
+              issues.append(HealthIssue(rule_name, Severity.CRITICAL, f"not configured: {str(e)[:100]}"))
 
           report.append("")
 
@@ -177,9 +213,68 @@ jobs:
                   error_count = int(sum(dp.get("Sum", 0) for dp in datapoints))
                   report.append(f"| {func} | {error_count} |")
                   if error_count > 10:
-                      issues.append(f"Lambda {func} had {error_count} errors in the last 6 hours")
+                      issues.append(HealthIssue(func, Severity.WARNING, f"had {error_count} errors in the last 6 hours"))
               except Exception as e:
                   report.append(f"| {func} | N/A |")
+                  issues.append(HealthIssue(f"metric:errors:{func}", Severity.WARNING, f"failed to read error metrics: {str(e)[:100]}"))
+
+          report.append("")
+
+          # ---- Source Failures & Rate Limits (CloudWatch Logs) ----
+          report.append("## Ingestion Source Health (CloudWatch Logs)")
+          report.append("")
+          report.append("| Source Type | Pattern | Event Count (Last 6h) | Status |")
+          report.append("|-------------|---------|-----------------------|--------|")
+
+          source_patterns = [
+              ("JSearch Rate Limit", "JSEARCH_RATE_LIMITED", "Rate limit (429)"),
+              ("JSearch Query", "JSEARCH_QUERY_ERROR", "Query request failure"),
+              ("Google CSE", "GOOGLE_CSE_QUERY_ERROR", "Search API error / disabled"),
+              ("Adzuna", "ADZUNA_QUERY_ERROR", "Adzuna query error"),
+              ("Greenhouse HTTP", "GREENHOUSE_HTTP_ERROR", "Greenhouse ATS HTTP error"),
+              ("Greenhouse Request", "GREENHOUSE_REQUEST_ERROR", "Greenhouse network/parse error"),
+              ("Lever HTTP", "LEVER_HTTP_ERROR", "Lever ATS HTTP error"),
+              ("Lever Request", "LEVER_REQUEST_ERROR", "Lever network/parse error"),
+              ("Ashby HTTP", "ASHBY_HTTP_ERROR", "Ashby ATS HTTP error"),
+              ("Ashby Request", "ASHBY_REQUEST_ERROR", "Ashby network/parse error"),
+              ("Generic Source", "SOURCE_ERROR", "General source error"),
+          ]
+
+          six_hours_ms = int(six_hours_ago.timestamp() * 1000)
+          for src_name, pattern, desc in source_patterns:
+              try:
+                  events_found = 0
+                  next_token = None
+                  truncated = False
+                  while True:
+                      kwargs = {
+                          "logGroupName": "/aws/lambda/job-ingestor",
+                          "filterPattern": f'"{pattern}"',
+                          "startTime": six_hours_ms,
+                          "limit": 100,
+                      }
+                      if next_token:
+                          kwargs["nextToken"] = next_token
+                      resp = logs_client.filter_log_events(**kwargs)
+                      batch = resp.get("events", [])
+                      events_found += len(batch)
+                      next_token = resp.get("nextToken")
+                      if not next_token:
+                          break
+                      if events_found >= 1000:
+                          truncated = True
+                          break
+                  count_str = f"{events_found}+" if truncated else f"{events_found}"
+                  status = "✅ Clean" if events_found == 0 else (f"⚠️ {count_str} events (truncated)" if truncated else f"⚠️ {events_found} events")
+                  report.append(f"| {src_name} ({desc}) | {pattern} | {count_str} | {status} |")
+                  if events_found > 0:
+                      issues.append(HealthIssue(f"source:{src_name.lower().replace(' ', '_')}", Severity.WARNING, f"{count_str} error/rate-limit events ({desc}) in last 6h"))
+              except Exception as e:
+                  err_str = str(e)
+                  is_missing_group = "ResourceNotFoundException" in err_str
+                  err_note = "Log group not found" if is_missing_group else f"Error: {err_str[:40]}"
+                  report.append(f"| {src_name} | {pattern} | - | ⚠️ Telemetry Unavailable ({err_note}) |")
+                  issues.append(HealthIssue(f"telemetry:{src_name.lower().replace(' ', '_')}", Severity.WARNING, f"CloudWatch logs unavailable for {src_name}: {err_note}"))
 
           report.append("")
 
@@ -204,21 +299,23 @@ jobs:
                   throttle_count = int(sum(dp.get("Sum", 0) for dp in datapoints))
                   report.append(f"| {func} | {throttle_count} |")
                   if throttle_count > 5:
-                      issues.append(f"Lambda {func} throttled {throttle_count} times in the last 6 hours")
+                      issues.append(HealthIssue(func, Severity.WARNING, f"throttled {throttle_count} times in the last 6 hours"))
               except Exception as e:
                   report.append(f"| {func} | N/A |")
+                  issues.append(HealthIssue(f"metric:throttles:{func}", Severity.WARNING, f"failed to read throttle metrics: {str(e)[:100]}"))
 
           report.append("")
 
-          # ---- Invocation counts ----
-          report.append("## Invocation Volume (Last 6 Hours)")
+          # ---- Invocation Volume & Missed Runs ----
+          report.append("## Invocation Volume & Schedule Verification")
           report.append("")
-          report.append("| Function | Invocations |")
-          report.append("|----------|-------------|")
+          report.append("| Function | Invocations (Last 6h) | Invocations (Last 24h) | Status |")
+          report.append("|----------|-----------------------|------------------------|--------|")
 
+          twenty_four_hours_ago = datetime.now(timezone.utc) - timedelta(hours=24)
           for func in LAMBDAS:
               try:
-                  response = cloudwatch.get_metric_statistics(
+                  resp_6h = cloudwatch.get_metric_statistics(
                       Namespace="AWS/Lambda",
                       MetricName="Invocations",
                       Dimensions=[{"Name": "FunctionName", "Value": func}],
@@ -227,11 +324,47 @@ jobs:
                       Period=21600,
                       Statistics=["Sum"],
                   )
-                  datapoints = response.get("Datapoints", [])
-                  count = int(sum(dp.get("Sum", 0) for dp in datapoints))
-                  report.append(f"| {func} | {count} |")
+                  count_6h = int(sum(dp.get("Sum", 0) for dp in resp_6h.get("Datapoints", [])))
+
+                  resp_24h = cloudwatch.get_metric_statistics(
+                      Namespace="AWS/Lambda",
+                      MetricName="Invocations",
+                      Dimensions=[{"Name": "FunctionName", "Value": func}],
+                      StartTime=twenty_four_hours_ago,
+                      EndTime=datetime.now(timezone.utc),
+                      Period=86400,
+                      Statistics=["Sum"],
+                  )
+                  count_24h = int(sum(dp.get("Sum", 0) for dp in resp_24h.get("Datapoints", [])))
+
+                  status = "✅ Active"
+                  if func == "job-ingestor" and count_24h == 0:
+                      status = "🔴 No runs in 24h (pipeline inactive)"
+                      issues.append(HealthIssue(func, Severity.CRITICAL, "zero invocations in 24 hours (ingestion pipeline did not run)"))
+                  elif func == "job-ingestor" and sched_expr == "rate(3 hours)":
+                      # A positive 24-hour total can hide missing scheduled windows.
+                      resp_intervals = cloudwatch.get_metric_statistics(
+                          Namespace="AWS/Lambda",
+                          MetricName="Invocations",
+                          Dimensions=[{"Name": "FunctionName", "Value": func}],
+                          StartTime=twenty_four_hours_ago,
+                          EndTime=datetime.now(timezone.utc),
+                          Period=300,
+                          Statistics=["Sum"],
+                      )
+                      intervals = resp_intervals.get("Datapoints", [])
+                      missed = missed_ingestor_windows(intervals, twenty_four_hours_ago, datetime.now(timezone.utc))
+                      if missed is None:
+                          issues.append(HealthIssue(func, Severity.WARNING, "invocation interval metrics unavailable despite positive 24h total"))
+                      elif missed:
+                          issues.append(HealthIssue(func, Severity.WARNING, f"{missed} possible scheduled 3-hour run(s) missed in last 24h"))
+                  elif func == "job-ingestor" and sched_expr:
+                      issues.append(HealthIssue(func, Severity.WARNING, f"missed-run interval check not configured for schedule {sched_expr}"))
+
+                  report.append(f"| {func} | {count_6h} | {count_24h} | {status} |")
               except Exception as e:
-                  report.append(f"| {func} | N/A |")
+                  report.append(f"| {func} | - | - | N/A |")
+                  issues.append(HealthIssue(f"metric:invocations:{func}", Severity.WARNING, f"failed to read invocation metrics: {str(e)[:100]}"))
 
           report.append("")
 
@@ -242,7 +375,7 @@ jobs:
               report.append(f"⚠️ **{len(issues)} issue(s) detected:**")
               report.append("")
               for issue in issues:
-                  report.append(f"- {issue}")
+                  report.append(f"- {str(issue)}")
           else:
               report.append("✅ **All systems healthy.** No issues detected.")
 
@@ -259,11 +392,11 @@ jobs:
               print(f"\n{'='*60}")
               print(f"HEALTH CHECK: {len(issues)} ISSUE(S) FOUND")
               for issue in issues:
-                  print(f"  - {issue}")
+                  print(f"  - {str(issue)}")
               print(f"{'='*60}")
-              # Exit 1 only for critical issues (DLQ messages or Lambda failures)
-              critical = [i for i in issues if "DLQ" in i or "FAILED" in i or "state is" in i]
+              critical = [i for i in issues if i.is_critical()]
               if critical:
+                  print(f"\nCRITICAL ISSUES FOUND ({len(critical)}): Exiting with failure.")
                   sys.exit(1)
           HEALTH_SCRIPT
 
