@@ -15,8 +15,12 @@ import os
 import re
 import time
 import hmac
+import hashlib
+import uuid
+import urllib.error
 import urllib.parse
 import urllib.request
+from contextvars import ContextVar
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Any
@@ -30,9 +34,12 @@ from shared.url_validation import get_canonical_job_url, is_valid_canonical_url
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+TELEGRAM_MAX_MESSAGE_CHARS = 4096
+TELEGRAM_SAFE_MESSAGE_CHARS = 3800
+
 secrets_client = boto3.client("secretsmanager", region_name="us-east-1")
-dynamodb = boto3.resource("dynamodb")
-lambda_client = boto3.client("lambda")
+dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+lambda_client = boto3.client("lambda", region_name="us-east-1")
 
 SECRET_NAME = os.environ.get("TELEGRAM_SECRET_NAME", "telegram")
 TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "Jobsearch")
@@ -44,15 +51,235 @@ HN_MAX_JOB_AGE_DAYS = int(os.environ.get("HN_MAX_JOB_AGE_DAYS", "3"))
 LIST_FETCH_LIMIT = int(os.environ.get("LIST_FETCH_LIMIT", "100"))
 ENABLE_PRACTICE_MODE = os.environ.get("ENABLE_PRACTICE_MODE", "false").strip().lower() == "true"
 ALLOW_TELEGRAM_EMAIL_SEND = os.environ.get("ALLOW_TELEGRAM_EMAIL_SEND", "false").strip().lower() == "true"
+REQUIRE_TELEGRAM_WEBHOOK_SECRET = os.environ.get("REQUIRE_TELEGRAM_WEBHOOK_SECRET", "true").strip().lower() == "true"
 LIST_ALLOWED_SOURCES = {
     source.strip().lower()
-    for source in os.environ.get("LIST_ALLOWED_SOURCES", "hackernews,hn,jsearch,google_cse,cse,adzuna,tejajob,signal_test").split(",")
+    for source in os.environ.get(
+        "LIST_ALLOWED_SOURCES",
+        "hackernews,hn,jsearch,google_cse,cse,adzuna,greenhouse,lever,ashby,tejajob,signal_test",
+    ).split(",")
     if source.strip()
 }
 
 table = dynamodb.Table(TABLE_NAME)
 _cached_secrets = None
 REVIEW_SESSION_PREFIX = "telegram_session_"
+_PROCESSED_CALLBACK_IDS: dict[str, float] = {}
+_CALLBACK_STATES: dict[str, dict] = {}
+_CALLBACK_DEDUP_TTL = 300
+_ACTION_TOKEN_CACHE: dict[str, str] = {}
+_JOB_ID_TO_TOKEN_CACHE: dict[str, str] = {}
+_ACTIVE_CALLBACK_CLAIM: ContextVar[tuple[str, str] | None] = ContextVar("active_callback_claim", default=None)
+_CALLBACK_DELIVERY_FAILED: ContextVar[bool] = ContextVar("callback_delivery_failed", default=False)
+
+
+def _get_or_create_action_token(job_id: str | None) -> str:
+    """Generate a compact 12-char hex token for a job_id and persist mapping in DynamoDB."""
+    if not job_id:
+        return ""
+    job_id_str = str(job_id).strip()
+    if not job_id_str:
+        return ""
+    if job_id_str in _JOB_ID_TO_TOKEN_CACHE:
+        return _JOB_ID_TO_TOKEN_CACHE[job_id_str]
+
+    token = hashlib.sha256(job_id_str.encode("utf-8")).hexdigest()[:12]
+    try:
+        table.put_item(
+            Item={
+                "job_id": f"tok:{token}",
+                "entity_type": "telegram_action_token",
+                "target_job_id": job_id_str,
+                "created_at": int(time.time()),
+            },
+            ConditionExpression="attribute_not_exists(job_id) OR target_job_id = :target",
+            ExpressionAttributeValues={":target": job_id_str},
+        )
+    except Exception as e:
+        logger.error("PUT_ACTION_TOKEN_ERROR: %s", str(e))
+        raise
+
+    _ACTION_TOKEN_CACHE[token] = job_id_str
+    _JOB_ID_TO_TOKEN_CACHE[job_id_str] = token
+    return token
+
+
+def _resolve_action_token(token_or_id: str | None) -> str | None:
+    """Resolve a compact token or direct job_id to the canonical job_id."""
+    if not token_or_id:
+        return None
+    val = str(token_or_id).strip()
+    if not val:
+        return None
+
+    if val in _ACTION_TOKEN_CACHE:
+        return _ACTION_TOKEN_CACHE[val]
+
+    try:
+        item = table.get_item(Key={"job_id": f"tok:{val}"}, ConsistentRead=True).get("Item")
+        if item and item.get("target_job_id"):
+            resolved = str(item["target_job_id"])
+            _ACTION_TOKEN_CACHE[val] = resolved
+            _JOB_ID_TO_TOKEN_CACHE[resolved] = val
+            return resolved
+    except Exception as e:
+        logger.error("GET_ACTION_TOKEN_ERROR: %s", str(e))
+        raise
+
+    if re.fullmatch(r"[0-9a-f]{12}", val):
+        if not table.get_item(Key={"job_id": val}, ConsistentRead=True).get("Item"):
+            raise ValueError("Review button expired. Open a fresh job card.")
+    return val
+
+
+def _get_callback_state(callback_query_id: str) -> dict | None:
+    """Check both in-memory cache and DynamoDB for callback processing state."""
+    if not callback_query_id:
+        return None
+    try:
+        item = table.get_item(Key={"job_id": f"cb:{callback_query_id}"}, ConsistentRead=True).get("Item")
+        if item:
+            rec = {
+                "status": item.get("callback_status", "COMPLETED"),
+                "ts": int(item.get("updated_at", 0)),
+                "target_job_id": item.get("target_job_id"),
+                "telegram_chat_id": item.get("telegram_chat_id"),
+                "claim_owner": item.get("claim_owner"),
+                "lease_until": int(item.get("lease_until", 0)),
+                "action_data": item.get("action_data"),
+                "initial_review_unset": bool(item.get("initial_review_unset", False)),
+            }
+            _CALLBACK_STATES[callback_query_id] = rec
+            _PROCESSED_CALLBACK_IDS[callback_query_id] = rec["ts"]
+            return rec
+    except Exception as e:
+        logger.error("GET_CALLBACK_STATE_ERROR: %s", str(e))
+        raise
+    return None
+
+
+def _claim_callback(callback_query_id: str, chat_id: str, action_data: str, context: Any) -> tuple[str, str | None]:
+    """Atomically claim a callback and pin its review target before any action."""
+    previous = _get_callback_state(callback_query_id)
+    now = int(time.time())
+    if previous:
+        if previous["status"] == "COMPLETED":
+            return "duplicate", None
+        if previous["status"] == "IN_PROGRESS" and previous["lease_until"] > now:
+            return "busy", None
+        if previous.get("action_data") and previous["action_data"] != action_data:
+            return "invalid", None
+
+    parts = action_data.split(":")
+    action = parts[1].strip().lower() if len(parts) > 1 and parts[0] == "cmd" else ""
+    raw_target = parts[2].strip() if len(parts) > 2 else ""
+    target = previous.get("target_job_id") if previous else None
+    initial_review_unset = previous.get("initial_review_unset", False) if previous else False
+    if previous and not target and action in {"apply", "skip"}:
+        # Legacy FAILED callbacks without identity must not select a new active job.
+        return "invalid", None
+    if not target and raw_target and action in {"apply", "skip", "why", "draft", "next"}:
+        target = _resolve_action_token(raw_target)
+    if not target and action in {"apply", "skip", "next"}:
+        target = _get_active_review_job_id(chat_id)
+        if not target:
+            initial_review_unset = action == "next"
+            jobs = _get_pending_jobs(limit=1)
+            target = jobs[0]["job_id"] if jobs else None
+        if not target and action in {"apply", "skip"}:
+            return "invalid", None
+
+    owner = uuid.uuid4().hex
+    remaining = getattr(context, "get_remaining_time_in_millis", lambda: 900000)()
+    lease_seconds = max(120, int(remaining / 1000) + 30)
+    item = {
+        "job_id": f"cb:{callback_query_id}", "entity_type": "telegram_callback",
+        "callback_status": "IN_PROGRESS", "telegram_chat_id": str(chat_id),
+        "updated_at": now, "lease_until": now + lease_seconds,
+        "claim_owner": owner, "action_data": action_data,
+    }
+    if target:
+        item["target_job_id"] = target
+    if initial_review_unset:
+        item["initial_review_unset"] = True
+    if previous:
+        old_owner = previous.get("claim_owner")
+        condition = "#state = :old_state AND #updated = :old_updated"
+        values = {":old_state": previous["status"], ":old_updated": previous["ts"]}
+        if old_owner:
+            condition += " AND claim_owner = :old_owner"
+            values[":old_owner"] = old_owner
+        else:
+            condition += " AND attribute_not_exists(claim_owner)"
+        names = {"#state": "callback_status", "#updated": "updated_at"}
+    else:
+        condition, values, names = "attribute_not_exists(job_id)", None, None
+    try:
+        kwargs = {"Item": item, "ConditionExpression": condition}
+        if values:
+            kwargs["ExpressionAttributeValues"] = values
+        if names:
+            kwargs["ExpressionAttributeNames"] = names
+        table.put_item(**kwargs)
+    except Exception as e:
+        if "ConditionalCheckFailed" in type(e).__name__ or "ConditionalCheckFailed" in str(e):
+            current = _get_callback_state(callback_query_id)
+            return ("duplicate" if current and current["status"] == "COMPLETED" else "busy"), None
+        raise
+    _CALLBACK_STATES[callback_query_id] = {"status": "IN_PROGRESS", "ts": now,
+        "target_job_id": target, "claim_owner": owner, "lease_until": now + lease_seconds}
+    _PROCESSED_CALLBACK_IDS[callback_query_id] = now
+    return "claimed", owner
+
+
+def _record_callback_state(
+    callback_query_id: str,
+    status: str,
+    chat_id: str = "",
+    target_job_id: str | None = None,
+    action: str = "",
+) -> None:
+    """Finish the owned callback without replacing its pinned target."""
+    if not callback_query_id:
+        return
+    active = _ACTIVE_CALLBACK_CLAIM.get()
+    if not active or active[0] != callback_query_id:
+        raise RuntimeError("Callback completion attempted without ownership")
+    table.update_item(
+        Key={"job_id": f"cb:{callback_query_id}"},
+        UpdateExpression="SET #state = :state, updated_at = :updated",
+        ConditionExpression="claim_owner = :owner AND #state = :in_progress",
+        ExpressionAttributeNames={"#state": "callback_status"},
+        ExpressionAttributeValues={":state": status, ":updated": int(time.time()),
+                                   ":owner": active[1], ":in_progress": "IN_PROGRESS"},
+    )
+    _CALLBACK_STATES.pop(callback_query_id, None)
+    _PROCESSED_CALLBACK_IDS.pop(callback_query_id, None)
+
+
+def _is_duplicate_callback(callback_query_id: str) -> bool:
+    """Check if callback query was already completed or currently in-progress."""
+    if not callback_query_id:
+        return False
+    rec = _get_callback_state(callback_query_id)
+    if not rec:
+        return False
+    status = rec.get("status")
+    if status == "COMPLETED":
+        return True
+    if status == "IN_PROGRESS":
+        now = time.time()
+        if rec.get("lease_until", 0) > now:
+            return True
+    return False
+
+
+def _clear_processed_callback(callback_query_id: str) -> None:
+    """Clear only local hints; never delete durable callback ownership."""
+    if not callback_query_id:
+        return
+    _CALLBACK_STATES.pop(callback_query_id, None)
+    _PROCESSED_CALLBACK_IDS.pop(callback_query_id, None)
 
 
 class DecimalEncoder(json.JSONEncoder):
@@ -121,7 +348,8 @@ def _is_synthetic_job(job: dict) -> bool:
     if source in {"showcase", "tejajob"} and ENABLE_PRACTICE_MODE:
         return False
     return bool(
-        entity_type == "telegram_review_session"
+        entity_type in {"telegram_review_session", "telegram_callback", "telegram_action_token"}
+        or str(job.get("job_id", "")).startswith(("telegram_session_", "cb:", "tok:"))
         or source in {"signal_test", "tejajob", "showcase"}
         or job.get("signal_test")
         or model_id == "showcase-seed"
@@ -150,6 +378,12 @@ def _source_label(job: dict) -> str:
         return "JSearch RapidAPI"
     if source == "adzuna":
         return "Adzuna Jobs API"
+    if source == "greenhouse":
+        return "Greenhouse Job Board"
+    if source == "lever":
+        return "Lever Postings"
+    if source == "ashby":
+        return "Ashby Job Board"
     return source or "unknown"
 
 
@@ -274,9 +508,50 @@ def _telegram_request(bot_token: str, method: str, payload: dict) -> bool:
         with urllib.request.urlopen(req, timeout=10) as response:
             result = json.loads(response.read().decode())
             return result.get("ok", False)
+    except urllib.error.HTTPError as e:
+        # Telegram's response body contains the actionable reason (for example,
+        # message-too-long), but never log credentials or the full message.
+        try:
+            reason = e.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            reason = "unavailable"
+        if method == "editMessageText" and e.code == 400:
+            try:
+                description = str(json.loads(reason).get("description", "")).lower()
+            except (ValueError, AttributeError):
+                description = ""
+            if "message is not modified" in description:
+                return True
+        logger.error(
+            "TELEGRAM_%s_ERROR: HTTP %s reason=%s payload_chars=%s",
+            method.upper(), e.code, reason, len(str(payload.get("text", ""))),
+        )
+        return False
     except Exception as e:
         logger.error("TELEGRAM_%s_ERROR: %s", method.upper(), str(e))
         return False
+
+
+def _split_telegram_text(text: str, limit: int = TELEGRAM_SAFE_MESSAGE_CHARS) -> list[str]:
+    """Split long Telegram messages without breaking line-oriented job records."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if current and len(current) + len(line) > limit:
+            chunks.append(current.rstrip())
+            current = ""
+        while len(line) > limit:
+            if current:
+                chunks.append(current.rstrip())
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        current += line
+    if current:
+        chunks.append(current.rstrip())
+    return chunks or [text[:limit]]
 
 
 def _send_telegram(
@@ -287,12 +562,24 @@ def _send_telegram(
     reply_markup: dict | None = None,
 ) -> bool:
     """Send a Telegram message. Returns True on success."""
-    payload = {"chat_id": chat_id, "text": text}
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return _telegram_request(bot_token, "sendMessage", payload)
+    chunks = _split_telegram_text(text)
+    for index, chunk in enumerate(chunks):
+        payload = {"chat_id": chat_id, "text": chunk}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        # Keep the keyboard on the final message so the user has one clear
+        # action surface after a multi-part List or Status response.
+        if reply_markup and index == len(chunks) - 1:
+            payload["reply_markup"] = reply_markup
+        if not _telegram_request(bot_token, "sendMessage", payload):
+            if _ACTIVE_CALLBACK_CLAIM.get():
+                _CALLBACK_DELIVERY_FAILED.set(True)
+            logger.error(
+                "TELEGRAM_MESSAGE_DELIVERY_FAILED part=%s/%s chars=%s",
+                index + 1, len(chunks), len(chunk),
+            )
+            return False
+    return True
 
 
 def _edit_telegram_message(
@@ -309,7 +596,10 @@ def _edit_telegram_message(
         payload["parse_mode"] = parse_mode
     if reply_markup:
         payload["reply_markup"] = reply_markup
-    return _telegram_request(bot_token, "editMessageText", payload)
+    delivered = _telegram_request(bot_token, "editMessageText", payload)
+    if not delivered and _ACTIVE_CALLBACK_CLAIM.get():
+        _CALLBACK_DELIVERY_FAILED.set(True)
+    return delivered
 
 
 def _answer_callback_query(bot_token: str, callback_query_id: str, text: str | None = None) -> bool:
@@ -670,10 +960,31 @@ def _job_index_by_id(jobs: list[dict], job_id: str) -> int | None:
     return None
 
 
+def _sanitize_event_for_logging(event: Any) -> Any:
+    """Recursively scrub secrets and sensitive authentication headers from event dict before logging."""
+    if not isinstance(event, dict):
+        return event
+    sanitized = {}
+    sensitive_substrings = ("token", "secret", "authorization", "auth", "key", "password", "signature")
+    for k, v in event.items():
+        k_lower = str(k).lower()
+        if any(sens in k_lower for sens in sensitive_substrings):
+            sanitized[k] = "[REDACTED]"
+        elif isinstance(v, dict):
+            sanitized[k] = _sanitize_event_for_logging(v)
+        elif isinstance(v, list):
+            sanitized[k] = [
+                _sanitize_event_for_logging(item) if isinstance(item, dict) else item
+                for item in v
+            ]
+        else:
+            sanitized[k] = v
+    return sanitized
+
+
 def _resolve_review_job(chat_id: str, jobs: list[dict], index: int | None = None) -> tuple[dict | None, int | None]:
     """Resolve an explicit index or the chat's active review job."""
     if not jobs:
-        _clear_active_review_job(chat_id)
         return None, None
 
     if index is not None:
@@ -684,12 +995,21 @@ def _resolve_review_job(chat_id: str, jobs: list[dict], index: int | None = None
         return job, index
 
     active_job_id = _get_active_review_job_id(chat_id)
-    active_idx = _job_index_by_id(jobs, active_job_id) if active_job_id else None
-    if active_idx is None:
-        job = jobs[0]
-        _set_active_review_job(chat_id, job["job_id"])
-        return job, 1
-    return jobs[active_idx], active_idx + 1
+    if active_job_id:
+        active_idx = _job_index_by_id(jobs, active_job_id)
+        if active_idx is not None:
+            return jobs[active_idx], active_idx + 1
+        # Active job was set, but it is no longer pending in jobs (already applied/rejected).
+        # Fetch it from table so caller can see its processed status, but DO NOT advance to jobs[0]!
+        processed_job = table.get_item(Key={"job_id": active_job_id}).get("Item")
+        if processed_job:
+            return processed_job, None
+        return None, None
+
+    # Initial session: no active job has ever been viewed or acted on; initialize to jobs[0]
+    job = jobs[0]
+    _set_active_review_job(chat_id, job["job_id"])
+    return job, 1
 
 
 def _advance_review_job(chat_id: str, jobs: list[dict]) -> tuple[dict | None, int | None, bool]:
@@ -757,13 +1077,41 @@ def _get_pipeline_stats() -> dict:
         return stats
 
 
-def _update_job_status(job_id: str, new_status: str) -> None:
-    table.update_item(
-        Key={"job_id": job_id},
-        UpdateExpression="SET #s = :s, status_updated_at = :t",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": new_status, ":t": int(time.time())},
-    )
+def _update_job_status(job_id: str, new_status: str, expected_status: str | None = None) -> bool:
+    try:
+        kwargs = {
+            "Key": {"job_id": job_id},
+            "UpdateExpression": "SET #s = :s, status_updated_at = :t",
+            "ExpressionAttributeNames": {"#s": "status"},
+            "ExpressionAttributeValues": {":s": new_status, ":t": int(time.time())},
+        }
+        if expected_status:
+            kwargs["ConditionExpression"] = "attribute_exists(job_id) AND #s = :expected"
+            kwargs["ExpressionAttributeValues"][":expected"] = expected_status
+        table.update_item(**kwargs)
+        return True
+    except Exception as e:
+        if "ConditionalCheckFailed" in type(e).__name__ or "ConditionalCheckFailed" in str(e):
+            logger.warning("CONDITIONAL_CHECK_FAILED | job_id=%s | expected=%s", job_id, expected_status)
+            return False
+        logger.error("UPDATE_STATUS_ERROR | job_id=%s | error=%s", job_id, str(e))
+        raise
+
+
+def _record_delivery_status(job_id: str, success: bool, error: str = "") -> None:
+    """Track Telegram delivery outcome separately on the DynamoDB job row."""
+    try:
+        table.update_item(
+            Key={"job_id": job_id},
+            UpdateExpression="SET delivery_status = :ds, delivery_attempted_at = :dt, delivery_error = :de",
+            ExpressionAttributeValues={
+                ":ds": "DELIVERED" if success else "DELIVERY_FAILED",
+                ":dt": int(time.time()),
+                ":de": str(error)[:200] if not success else "",
+            },
+        )
+    except Exception as e:
+        logger.warning("FAILED_TO_RECORD_DELIVERY_STATUS | job_id=%s | %s", job_id, str(e))
 
 
 def _record_application_outcome(job_id: str, outcome: str, reason: str = "") -> str:
@@ -795,7 +1143,7 @@ def _record_application_outcome(job_id: str, outcome: str, reason: str = "") -> 
     return status
 
 
-def _record_review_feedback(job_id: str, sentiment: str, reason: str = "") -> str:
+def _record_review_feedback(job_id: str, sentiment: str, reason: str = "") -> str | None:
     """Persist the user's review preference while preserving apply outcome semantics."""
     now = int(time.time())
     new_status = "NOT_INTERESTED" if sentiment == "not_interested" else "PENDING_APPROVAL"
@@ -808,18 +1156,27 @@ def _record_review_feedback(job_id: str, sentiment: str, reason: str = "") -> st
         ":t": now,
         ":sentiment": sentiment,
         ":source": "telegram",
+        ":expected": "PENDING_APPROVAL",
     }
     if reason:
         update_expr += ", user_feedback_reason = :reason"
         expr_vals[":reason"] = reason[:500]
 
-    table.update_item(
-        Key={"job_id": job_id},
-        UpdateExpression=update_expr,
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues=expr_vals,
-    )
-    return new_status
+    try:
+        table.update_item(
+            Key={"job_id": job_id},
+            UpdateExpression=update_expr,
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues=expr_vals,
+            ConditionExpression="attribute_exists(job_id) AND #s = :expected",
+        )
+        return new_status
+    except Exception as e:
+        if "ConditionalCheckFailed" in type(e).__name__ or "ConditionalCheckFailed" in str(e):
+            logger.warning("CONDITIONAL_CHECK_FAILED | job_id=%s | review_feedback", job_id)
+            return None
+        logger.error("UPDATE_REVIEW_FEEDBACK_ERROR | job_id=%s | error=%s", job_id, str(e))
+        raise
 
 
 def _format_posted(posted_at: str) -> str:
@@ -966,20 +1323,22 @@ def _reason_bullets(reason: str, limit: int = 3) -> list[str]:
     return parts[:limit]
 
 
-def _build_review_card_keyboard() -> dict:
-    """Focused inline keyboard for reviewing one match at a time."""
+def _build_review_card_keyboard(job_id: str | None = None) -> dict:
+    """Focused inline keyboard for reviewing one match at a time, bound to immutable compact token."""
+    token = _get_or_create_action_token(job_id) if job_id else ""
+    suffix = f":{token}" if token else ""
     return {
         "inline_keyboard": [
             [
-                {"text": "Why", "callback_data": "cmd:why"},
-                {"text": "Draft", "callback_data": "cmd:draft"},
-                {"text": "✓ Apply", "callback_data": "cmd:apply"},
-                {"text": "Skip", "callback_data": "cmd:skip"},
+                {"text": "Why", "callback_data": f"cmd:why{suffix}"},
+                {"text": "Draft", "callback_data": f"cmd:draft{suffix}"},
+                {"text": "✓ Apply", "callback_data": f"cmd:apply{suffix}"},
+                {"text": "Skip", "callback_data": f"cmd:skip{suffix}"},
             ],
             [
-                {"text": "→ Next Match", "callback_data": "cmd:next"},
+                {"text": "→ Next Match", "callback_data": f"cmd:next{suffix}"},
             ],
-        ]
+        ],
     }
 
 
@@ -1206,55 +1565,171 @@ def _handle_backlog(bot_token: str, chat_id: str) -> None:
     _send_telegram(bot_token, chat_id, "\n".join(lines), reply_markup=_build_state_keyboard("more"))
 
 
-def _handle_apply(bot_token: str, chat_id: str, index: int | None = None) -> None:
+def _handle_apply(
+    bot_token: str,
+    chat_id: str,
+    index: int | None = None,
+    target_job_id: str | None = None,
+    callback_query_id: str | None = None,
+) -> None:
     """Move a reviewable job to manual follow-up. Telegram never sends email here."""
-    jobs = _get_pending_jobs(limit=20)
+    if target_job_id:
+        job = table.get_item(Key={"job_id": target_job_id}).get("Item")
+        if not job:
+            _send_telegram(bot_token, chat_id, "Job not found. Use 'list' to view pending matches.")
+            return
+        resolved_index = None
+    elif index is not None:
+        jobs = _get_pending_jobs(limit=20)
+        if not jobs:
+            empty_msg = (
+                "Your review queue is empty.\n\nUse tejajob to practice the workflow, or search jobs to scan live sources."
+                if ENABLE_PRACTICE_MODE
+                else
+                "Your review queue is empty.\n\nUse search jobs to scan live sources, then list to review real matches."
+            )
+            _send_telegram(
+                bot_token,
+                chat_id,
+                empty_msg,
+                reply_markup=_build_state_keyboard("home"),
+            )
+            return
 
-    if not jobs:
-        empty_msg = (
-            "Your review queue is empty.\n\nUse tejajob to practice the workflow, or search jobs to scan live sources."
-            if ENABLE_PRACTICE_MODE
-            else
-            "Your review queue is empty.\n\nUse search jobs to scan live sources, then list to review real matches."
-        )
-        _send_telegram(
-            bot_token,
-            chat_id,
-            empty_msg,
-            reply_markup=_build_state_keyboard("home"),
-        )
-        return
+        if index < 1 or index > len(jobs):
+            _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+            return
 
-    if index is not None and (index < 1 or index > len(jobs)):
-        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
-        return
+        job = jobs[index - 1]
+        resolved_index = index
+        _set_active_review_job(chat_id, job["job_id"])
+    else:
+        active_job_id = _get_active_review_job_id(chat_id)
+        if active_job_id:
+            active_job = table.get_item(Key={"job_id": active_job_id}).get("Item")
+            if active_job:
+                status = active_job.get("status")
+                if status == "MANUAL_APPLY":
+                    job = active_job
+                    resolved_index = None
+                elif status == "PENDING_APPROVAL":
+                    job = active_job
+                    jobs = _get_pending_jobs(limit=20)
+                    idx = _job_index_by_id(jobs, active_job_id)
+                    resolved_index = (idx + 1) if idx is not None else 1
+                else:
+                    _send_telegram(
+                        bot_token,
+                        chat_id,
+                        "The active match was already processed. Use 'next' to review the next match, or 'list' to view pending matches.",
+                    )
+                    return
+            else:
+                jobs = _get_pending_jobs(limit=20)
+                if not jobs:
+                    empty_msg = (
+                        "Your review queue is empty.\n\nUse tejajob to practice the workflow, or search jobs to scan live sources."
+                        if ENABLE_PRACTICE_MODE
+                        else
+                        "Your review queue is empty.\n\nUse search jobs to scan live sources, then list to review real matches."
+                    )
+                    _send_telegram(
+                        bot_token,
+                        chat_id,
+                        empty_msg,
+                        reply_markup=_build_state_keyboard("home"),
+                    )
+                    return
+                job = jobs[0]
+                resolved_index = 1
+                _set_active_review_job(chat_id, job["job_id"])
+        else:
+            jobs = _get_pending_jobs(limit=20)
+            if not jobs:
+                empty_msg = (
+                    "Your review queue is empty.\n\nUse tejajob to practice the workflow, or search jobs to scan live sources."
+                    if ENABLE_PRACTICE_MODE
+                    else
+                    "Your review queue is empty.\n\nUse search jobs to scan live sources, then list to review real matches."
+                )
+                _send_telegram(
+                    bot_token,
+                    chat_id,
+                    empty_msg,
+                    reply_markup=_build_state_keyboard("home"),
+                )
+                return
+            job = jobs[0]
+            resolved_index = 1
+            _set_active_review_job(chat_id, job["job_id"])
 
-    job, resolved_index = _resolve_review_job(chat_id, jobs, index)
-    if not job or resolved_index is None:
-        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
-        return
     job_id = job["job_id"]
     recruiter = (job.get("recruiter_email") or "").strip()
     source_url = _source_url(job)
     is_practice = job.get("source") == "tejajob"
 
     if not is_practice and not source_url:
+        item_ref = f"match #{resolved_index}" if resolved_index else job.get("company", "this role")
         _send_telegram(
             bot_token,
             chat_id,
-            f"Blocked: match #{resolved_index} ({job.get('company', 'Unknown')}) has no verifiable source link.",
+            f"Blocked: {item_ref} ({job.get('company', 'Unknown')}) has no verifiable source link.",
         )
         return
 
     current = table.get_item(Key={"job_id": job_id}).get("Item", {})
-    if current.get("status") != "PENDING_APPROVAL":
-        _send_telegram(bot_token, chat_id, f"Job already {current.get('status', 'processed')}. Use 'list' to refresh.")
+    status = current.get("status")
+
+    if status == "MANUAL_APPLY":
+        # Idempotent re-delivery: re-send follow-up details without altering state or affecting other jobs
+        contact_line = f"Contact: {recruiter}" if recruiter else "Contact: no recruiter email found"
+        msg = (
+            f"Manual follow-up already selected (re-delivered):\n\n"
+            f"Role: {job.get('title', 'Unknown')}\n"
+            f"Company: {job.get('company', 'Unknown')}\n"
+            f"Match: {job.get('match_score', '?')}%\n"
+            f"Work mode: {'⚠️ ' if _is_work_mode_uncertain(job) else ''}{_work_mode_label(job)}\n"
+            f"Work mode evidence: {_work_mode_evidence(job)}\n"
+            f"Source: {_source_label(job)}\n"
+            f"Source link: {source_url or 'No source link stored'}\n"
+            f"{contact_line}\n\n"
+            "No email was sent from Telegram. Review the source and send manually if it is a real fit.\n\n"
+            "After you act, reply applied. If you decide not to apply, reply not applied <reason>."
+        )
+        delivery_ok = _send_telegram(bot_token, chat_id, msg)
+        _record_delivery_status(job_id, delivery_ok, "" if delivery_ok else "telegram send failed")
+        if callback_query_id:
+            if delivery_ok:
+                _record_callback_state(callback_query_id, "COMPLETED", chat_id=chat_id, target_job_id=job_id)
+            else:
+                _record_callback_state(callback_query_id, "FAILED", chat_id=chat_id, target_job_id=job_id)
+        return
+
+    if status != "PENDING_APPROVAL":
+        _send_telegram(
+            bot_token,
+            chat_id,
+            f"Job already {status or 'processed'}. Old cards do not affect current matches. Use 'list' to refresh.",
+        )
+        return
+
+    if not is_practice and not _is_reviewable_job(job):
+        reason_msg = _hidden_pending_reason(job)
+        _send_telegram(
+            bot_token,
+            chat_id,
+            f"Blocked: this role is not reviewable ({reason_msg}).",
+        )
         return
 
     if is_practice:
-        _update_job_status(job_id, "SHOWCASE_COMPLETE")
-        _refresh_active_review_job(chat_id)
-        _send_telegram(
+        updated = _update_job_status(job_id, "SHOWCASE_COMPLETE", expected_status="PENDING_APPROVAL")
+        if not updated:
+            _send_telegram(bot_token, chat_id, "Practice job was already updated.")
+            return
+        if _get_active_review_job_id(chat_id) == job_id:
+            _clear_active_review_job(chat_id)
+        delivery_ok = _send_telegram(
             bot_token,
             chat_id,
             f"Practice workflow completed.\n\n"
@@ -1264,14 +1739,21 @@ def _handle_apply(bot_token: str, chat_id: str, index: int | None = None) -> Non
             "No real application was submitted and no email was sent.\n"
             "Use tejajob anytime to reset the practice opportunity.",
         )
+        if callback_query_id:
+            _record_callback_state(callback_query_id, "COMPLETED" if delivery_ok else "FAILED", chat_id=chat_id, target_job_id=job_id)
         return
 
-    _update_job_status(job_id, "MANUAL_APPLY")
-    _refresh_active_review_job(chat_id)
+    updated = _update_job_status(job_id, "MANUAL_APPLY", expected_status="PENDING_APPROVAL")
+    if not updated:
+        _send_telegram(
+            bot_token,
+            chat_id,
+            "Job was updated concurrently or already processed. Use 'list' to refresh.",
+        )
+        return
+
     contact_line = f"Contact: {recruiter}" if recruiter else "Contact: no recruiter email found"
-    _send_telegram(
-        bot_token,
-        chat_id,
+    msg = (
         f"Manual follow-up selected.\n\n"
         f"Role: {job.get('title', 'Unknown')}\n"
         f"Company: {job.get('company', 'Unknown')}\n"
@@ -1283,8 +1765,16 @@ def _handle_apply(bot_token: str, chat_id: str, index: int | None = None) -> Non
         f"{contact_line}\n\n"
         "No email was sent from Telegram. Review the source and send manually if it is a real fit.\n"
         "I moved it out of the active queue so it will not keep reappearing in list.\n\n"
-        "After you act, reply applied. If you decide not to apply, reply not applied <reason>.",
+        "After you act, reply applied. If you decide not to apply, reply not applied <reason>."
     )
+    delivery_ok = _send_telegram(bot_token, chat_id, msg)
+    _record_delivery_status(job_id, delivery_ok, "" if delivery_ok else "telegram send failed")
+    if callback_query_id:
+        if delivery_ok:
+            _record_callback_state(callback_query_id, "COMPLETED", chat_id=chat_id, target_job_id=job_id)
+        else:
+            logger.error("TELEGRAM_DELIVERY_FAILED | job_id=%s", job_id)
+            _record_callback_state(callback_query_id, "FAILED", chat_id=chat_id, target_job_id=job_id)
 
 
 def _handle_followups(bot_token: str, chat_id: str) -> None:
@@ -1374,8 +1864,15 @@ def _handle_review_feedback(
         _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
         return
     status = _record_review_feedback(job["job_id"], sentiment, reason)
+    if not status:
+        _send_telegram(
+            bot_token,
+            chat_id,
+            "Job was updated concurrently or already processed. Use 'list' to refresh.",
+        )
+        return
     if sentiment == "not_interested":
-        _refresh_active_review_job(chat_id)
+        _set_active_review_job(chat_id, job["job_id"])
     label = {
         "interested": "interested",
         "not_interested": "not interested",
@@ -1398,37 +1895,110 @@ def _handle_review_feedback(
     )
 
 
-def _handle_explain(bot_token: str, chat_id: str, index: int | None = None) -> None:
+def _handle_explain(
+    bot_token: str,
+    chat_id: str,
+    index: int | None = None,
+    target_job_id: str | None = None,
+) -> None:
     """Explain why a job is in the review queue."""
-    jobs = _get_pending_jobs(limit=20)
-    if not jobs:
-        msg = (
-            "Your review queue is empty. Use tejajob or search jobs to add matches."
-            if ENABLE_PRACTICE_MODE
-            else
-            "Your review queue is empty. Use search jobs to scan live sources."
-        )
-        _send_telegram(bot_token, chat_id, msg)
-        return
-    if index is not None and (index < 1 or index > len(jobs)):
-        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
-        return
+    if target_job_id:
+        job = table.get_item(Key={"job_id": target_job_id}).get("Item")
+        if not job:
+            _send_telegram(bot_token, chat_id, "Job not found. Use 'list' to view pending matches.")
+            return
+        if not _is_practice_job(job) and not _is_reviewable_job(job):
+            reason_msg = _hidden_pending_reason(job)
+            _send_telegram(bot_token, chat_id, f"Blocked: this role is not reviewable ({reason_msg}).")
+            return
+        resolved_index = 1
+    else:
+        jobs = _get_pending_jobs(limit=20)
+        if not jobs:
+            msg = (
+                "Your review queue is empty. Use tejajob or search jobs to add matches."
+                if ENABLE_PRACTICE_MODE
+                else
+                "Your review queue is empty. Use search jobs to scan live sources."
+            )
+            _send_telegram(bot_token, chat_id, msg)
+            return
+        if index is not None and (index < 1 or index > len(jobs)):
+            _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+            return
 
-    job, resolved_index = _resolve_review_job(chat_id, jobs, index)
-    if not job or resolved_index is None:
-        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
-        return
+        job, resolved_index = _resolve_review_job(chat_id, jobs, index)
+        if not job or resolved_index is None:
+            _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+            return
 
     source_url = _source_url(job)
     if not _is_practice_job(job) and not source_url:
+        item_ref = f"match #{resolved_index}" if resolved_index else job.get("company", "this role")
         _send_telegram(
             bot_token,
             chat_id,
-            f"Blocked: match #{resolved_index} ({job.get('company', 'Unknown')}) has no verifiable source link.",
+            f"Blocked: {item_ref} ({job.get('company', 'Unknown')}) has no verifiable source link.",
         )
         return
 
-    _send_telegram(bot_token, chat_id, _format_job_explanation(job, resolved_index))
+    _send_telegram(
+        bot_token,
+        chat_id,
+        _format_job_explanation(job, resolved_index),
+        reply_markup=_build_review_card_keyboard(job.get("job_id")),
+    )
+
+
+def _handle_skip(
+    bot_token: str,
+    chat_id: str,
+    target_job_id: str | None = None,
+    reason: str = "Skipped from review button",
+    callback_query_id: str | None = None,
+) -> None:
+    """Skip a reviewable job and record feedback."""
+    if target_job_id:
+        job = table.get_item(Key={"job_id": target_job_id}).get("Item")
+        if not job:
+            _send_telegram(bot_token, chat_id, "Job not found. Use 'list' to refresh.")
+            return
+        if job.get("status") != "PENDING_APPROVAL":
+            _send_telegram(
+                bot_token,
+                chat_id,
+                f"Job already {job.get('status', 'processed')}. Old cards do not affect current matches. Use 'list' to refresh.",
+            )
+            return
+        if not _is_practice_job(job) and not _is_reviewable_job(job):
+            reason_msg = _hidden_pending_reason(job)
+            _send_telegram(bot_token, chat_id, f"Blocked: this role is not reviewable ({reason_msg}).")
+            return
+        status = _record_review_feedback(target_job_id, "not_interested", reason)
+        if not status:
+            _send_telegram(
+                bot_token,
+                chat_id,
+                "Job was updated concurrently or already processed. Use 'list' to refresh.",
+            )
+            return
+
+        _send_telegram(
+            bot_token,
+            chat_id,
+            f"Recorded: not interested.\n\n"
+            f"Role: {job.get('title', 'Unknown')}\n"
+            f"Company: {job.get('company', 'Unknown')}\n"
+            f"Stored status: {status}\nReason: {reason}\n\n"
+            "I removed it from the active review queue. Use next to continue.",
+        )
+        if callback_query_id:
+            _record_callback_state(callback_query_id, "COMPLETED", chat_id=chat_id, target_job_id=target_job_id)
+        return
+    _handle_review_feedback(bot_token, chat_id, "not_interested", None, reason)
+    if callback_query_id:
+        active_id = _get_active_review_job_id(chat_id)
+        _record_callback_state(callback_query_id, "COMPLETED", chat_id=chat_id, target_job_id=active_id)
 
 
 def _handle_next(bot_token: str, chat_id: str) -> None:
@@ -1458,7 +2028,7 @@ def _handle_next(bot_token: str, chat_id: str) -> None:
             bot_token,
             chat_id,
             _format_next_review_card(job) + "\n\nYou are already on the last reviewable match.",
-            reply_markup=_build_state_keyboard("review"),
+            reply_markup=_build_review_card_keyboard(job.get("job_id")),
         )
         return
 
@@ -1466,37 +2036,54 @@ def _handle_next(bot_token: str, chat_id: str) -> None:
         bot_token,
         chat_id,
         _format_next_review_card(job),
-        reply_markup=_build_state_keyboard("review"),
+        reply_markup=_build_review_card_keyboard(job.get("job_id")),
     )
 
 
-def _handle_draft(bot_token: str, chat_id: str, index: int | None = None) -> None:
+def _handle_draft(
+    bot_token: str,
+    chat_id: str,
+    index: int | None = None,
+    target_job_id: str | None = None,
+) -> None:
     """Generate a preview-only outreach draft for a reviewable job."""
-    jobs = _get_pending_jobs(limit=20)
-    if not jobs:
-        msg = (
-            "Your review queue is empty. Use tejajob or search jobs to add matches."
-            if ENABLE_PRACTICE_MODE
-            else
-            "Your review queue is empty. Use search jobs to scan live sources."
-        )
-        _send_telegram(bot_token, chat_id, msg)
-        return
-    if index is not None and (index < 1 or index > len(jobs)):
-        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
-        return
+    if target_job_id:
+        job = table.get_item(Key={"job_id": target_job_id}).get("Item")
+        if not job:
+            _send_telegram(bot_token, chat_id, "Job not found. Use 'list' to view pending matches.")
+            return
+        if not _is_practice_job(job) and not _is_reviewable_job(job):
+            reason_msg = _hidden_pending_reason(job)
+            _send_telegram(bot_token, chat_id, f"Blocked: this role is not reviewable ({reason_msg}).")
+            return
+        resolved_index = 1
+    else:
+        jobs = _get_pending_jobs(limit=20)
+        if not jobs:
+            msg = (
+                "Your review queue is empty. Use tejajob or search jobs to add matches."
+                if ENABLE_PRACTICE_MODE
+                else
+                "Your review queue is empty. Use search jobs to scan live sources."
+            )
+            _send_telegram(bot_token, chat_id, msg)
+            return
+        if index is not None and (index < 1 or index > len(jobs)):
+            _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+            return
 
-    job, resolved_index = _resolve_review_job(chat_id, jobs, index)
-    if not job or resolved_index is None:
-        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
-        return
+        job, resolved_index = _resolve_review_job(chat_id, jobs, index)
+        if not job or resolved_index is None:
+            _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+            return
 
     source_url = _source_url(job)
     if not _is_practice_job(job) and not source_url:
+        item_ref = f"match #{resolved_index}" if resolved_index else job.get("company", "this role")
         _send_telegram(
             bot_token,
             chat_id,
-            f"Blocked: match #{resolved_index} ({job.get('company', 'Unknown')}) has no verifiable source link.",
+            f"Blocked: {item_ref} ({job.get('company', 'Unknown')}) has no verifiable source link.",
         )
         return
     try:
@@ -1527,6 +2114,7 @@ def _handle_draft(bot_token: str, chat_id: str, index: int | None = None) -> Non
             f"{body}{fallback_note}\n\n"
             "No email was sent.\n\n"
             "Next: interested, meh <reason>, apply, skip <reason>, or next.",
+            reply_markup=_build_review_card_keyboard(job.get("job_id")),
         )
     except Exception as e:
         logger.error("DRAFT_PREVIEW_ERROR: %s", str(e))
@@ -1638,7 +2226,7 @@ def _handle_reject(bot_token: str, chat_id: str, index: int | None = None) -> No
         _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
         return
     _update_job_status(job["job_id"], "REJECTED")
-    _refresh_active_review_job(chat_id)
+    _set_active_review_job(chat_id, job["job_id"])
     _send_telegram(bot_token, chat_id, f"Rejected: {job.get('title', 'Unknown')} at {job.get('company', 'Unknown')}")
 
 
@@ -1929,7 +2517,9 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
     _handle_help(bot_token, chat_id)
 
 
-def _handle_callback_command(bot_token: str, chat_id: str, callback_query_id: str, data: str, message_id: int) -> None:
+def _handle_callback_command(bot_token: str, chat_id: str, callback_query_id: str, data: str,
+                             message_id: int, pinned_target: str | None = None,
+                             retrying: bool = False) -> None:
     """Handle Telegram inline button callbacks for help navigation and command shortcuts."""
     if data.startswith("help:"):
         page = data.split(":", 1)[1]
@@ -1938,8 +2528,12 @@ def _handle_callback_command(bot_token: str, chat_id: str, callback_query_id: st
         return
 
     if data.startswith("cmd:"):
-        command = data.split(":", 1)[1]
-        if CONFIRM_SEND_PATTERN.match(command):
+        parts = data.split(":")
+        action = parts[1].strip().lower() if len(parts) > 1 else ""
+        raw_target = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+        target_job_id = pinned_target or (_resolve_action_token(raw_target) if raw_target else None)
+
+        if CONFIRM_SEND_PATTERN.match(action):
             _answer_callback_query(bot_token, callback_query_id, "Type confirm send manually")
             _send_telegram(
                 bot_token,
@@ -1947,7 +2541,53 @@ def _handle_callback_command(bot_token: str, chat_id: str, callback_query_id: st
                 "For safety, confirm send must be typed manually.\n\nType exactly: confirm send 1",
             )
             return
-        _answer_callback_query(bot_token, callback_query_id, f"Running {command}")
+
+        _answer_callback_query(bot_token, callback_query_id, f"Running {action}")
+
+        if action == "apply":
+            _handle_apply(
+                bot_token,
+                chat_id,
+                target_job_id=target_job_id,
+                callback_query_id=callback_query_id,
+            )
+            return
+        if action == "why":
+            _handle_explain(bot_token, chat_id, target_job_id=target_job_id)
+            return
+        if action == "draft":
+            _handle_draft(bot_token, chat_id, target_job_id=target_job_id)
+            return
+        if action == "skip":
+            _handle_skip(
+                bot_token,
+                chat_id,
+                target_job_id=target_job_id,
+                callback_query_id=callback_query_id,
+            )
+            return
+        if action == "next":
+            if retrying and target_job_id:
+                current = _get_active_review_job_id(chat_id)
+                state = _get_callback_state(callback_query_id)
+                if current and (current != target_job_id or (state and state.get("initial_review_unset"))):
+                    # The previous attempt changed the session, but its reply may
+                    # have failed. Re-show that card instead of silently skipping it.
+                    jobs = _get_pending_jobs(limit=20)
+                    current_index = _job_index_by_id(jobs, current)
+                    if current_index is not None:
+                        job = jobs[current_index]
+                        _send_telegram(
+                            bot_token, chat_id, _format_next_review_card(job),
+                            reply_markup=_build_review_card_keyboard(job.get("job_id")),
+                        )
+                    else:
+                        _send_telegram(bot_token, chat_id, "Review queue changed. Use list to refresh.")
+                    return
+            _handle_next(bot_token, chat_id)
+            return
+
+        command = data.split(":", 1)[1]
         _route_command(command, bot_token, chat_id)
         return
 
@@ -1978,7 +2618,7 @@ def lambda_handler(event, context):
     """
     Entry point for both SNS notifications and Telegram webhook commands.
     """
-    logger.info("ROUTER_EVENT: %s", json.dumps(event, default=str)[:500])
+    logger.info("ROUTER_EVENT: %s", json.dumps(_sanitize_event_for_logging(event), default=str)[:500])
 
     secrets = _get_secrets()
     bot_token = secrets.get("TELEGRAM_BOT_TOKEN")
@@ -2003,18 +2643,47 @@ def lambda_handler(event, context):
             secrets.get("TELEGRAM_WEBHOOK_SECRET")
             or os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
         )
-        if expected_secret and not _validate_webhook_secret(event, expected_secret):
-            logger.warning("UNAUTHORIZED_WEBHOOK_SECRET: missing or invalid secret token header")
-            return {"statusCode": 403, "body": "Forbidden: invalid secret token"}
+        if REQUIRE_TELEGRAM_WEBHOOK_SECRET and not expected_secret:
+            logger.error("WEBHOOK_SECRET_REQUIRED_BUT_NOT_CONFIGURED")
+            return {"statusCode": 500, "body": "Webhook secret required but not configured"}
+
+        if expected_secret:
+            if not _validate_webhook_secret(event, expected_secret):
+                logger.warning("UNAUTHORIZED_WEBHOOK_SECRET: missing or invalid secret token header")
+                return {"statusCode": 403, "body": "Forbidden: invalid secret token"}
+        elif REQUIRE_TELEGRAM_WEBHOOK_SECRET:
+            logger.warning("UNAUTHORIZED_WEBHOOK_SECRET: missing secret token header")
+            return {"statusCode": 403, "body": "Forbidden: webhook secret required"}
+
+        raw_body = event["body"]
+        if raw_body is None:
+            logger.warning("MALFORMED_WEBHOOK: body is null")
+            return {"statusCode": 400, "body": "Bad Request: body cannot be null"}
 
         try:
-            body = json.loads(event["body"]) if isinstance(event["body"], str) else event["body"]
+            body = json.loads(raw_body) if isinstance(raw_body, str) else raw_body
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.warning("MALFORMED_WEBHOOK: invalid JSON: %s", str(e))
+            return {"statusCode": 400, "body": "Bad Request: invalid JSON"}
+
+        if not isinstance(body, dict):
+            logger.warning("MALFORMED_WEBHOOK: body is not a JSON object (type=%s)", type(body).__name__)
+            return {"statusCode": 400, "body": "Bad Request: body must be a JSON object"}
+
+        try:
             callback_query = body.get("callback_query")
-            if callback_query:
-                data = callback_query.get("data", "")
-                callback_query_id = callback_query.get("id", "")
-                message = callback_query.get("message", {})
-                incoming_chat_id = str(message.get("chat", {}).get("id", ""))
+            if callback_query is not None:
+                if not isinstance(callback_query, dict):
+                    logger.warning("MALFORMED_WEBHOOK: callback_query is not a JSON object")
+                    return {"statusCode": 400, "body": "Bad Request: callback_query must be a JSON object"}
+
+                data = str(callback_query.get("data") or "")
+                callback_query_id = str(callback_query.get("id") or "")
+                message = callback_query.get("message")
+                if not isinstance(message, dict):
+                    message = {}
+                chat = message.get("chat")
+                incoming_chat_id = str(chat.get("id", "")) if isinstance(chat, dict) else ""
                 message_id = _as_int(message.get("message_id"))
 
                 if incoming_chat_id != str(chat_id):
@@ -2023,22 +2692,76 @@ def lambda_handler(event, context):
 
                 if data and callback_query_id and message_id:
                     logger.info("TELEGRAM_CALLBACK: '%s' from chat %s", data, incoming_chat_id)
-                    _handle_callback_command(bot_token, chat_id, callback_query_id, data, message_id)
+                    try:
+                        previous = _get_callback_state(callback_query_id)
+                        claim_status, owner = _claim_callback(callback_query_id, incoming_chat_id, data, context)
+                    except ValueError as exc:
+                        _answer_callback_query(bot_token, callback_query_id, str(exc))
+                        return {"statusCode": 400, "body": str(exc)}
+                    except Exception:
+                        logger.exception("CALLBACK_CLAIM_UNAVAILABLE")
+                        return {"statusCode": 503, "body": "Callback storage unavailable"}
+                    if claim_status == "duplicate":
+                        _answer_callback_query(bot_token, callback_query_id, "Action already processed")
+                        return {"statusCode": 200, "body": "Duplicate callback ignored"}
+                    if claim_status == "busy":
+                        return {"statusCode": 503, "body": "Callback already in progress; retry later"}
+                    if claim_status == "invalid":
+                        _answer_callback_query(bot_token, callback_query_id, "Open a fresh review card")
+                        return {"statusCode": 400, "body": "Callback target unavailable; open a fresh review card"}
+                    claim_token = _ACTIVE_CALLBACK_CLAIM.set((callback_query_id, owner))
+                    delivery_token = _CALLBACK_DELIVERY_FAILED.set(False)
+                    try:
+                        claimed = _get_callback_state(callback_query_id)
+                        _handle_callback_command(bot_token, chat_id, callback_query_id, data, message_id,
+                                                 pinned_target=claimed.get("target_job_id") if claimed else None,
+                                                 retrying=previous is not None)
+                        if _CALLBACK_DELIVERY_FAILED.get():
+                            action = data.split(":")[1].strip().lower() if data.startswith("cmd:") else ""
+                            retryable = data.startswith("help:") or action in {
+                                "list", "status", "backlog", "followups", "why", "draft", "apply", "skip", "next",
+                            }
+                            if retryable:
+                                raise RuntimeError("Telegram callback reply delivery failed")
+                            logger.error("TELEGRAM_CALLBACK_REPLY_FAILED action=%s; action will not repeat", action)
+                        state_now = _get_callback_state(callback_query_id)
+                        if state_now and state_now.get("status") == "IN_PROGRESS":
+                            _record_callback_state(callback_query_id, "COMPLETED", chat_id=incoming_chat_id, action=data)
+                    except Exception as exc:
+                        try:
+                            state_now = _get_callback_state(callback_query_id)
+                            if state_now and state_now.get("status") == "IN_PROGRESS":
+                                _record_callback_state(callback_query_id, "FAILED", chat_id=incoming_chat_id, action=data)
+                        except Exception:
+                            logger.exception("CALLBACK_FAILURE_RECORD_UNAVAILABLE")
+                        logger.error("CALLBACK_PROCESSING_ERROR: %s", str(exc))
+                        raise
+                    finally:
+                        _CALLBACK_DELIVERY_FAILED.reset(delivery_token)
+                        _ACTIVE_CALLBACK_CLAIM.reset(claim_token)
                 return {"statusCode": 200}
 
-            message = body.get("message", {})
-            user_text = message.get("text", "").strip()
-            incoming_chat_id = str(message.get("chat", {}).get("id", ""))
+            message = body.get("message")
+            if message is not None:
+                if not isinstance(message, dict):
+                    logger.warning("MALFORMED_WEBHOOK: message is not a JSON object")
+                    return {"statusCode": 400, "body": "Bad Request: message must be a JSON object"}
 
-            if incoming_chat_id != str(chat_id):
-                logger.warning("UNAUTHORIZED_CHAT: %s (expected %s)", incoming_chat_id, chat_id)
-                return {"statusCode": 200, "body": "Unauthorized"}
+                raw_text = message.get("text")
+                user_text = str(raw_text).strip() if raw_text is not None else ""
+                chat = message.get("chat")
+                incoming_chat_id = str(chat.get("id", "")) if isinstance(chat, dict) else ""
 
-            if user_text:
-                logger.info("TELEGRAM_CMD: '%s' from chat %s", user_text, incoming_chat_id)
-                _route_command(user_text, bot_token, chat_id)
+                if incoming_chat_id != str(chat_id):
+                    logger.warning("UNAUTHORIZED_CHAT: %s (expected %s)", incoming_chat_id, chat_id)
+                    return {"statusCode": 200, "body": "Unauthorized"}
 
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
+                if user_text:
+                    logger.info("TELEGRAM_CMD: '%s' from chat %s", user_text, incoming_chat_id)
+                    _route_command(user_text, bot_token, chat_id)
+
+        except (KeyError, TypeError, AttributeError) as e:
             logger.error("WEBHOOK_PARSE_ERROR: %s", str(e))
+            return {"statusCode": 400, "body": f"Bad Request: {str(e)}"}
 
     return {"statusCode": 200}

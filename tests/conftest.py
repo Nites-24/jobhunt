@@ -69,6 +69,7 @@ def set_env_vars(monkeypatch):
         "TELEGRAM_SECRET_NAME": "telegram",
         "SENDER_LAMBDA_NAME": "job-sender",
         "INGESTOR_LAMBDA_NAME": "job-ingestor",
+        "REQUIRE_TELEGRAM_WEBHOOK_SECRET": "false",
         # Sender
         "SENDER_EMAIL": "vakateja24@gmail.com",
         "SECRETS_NAME": "jobserch_gmail",
