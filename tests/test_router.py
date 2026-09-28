@@ -1027,6 +1027,27 @@ class TestRouter:
         assert result["statusCode"] == 200
         mock_tg.assert_not_called()  # No response sent
 
+    def test_webhook_without_configured_secret_keeps_legacy_delivery(self, monkeypatch):
+        """An unconfigured production secret must not disable every bot command."""
+        import importlib
+        import os
+        import job_router.lambda_function as mod
+
+        original = os.environ.get("REQUIRE_TELEGRAM_WEBHOOK_SECRET")
+        monkeypatch.delenv("REQUIRE_TELEGRAM_WEBHOOK_SECRET", raising=False)
+        try:
+            importlib.reload(mod)
+            mod, _ = self._setup_infra()
+            assert mod.REQUIRE_TELEGRAM_WEBHOOK_SECRET is False
+            with patch.object(mod, "_send_telegram", return_value=True) as mock_tg:
+                result = mod.lambda_handler(_make_telegram_event("help"), MockContext())
+            assert result["statusCode"] == 200
+            mock_tg.assert_called_once()
+        finally:
+            if original is not None:
+                monkeypatch.setenv("REQUIRE_TELEGRAM_WEBHOOK_SECRET", original)
+            importlib.reload(mod)
+
     @patch("job_router.lambda_function._send_telegram")
     def test_webhook_secret_missing_rejected(self, mock_tg):
         """When TELEGRAM_WEBHOOK_SECRET is set, requests without the header must be rejected with 403."""

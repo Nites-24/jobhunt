@@ -51,7 +51,7 @@ HN_MAX_JOB_AGE_DAYS = int(os.environ.get("HN_MAX_JOB_AGE_DAYS", "3"))
 LIST_FETCH_LIMIT = int(os.environ.get("LIST_FETCH_LIMIT", "100"))
 ENABLE_PRACTICE_MODE = os.environ.get("ENABLE_PRACTICE_MODE", "false").strip().lower() == "true"
 ALLOW_TELEGRAM_EMAIL_SEND = os.environ.get("ALLOW_TELEGRAM_EMAIL_SEND", "false").strip().lower() == "true"
-REQUIRE_TELEGRAM_WEBHOOK_SECRET = os.environ.get("REQUIRE_TELEGRAM_WEBHOOK_SECRET", "true").strip().lower() == "true"
+REQUIRE_TELEGRAM_WEBHOOK_SECRET = os.environ.get("REQUIRE_TELEGRAM_WEBHOOK_SECRET", "false").strip().lower() == "true"
 LIST_ALLOWED_SOURCES = {
     source.strip().lower()
     for source in os.environ.get(
