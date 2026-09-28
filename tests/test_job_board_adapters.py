@@ -43,7 +43,8 @@ class AdapterTests(unittest.TestCase):
                 "id": 101,
                 "title": "LLM Engineer",
                 "content": "Build retrieval systems with Python and AWS.",
-                "updated_at": "2026-09-24T10:00:00Z",
+                "first_published": "2026-09-24T10:00:00Z",
+                "updated_at": "2026-09-24T12:00:00Z",
                 "absolute_url": "https://boards.greenhouse.io/acme/jobs/101",
                 "location": {"name": "Remote, US"},
             }]})
@@ -54,6 +55,7 @@ class AdapterTests(unittest.TestCase):
                 "descriptionPlain": "Build production ML systems.",
                 "hostedUrl": "https://jobs.lever.co/acme/l-101",
                 "applyUrl": "https://jobs.lever.co/acme/l-101/apply",
+                "createdAt": 1727172000000,
                 "categories": {"location": "Wichita, KS", "commitment": "Full-time"},
                 "workplaceType": "hybrid",
             }])
@@ -82,10 +84,13 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(greenhouse[0]["source"], "greenhouse")
         self.assertEqual(greenhouse[0]["apply_url"], greenhouse[0]["url"])
         self.assertEqual(greenhouse[0]["company"], "Acme AI")
+        self.assertEqual(greenhouse[0]["posted_at"], "2026-09-24T10:00:00Z")
+        self.assertEqual(greenhouse[0]["updated_at"], "2026-09-24T12:00:00Z")
 
         self.assertEqual(len(lever), 1)
         self.assertEqual(lever[0]["source"], "lever")
         self.assertEqual(lever[0]["work_mode"], "hybrid")
+        self.assertTrue(lever[0]["posted_at"].startswith("2024-09-24"))
         self.assertTrue(lever[0]["apply_url"].endswith("/apply"))
 
         self.assertEqual(len(ashby), 1)
@@ -108,6 +113,57 @@ class AdapterTests(unittest.TestCase):
         }, {"slug": "acme", "company": "Acme AI"})
         self.assertIsNone(greenhouse)
         self.assertIsNone(ashby)
+
+    def test_greenhouse_updated_at_not_treated_as_publication_date(self):
+        """Greenhouse jobs without first_published or created_at must not use updated_at as posted_at."""
+        job = ingestor._normalize_greenhouse_job({
+            "id": 102,
+            "title": "AI Engineer",
+            "content": "PyTorch LLM orchestration",
+            "updated_at": "2026-09-27T10:00:00Z",
+            "absolute_url": "https://boards.greenhouse.io/acme/jobs/102",
+        }, {"slug": "acme", "company": "Acme AI"})
+        self.assertIsNotNone(job)
+        self.assertEqual(job["posted_at"], "")
+        self.assertEqual(job["updated_at"], "2026-09-27T10:00:00Z")
+
+    def test_lever_missing_created_at_handled_explicitly_without_inventing_freshness(self):
+        """Lever jobs without createdAt must not fall back to updatedAt as publication date."""
+        job = ingestor._normalize_lever_job({
+            "id": "l-102",
+            "text": "Machine Learning Engineer",
+            "descriptionPlain": "PyTorch ML systems",
+            "hostedUrl": "https://jobs.lever.co/acme/l-102",
+            "updatedAt": 1727400000000,
+        }, {"slug": "acme", "company": "Acme AI"})
+        self.assertIsNotNone(job)
+        self.assertEqual(job["posted_at"], "")
+        self.assertEqual(job["updated_at"], "1727400000000")
+
+    def test_ats_fetch_scans_beyond_index_100_for_target_roles(self):
+        """Boards with >100 non-engineering listings must not drop target roles listed past index 100."""
+        # 120 irrelevant jobs followed by 1 AI Engineer job
+        jobs_payload = [
+            {"id": i, "title": f"Sales Rep {i}", "absolute_url": f"https://boards.greenhouse.io/acme/jobs/{i}", "content": "Sales"}
+            for i in range(120)
+        ]
+        jobs_payload.append({
+            "id": 999,
+            "title": "Lead AI Engineer",
+            "first_published": "2026-09-27T08:00:00Z",
+            "absolute_url": "https://boards.greenhouse.io/acme/jobs/999",
+            "content": "Lead our RAG and LLM agent architecture.",
+        })
+
+        def fake_large_board(request, timeout):
+            return FakeResponse({"jobs": jobs_payload})
+
+        with patch.object(ingestor.urllib.request, "urlopen", fake_large_board):
+            greenhouse = ingestor.fetch_greenhouse_jobs()
+
+        self.assertEqual(len(greenhouse), 1)
+        self.assertEqual(greenhouse[0]["title"], "Lead AI Engineer")
+        self.assertEqual(greenhouse[0]["source_job_id"], "999")
 
 
 if __name__ == "__main__":

@@ -7,8 +7,8 @@
 # Safety gates:
 #   1. CI must pass first (tests + evals)
 #   2. Manual approval required for production
-#   3. Post-deploy health verification
-#   4. Automatic rollback on verification failure
+#   3. Post-deploy health verification (waits for updates to complete with Successful status)
+#   4. Manual rollback procedure (see docs/deployment.md)
 #
 # Production safety rules from AGENTS.md:
 #   - Real email sending remains gated by both env flags
@@ -226,7 +226,7 @@ jobs:
       - name: Verify Lambda health
         run: |
           python -c "
-          import boto3, sys
+          import boto3, sys, time
 
           client = boto3.client('lambda', region_name='us-east-1')
           functions = ['job-ingestor', 'job-deduplicator', 'job-processor', 'job-router', 'job-sender']
@@ -234,20 +234,25 @@ jobs:
 
           for func in functions:
               try:
-                  cfg = client.get_function_configuration(FunctionName=func)
-                  state = cfg.get('State', 'Unknown')
-                  update = cfg.get('LastUpdateStatus', 'Unknown')
+                  state, update = 'Unknown', 'Unknown'
+                  for _ in range(12):
+                      cfg = client.get_function_configuration(FunctionName=func)
+                      state = cfg.get('State', 'Unknown')
+                      update = cfg.get('LastUpdateStatus', 'Unknown')
+                      if update != 'InProgress':
+                          break
+                      time.sleep(5)
                   print(f'{func}: state={state} update_status={update}')
-                  if state != 'Active' or update not in ('Successful', 'InProgress'):
-                      failed.append(func)
+                  if state != 'Active' or update != 'Successful':
+                      failed.append(f'{func} (state={state}, update={update})')
               except Exception as e:
                   print(f'{func}: ERROR - {e}')
-                  failed.append(func)
+                  failed.append(f'{func} ({e})')
 
           if failed:
               print(f'\\nFAILED: {failed}')
               sys.exit(1)
-          print('\\nAll Lambdas healthy.')
+          print('\\nAll Lambdas successfully updated and active.')
           "
 
       - name: Verify SQS queues are clean

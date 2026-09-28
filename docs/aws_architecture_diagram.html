@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JobHunt AWS Architecture Blueprint</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --surface: #111827;
+      --surface-elevated: #1f2937;
+      --border: #374151;
+      --border-glow: rgba(99, 102, 241, 0.4);
+      --text: #f3f4f6;
+      --text-muted: #9ca3af;
+      
+      /* AWS Brand Colors */
+      --aws-orange: #ff9900;
+      --aws-amber: #f59e0b;
+      --aws-purple: #8b5cf6;
+      --aws-blue: #3b82f6;
+      --aws-red: #ef4444;
+      --aws-green: #10b981;
+      --aws-cyan: #06b6d4;
+      --aws-magenta: #ec4899;
+      --telegram-blue: #229ed9;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      min-height: 100vh;
+      padding: 24px;
+      overflow-x: auto;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 24px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+      max-width: 1440px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    .title-area h1 {
+      font-family: 'Outfit', sans-serif;
+      font-size: 26px;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .title-area h1 span.badge {
+      font-size: 11px;
+      background: linear-gradient(135deg, rgba(255,153,0,0.2), rgba(255,153,0,0.05));
+      border: 1px solid var(--aws-orange);
+      color: var(--aws-orange);
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-family: 'Inter', sans-serif;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+
+    .title-area p {
+      color: var(--text-muted);
+      font-size: 14px;
+      margin-top: 4px;
+    }
+
+    .controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .btn {
+      background: linear-gradient(135deg, #2563eb, #1d4ed8);
+      color: #fff;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
+      transition: all 0.2s ease;
+    }
+
+    .btn:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 16px rgba(37, 99, 235, 0.4);
+    }
+
+    .btn-secondary {
+      background: var(--surface-elevated);
+      color: var(--text);
+      border: 1px solid var(--border);
+      box-shadow: none;
+    }
+
+    .btn-secondary:hover {
+      background: #374151;
+      border-color: #4b5563;
+    }
+
+    /* Step indicator bar */
+    .status-ticker {
+      max-width: 1440px;
+      margin: 0 auto 20px auto;
+      background: rgba(17, 24, 39, 0.7);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 16px;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--aws-green);
+      box-shadow: 0 0 10px var(--aws-green);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(0.9); }
+    }
+
+    /* Diagram Canvas Container */
+    .canvas {
+      max-width: 1440px;
+      margin: 0 auto;
+      background: radial-gradient(circle at 50% 0%, rgba(30, 41, 59, 0.5) 0%, rgba(11, 15, 25, 0.95) 100%);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px;
+      position: relative;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+    }
+
+    /* Zone Containers */
+    .grid-container {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 24px;
+      position: relative;
+      z-index: 2;
+    }
+
+    .zone {
+      background: rgba(17, 24, 39, 0.85);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+      backdrop-filter: blur(8px);
+      transition: border-color 0.3s ease;
+      position: relative;
+    }
+
+    .zone:hover {
+      border-color: rgba(156, 163, 175, 0.4);
+    }
+
+    .zone-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-bottom: 12px;
+      border-bottom: 1px dashed var(--border);
+    }
+
+    .zone-title {
+      font-family: 'Outfit', sans-serif;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .zone-number {
+      background: var(--surface-elevated);
+      color: #fff;
+      font-size: 11px;
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+    }
+
+    /* Card Components */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      position: relative;
+      transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      cursor: pointer;
+    }
+
+    .card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+      border-color: rgba(255, 255, 255, 0.3);
+    }
+
+    .card.active-step {
+      border-color: var(--aws-orange) !important;
+      box-shadow: 0 0 20px rgba(255, 153, 0, 0.4) !important;
+      transform: scale(1.02);
+    }
+
+    .card-top {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .icon-box {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      font-weight: 700;
+      font-size: 18px;
+    }
+
+    /* Service Specific Badges & Icons */
+    .icon-eventbridge { background: rgba(236, 72, 153, 0.15); color: var(--aws-magenta); border: 1px solid rgba(236, 72, 153, 0.3); }
+    .icon-lambda { background: rgba(255, 153, 0, 0.15); color: var(--aws-orange); border: 1px solid rgba(255, 153, 0, 0.3); }
+    .icon-sqs { background: rgba(239, 68, 68, 0.15); color: var(--aws-red); border: 1px solid rgba(239, 68, 68, 0.3); }
+    .icon-dynamo { background: rgba(59, 130, 246, 0.15); color: var(--aws-blue); border: 1px solid rgba(59, 130, 246, 0.3); }
+    .icon-bedrock { background: rgba(139, 92, 246, 0.15); color: var(--aws-purple); border: 1px solid rgba(139, 92, 246, 0.3); }
+    .icon-sns { background: rgba(239, 68, 68, 0.15); color: var(--aws-red); border: 1px solid rgba(239, 68, 68, 0.3); }
+    .icon-apigw { background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3); }
+    .icon-telegram { background: rgba(34, 158, 217, 0.15); color: var(--telegram-blue); border: 1px solid rgba(34, 158, 217, 0.3); }
+    .icon-cloudwatch { background: rgba(236, 72, 153, 0.15); color: var(--aws-magenta); border: 1px solid rgba(236, 72, 153, 0.3); }
+
+    .card-meta {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .service-tag {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--text-muted);
+    }
+
+    .card-title {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      font-weight: 600;
+      color: #fff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .card-desc {
+      font-size: 12px;
+      color: var(--text-muted);
+      line-height: 1.4;
+    }
+
+    .pill-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: var(--surface-elevated);
+      color: #d1d5db;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-family: 'JetBrains Mono', monospace;
+      margin-top: 4px;
+      align-self: flex-start;
+      border: 1px solid var(--border);
+    }
+
+    /* Sub-queues / DLQs */
+    .dlq-box {
+      background: rgba(239, 68, 68, 0.08);
+      border: 1px dashed rgba(239, 68, 68, 0.3);
+      border-radius: 8px;
+      padding: 8px 12px;
+      font-size: 11px;
+      color: #fca5a5;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: -8px;
+    }
+
+    /* Flow connector arrows */
+    .flow-connector {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-muted);
+      font-size: 12px;
+      font-family: 'JetBrains Mono', monospace;
+      gap: 6px;
+      padding: 4px 0;
+    }
+
+    .arrow-down {
+      width: 2px;
+      height: 16px;
+      background: linear-gradient(to bottom, var(--border), var(--aws-orange));
+      margin: 0 auto;
+      position: relative;
+    }
+
+    .arrow-down::after {
+      content: '';
+      position: absolute;
+      bottom: -4px;
+      left: -3px;
+      width: 0;
+      height: 0;
+      border-left: 4px solid transparent;
+      border-right: 4px solid transparent;
+      border-top: 5px solid var(--aws-orange);
+    }
+
+    /* Bottom Info Drawer */
+    .drawer {
+      margin-top: 24px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 20px;
+    }
+
+    .drawer-title {
+      font-family: 'Outfit', sans-serif;
+      font-size: 15px;
+      font-weight: 700;
+      color: #fff;
+      margin-bottom: 8px;
+    }
+
+    .drawer-text {
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.6;
+    }
+
+    .code-badge {
+      background: #000;
+      border: 1px solid var(--border);
+      color: #67e8f9;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+    }
+
+    /* Mock Telegram Card preview */
+    .tg-preview {
+      background: #17212b;
+      border: 1px solid #242f3d;
+      border-radius: 10px;
+      padding: 14px;
+      font-size: 12px;
+      color: #e5e7eb;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .tg-score {
+      color: #4ade80;
+      font-weight: 700;
+    }
+
+    .tg-btns {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 6px;
+      margin-top: 6px;
+    }
+
+    .tg-btn {
+      background: #2b5278;
+      color: #fff;
+      text-align: center;
+      padding: 5px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <div class="title-area">
+      <h1>
+        JobHunt AWS Architecture Blueprint
+        <span class="badge">Production Cloud Layout</span>
+      </h1>
+      <p>Visual map of all AWS services, triggers, queues, and message flow</p>
+    </div>
+    <div class="controls">
+      <button class="btn btn-secondary" onclick="resetFlow()">Reset</button>
+      <button class="btn" id="simBtn" onclick="stepSimulation()">▶ Simulate 1 Job Discovery</button>
+    </div>
+  </div>
+
+  <div class="status-ticker">
+    <div class="status-dot" id="tickerDot"></div>
+    <span id="tickerText"><strong>System Ready:</strong> EventBridge is scheduled to trigger job-ingestor every 3 hours. Click "Simulate 1 Job Discovery" to watch the data travel across AWS.</span>
+  </div>
+
+  <div class="canvas">
+    <!-- Visual Architecture Diagram Image -->
+    <div style="margin-bottom: 32px; background: rgba(17, 24, 39, 0.9); border: 1px solid var(--border); border-radius: 12px; padding: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+        <div style="font-family: 'Outfit', sans-serif; font-size: 15px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 8px;">
+          <span>🖼️</span> AWS Architecture Graphic Diagram
+        </div>
+        <span class="pill-badge" style="color: #38bdf8;">High-Resolution Cloud Diagram</span>
+      </div>
+      <div style="text-align: center; background: #000; border-radius: 8px; padding: 12px; border: 1px solid rgba(255,255,255,0.08);">
+        <img src="aws_architecture_diagram.jpg" alt="Agentic AI Job Pipeline AWS Cloud Architecture Diagram" style="width: 100%; max-height: 580px; object-fit: contain; border-radius: 6px;" />
+      </div>
+    </div>
+
+    <div class="grid-container">
+
+      <!-- ZONE 1: INGESTION -->
+      <div class="zone" id="zone1">
+        <div class="zone-header">
+          <div class="zone-title">
+            <span class="zone-number">1</span>
+            Data Ingestion
+          </div>
+          <span class="pill-badge" style="color: #ec4899;">Every 3 Hours</span>
+        </div>
+
+        <div class="card" id="card-eventbridge">
+          <div class="card-top">
+            <div class="icon-box icon-eventbridge">⏰</div>
+            <div class="card-meta">
+              <div class="service-tag">AWS EventBridge</div>
+              <div class="card-title">daily-trigger</div>
+            </div>
+          </div>
+          <div class="card-desc">Cron rule: <code class="code-badge">rate(3 hours)</code>. Fires automated event payload to start job discovery.</div>
+        </div>
+
+        <div class="arrow-down"></div>
+
+        <div class="card" id="card-ingestor">
+          <div class="card-top">
+            <div class="icon-box icon-lambda">λ</div>
+            <div class="card-meta">
+              <div class="service-tag">AWS Lambda</div>
+              <div class="card-title">job-ingestor</div>
+            </div>
+          </div>
+          <div class="card-desc">Crawls Hacker News, calls Adzuna API & queries Greenhouse, Lever, Ashby ATS boards. Extracts emails & verifies URLs.</div>
+          <div class="pill-badge">job_ingestor/lambda_function.py</div>
+        </div>
+      </div>
+
+      <!-- ZONE 2: QUEUE & DEDUP -->
+      <div class="zone" id="zone2">
+        <div class="zone-header">
+          <div class="zone-title">
+            <span class="zone-number">2</span>
+            Buffer & Dedup
+          </div>
+          <span class="pill-badge" style="color: #f87171;">SQS Decoupled</span>
+        </div>
+
+        <div class="card" id="card-raw-queue">
+          <div class="card-top">
+            <div class="icon-box icon-sqs">✉️</div>
+            <div class="card-meta">
+              <div class="service-tag">Amazon SQS</div>
+              <div class="card-title">job-raw-queue</div>
+            </div>
+          </div>
+          <div class="card-desc">Holds incoming raw job batches (max 10 jobs/msg). Absorbs traffic spikes from web APIs.</div>
+        </div>
+
+        <div class="dlq-box">
+          <span>🛡️ Attached DLQ: job-raw-dlq</span>
+          <span>MaxReceive: 3</span>
+        </div>
+
+        <div class="arrow-down"></div>
+
+        <div class="card" id="card-deduplicator">
+          <div class="card-top">
+            <div class="icon-box icon-lambda">λ</div>
+            <div class="card-meta">
+              <div class="service-tag">AWS Lambda</div>
+              <div class="card-title">job-deduplicator</div>
+            </div>
+          </div>
+          <div class="card-desc">Computes SHA-256 hash (<code class="code-badge">title+company+url</code>). Checks DynamoDB. Drops duplicates to save 100% of LLM costs.</div>
+          <div class="pill-badge">job_deduplicator/lambda_function.py</div>
+        </div>
+
+        <div class="arrow-down"></div>
+
+        <div class="card" id="card-dynamo-check">
+          <div class="card-top">
+            <div class="icon-box icon-dynamo">⚡</div>
+            <div class="card-meta">
+              <div class="service-tag">Amazon DynamoDB</div>
+              <div class="card-title">Jobsearch (Table)</div>
+            </div>
+          </div>
+          <div class="card-desc">State store. Uses conditional write <code class="code-badge">attribute_not_exists</code> to prevent duplicate entries.</div>
+        </div>
+      </div>
+
+      <!-- ZONE 3: AI SCORING & STORAGE -->
+      <div class="zone" id="zone3">
+        <div class="zone-header">
+          <div class="zone-title">
+            <span class="zone-number">3</span>
+            AI Evaluation
+          </div>
+          <span class="pill-badge" style="color: #a78bfa;">Claude on Bedrock</span>
+        </div>
+
+        <div class="card" id="card-filtered-queue">
+          <div class="card-top">
+            <div class="icon-box icon-sqs">✉️</div>
+            <div class="card-meta">
+              <div class="service-tag">Amazon SQS</div>
+              <div class="card-title">job-filtered-queue</div>
+            </div>
+          </div>
+          <div class="card-desc">Clean, deduplicated jobs awaiting evaluation. Triggers processor via Event Source Mapping.</div>
+        </div>
+
+        <div class="arrow-down"></div>
+
+        <div class="card" id="card-processor">
+          <div class="card-top">
+            <div class="icon-box icon-lambda">λ</div>
+            <div class="card-meta">
+              <div class="service-tag">AWS Lambda</div>
+              <div class="card-title">job-processor</div>
+            </div>
+          </div>
+          <div class="card-desc">Fast pre-filter rejects stale jobs. Passes qualified leads to Claude on Bedrock. Evaluates fit against Teja's profile.</div>
+          <div class="pill-badge">job_processor/lambda_function.py</div>
+        </div>
+
+        <div class="arrow-down"></div>
+
+        <div class="card" id="card-bedrock">
+          <div class="card-top">
+            <div class="icon-box icon-bedrock">🧠</div>
+            <div class="card-meta">
+              <div class="service-tag">AWS Bedrock</div>
+              <div class="card-title">Anthropic Claude</div>
+            </div>
+          </div>
+          <div class="card-desc">Reads job requirements vs candidate knowledge graph (RAG, PyTorch, RetireIQ, Rivulet). Returns score & reasons.</div>
+        </div>
+
+        <div class="arrow-down"></div>
+
+        <div class="card" id="card-sns">
+          <div class="card-top">
+            <div class="icon-box icon-sns">📢</div>
+            <div class="card-meta">
+              <div class="service-tag">Amazon SNS</div>
+              <div class="card-title">job-alerts-topic</div>
+            </div>
+          </div>
+          <div class="card-desc">Publishes match notification if score is ≥ 80% with valid source URL.</div>
+        </div>
+      </div>
+
+      <!-- ZONE 4: CONTROL PLANE -->
+      <div class="zone" id="zone4">
+        <div class="zone-header">
+          <div class="zone-title">
+            <span class="zone-number">4</span>
+            Mobile Control Plane
+          </div>
+          <span class="pill-badge" style="color: #38bdf8;">Telegram Bot</span>
+        </div>
+
+        <div class="card" id="card-router">
+          <div class="card-top">
+            <div class="icon-box icon-lambda">λ</div>
+            <div class="card-meta">
+              <div class="service-tag">AWS Lambda</div>
+              <div class="card-title">job-router</div>
+            </div>
+          </div>
+          <div class="card-desc">Subscribes to SNS to send push alerts. Receives Telegram webhooks from API Gateway to handle user commands.</div>
+          <div class="pill-badge">job_router/lambda_function.py</div>
+        </div>
+
+        <div class="arrow-down"></div>
+
+        <div class="card" id="card-apigw">
+          <div class="card-top">
+            <div class="icon-box icon-apigw">🌐</div>
+            <div class="card-meta">
+              <div class="service-tag">Amazon API Gateway</div>
+              <div class="card-title">HTTP POST /webhook</div>
+            </div>
+          </div>
+          <div class="card-desc">Secure webhook receiver with secret token authentication header. Routes user actions to job-router.</div>
+        </div>
+
+        <div class="arrow-down"></div>
+
+        <!-- Phone Card Display -->
+        <div class="tg-preview" id="card-telegram">
+          <div style="font-weight: 700; color: #38bdf8; display: flex; justify-content: space-between;">
+            <span>🤖 JobHunt Bot</span>
+            <span style="font-size: 10px; color: #9ca3af;">Telegram Mobile</span>
+          </div>
+          <div class="tg-score" id="tg-score-line">NEW HIGH MATCH: 85%</div>
+          <div style="font-size: 11px;"><strong>Acme AI</strong> · Applied AI Engineer</div>
+          <div style="font-size: 10px; color: #9ca3af;">Location: Remote · Source: Hacker News</div>
+          <div style="font-size: 11px; margin-top: 4px;">Strong match for RAG, vector DBs & PyTorch background.</div>
+          <div class="tg-btns">
+            <div class="tg-btn">💡 Explain</div>
+            <div class="tg-btn">✍️ Draft</div>
+            <div class="tg-btn">🚀 Apply</div>
+          </div>
+        </div>
+
+      </div>
+
+    </div>
+
+    <!-- Details Drawer -->
+    <div class="drawer">
+      <div>
+        <div class="drawer-title" id="drawerTitle">AWS Architecture Blueprint: Built For Zero-Cost At Rest & Resilience</div>
+        <div class="drawer-text" id="drawerText">
+          Every component in this architecture runs completely serverless on AWS. When there are no jobs to process, CPU usage and cost are zero. SQS queues act as elastic buffers between web scrapers and AI models so Bedrock never hits rate limits or bursts.
+        </div>
+      </div>
+      <div>
+        <div class="drawer-title">Key Production Safety Rules</div>
+        <div class="drawer-text">
+          • <strong>80%+ Threshold:</strong> Only high matches trigger phone alerts.<br>
+          • <strong>Source URL Required:</strong> Fake/unverifiable leads are rejected.<br>
+          • <strong>Email Sending Gated:</strong> Bot previews outreach but never sends real emails without confirmation.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const steps = [
+      {
+        cardId: 'card-eventbridge',
+        dot: 'var(--aws-magenta)',
+        title: 'Step 1: EventBridge Cron Fires',
+        msg: 'AWS EventBridge rule "job-search-daily-trigger" triggers job-ingestor automatically on a 3-hour schedule.',
+        drawer: 'EventBridge initiates an asynchronous invocation to the job-ingestor Lambda. This ensures daily job discovery happens on autopilot without requiring any manual cron servers.'
+      },
+      {
+        cardId: 'card-ingestor',
+        dot: 'var(--aws-orange)',
+        title: 'Step 2: Scrapes & Ingests Fresh Leads',
+        msg: 'job-ingestor pulls fresh postings from Hacker News, Adzuna, and Greenhouse/Lever/Ashby ATS APIs.',
+        drawer: 'The ingestor parses messy HTML, extracts recruiter emails, verifies URLs against SSRF vulnerabilities, and bundles jobs into batches of 10.'
+      },
+      {
+        cardId: 'card-raw-queue',
+        dot: 'var(--aws-red)',
+        title: 'Step 3: Queued in SQS (job-raw-queue)',
+        msg: 'Raw jobs land in Amazon SQS job-raw-queue. If 200 jobs arrive at once, SQS absorbs the traffic spike.',
+        drawer: 'SQS decouples ingestion from deduplication. Attached to a Dead-Letter Queue (DLQ) with maxReceiveCount=3 to isolate any poisoned or unparseable messages.'
+      },
+      {
+        cardId: 'card-deduplicator',
+        dot: 'var(--aws-orange)',
+        title: 'Step 4: Deduplication & Fingerprint Check',
+        msg: 'job-deduplicator hashes (title + company + URL). Checks DynamoDB to drop jobs we have already seen.',
+        drawer: 'By dropping duplicates before calling Bedrock, the deduplicator eliminates redundant AI evaluations and cuts token costs by 100% on repeated postings.'
+      },
+      {
+        cardId: 'card-dynamo-check',
+        dot: 'var(--aws-blue)',
+        title: 'Step 5: DynamoDB State Recorded',
+        msg: 'DynamoDB records the new job row with state = NEW using conditional write attribute_not_exists.',
+        drawer: 'DynamoDB acts as the canonical single source of truth, storing job metadata, recruiter contacts, model versions, and evaluation history.'
+      },
+      {
+        cardId: 'card-filtered-queue',
+        dot: 'var(--aws-red)',
+        title: 'Step 6: Staged in SQS (job-filtered-queue)',
+        msg: 'Unique, verified jobs are placed in job-filtered-queue awaiting AI evaluation.',
+        drawer: 'Another SQS buffer prevents Claude from being throttled by burst evaluations. Only clean, deduplicated jobs enter this queue.'
+      },
+      {
+        cardId: 'card-processor',
+        dot: 'var(--aws-orange)',
+        title: 'Step 7: Pre-Filter & AI Evaluation',
+        msg: 'job-processor runs free pre-filters (drops stale/non-AI jobs) then invokes Claude on AWS Bedrock.',
+        drawer: 'Jobs older than 3 days or lacking AI keywords are rejected locally for free. The remaining high-potential jobs are sent to Anthropic Claude on Bedrock.'
+      },
+      {
+        cardId: 'card-bedrock',
+        dot: 'var(--aws-purple)',
+        title: 'Step 8: Bedrock Claude Evaluates Fit',
+        msg: 'Claude compares job description to Teja\'s candidate profile. Returns score (85%), reasoning & missing requirements.',
+        drawer: 'Bedrock scores the role using a compact candidate knowledge graph (RAG, PyTorch, RetireIQ, Rivulet, GPU cost reduction) and returns structured JSON.'
+      },
+      {
+        cardId: 'card-sns',
+        dot: 'var(--aws-red)',
+        title: 'Step 9: Score >= 80% Publishes to SNS',
+        msg: 'Because score is 85% and URL is valid, job-processor publishes an alert event to Amazon SNS.',
+        drawer: 'Amazon SNS (job-alerts-topic) provides instant pub-sub routing to alert subscribers without tight coupling.'
+      },
+      {
+        cardId: 'card-router',
+        dot: 'var(--aws-orange)',
+        title: 'Step 10: SNS Invokes job-router',
+        msg: 'job-router Lambda receives the SNS record and formats the notification payload for Telegram.',
+        drawer: 'job-router serves as the control plane. It forwards alerts and processes interactive webhook commands from the user.'
+      },
+      {
+        cardId: 'card-telegram',
+        dot: 'var(--telegram-blue)',
+        title: 'Step 11: Alert Buzzes Your Phone!',
+        msg: 'Telegram Bot delivers the high match card to your phone! You can tap Explain, Draft, or Apply.',
+        drawer: 'The notification gives you the match score, role summary, and direct apply link. You retain full human control over outreach and applications.'
+      }
+    ];
+
+    let currentStep = -1;
+
+    function resetFlow() {
+      currentStep = -1;
+      document.querySelectorAll('.card, .tg-preview').forEach(c => c.classList.remove('active-step'));
+      document.getElementById('tickerText').innerHTML = '<strong>System Ready:</strong> EventBridge is scheduled to trigger job-ingestor every 3 hours. Click "Simulate 1 Job Discovery" to watch the data travel across AWS.';
+      document.getElementById('tickerDot').style.background = 'var(--aws-green)';
+      document.getElementById('drawerTitle').innerText = 'AWS Architecture Blueprint: Built For Zero-Cost At Rest & Resilience';
+      document.getElementById('drawerText').innerText = 'Every component in this architecture runs completely serverless on AWS. When there are no jobs to process, CPU usage and cost are zero. SQS queues act as elastic buffers between web scrapers and AI models so Bedrock never hits rate limits or bursts.';
+      document.getElementById('simBtn').innerText = '▶ Simulate 1 Job Discovery';
+    }
+
+    function stepSimulation() {
+      currentStep = (currentStep + 1) % steps.length;
+      const step = steps[currentStep];
+
+      document.querySelectorAll('.card, .tg-preview').forEach(c => c.classList.remove('active-step'));
+      const activeEl = document.getElementById(step.cardId);
+      if (activeEl) {
+        activeEl.classList.add('active-step');
+        activeEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+
+      document.getElementById('tickerDot').style.background = step.dot;
+      document.getElementById('tickerText').innerHTML = `<strong>${step.title}:</strong> ${step.msg}`;
+      document.getElementById('drawerTitle').innerText = step.title;
+      document.getElementById('drawerText').innerText = step.drawer;
+
+      if (currentStep === steps.length - 1) {
+        document.getElementById('simBtn').innerText = '🔄 Re-run Simulation';
+      } else {
+        document.getElementById('simBtn').innerText = `Next: Step ${currentStep + 2} of ${steps.length} ➔`;
+      }
+    }
+  </script>
+</body>
+</html>

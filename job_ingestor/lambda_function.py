@@ -166,6 +166,7 @@ NEVER_CONTACT_EMAIL_LOCAL_PARTS = {"noreply", "no-reply", "donotreply", "support
 
 def _record_source_error(source: str, detail: str) -> None:
     SOURCE_ERRORS.append({"source": source, "detail": detail[:300]})
+    logger.warning("SOURCE_ERROR | source=%s | detail=%s", source, detail[:300])
 
 
 def _build_signal_test_job() -> dict:
@@ -737,6 +738,9 @@ def _normalize_greenhouse_job(raw: dict, board: dict[str, str]) -> dict | None:
     if work_mode == "on-site":
         work_mode = "onsite"
     job_id = str(raw.get("id") or uuid.uuid5(uuid.NAMESPACE_URL, source_url))
+    first_pub = raw.get("first_published") or raw.get("created_at") or ""
+    posted_at = str(first_pub).strip() if first_pub else ""
+    updated_at = str(raw.get("updated_at") or "").strip()
     return {
         "job_id": f"greenhouse_{board['slug']}_{job_id}",
         "title": title[:120],
@@ -755,7 +759,8 @@ def _normalize_greenhouse_job(raw: dict, board: dict[str, str]) -> dict | None:
         "work_mode": work_mode,
         "work_mode_source": work_mode_source,
         "employment_type": "",
-        "posted_at": str(raw.get("first_published") or raw.get("updated_at") or ""),
+        "posted_at": posted_at,
+        "updated_at": updated_at,
         "employer_website": f"https://boards.greenhouse.io/{board['slug']}",
         "recruiter_email": "",
         "recruiter_name": "",
@@ -778,11 +783,13 @@ def fetch_greenhouse_jobs() -> list:
         data = _ats_request_json(url, "greenhouse")
         raw_jobs = data.get("jobs", []) if isinstance(data, dict) else []
         accepted = 0
-        for raw in raw_jobs[:ATS_MAX_JOBS_PER_BOARD]:
+        for raw in raw_jobs:
             job = _normalize_greenhouse_job(raw, board)
             if job:
                 jobs.append(job)
                 accepted += 1
+                if accepted >= ATS_MAX_JOBS_PER_BOARD:
+                    break
         logger.info(
             "GREENHOUSE_BOARD | company=%s | raw=%d | accepted=%d",
             board["company"], len(raw_jobs), accepted,
@@ -809,8 +816,9 @@ def _normalize_lever_job(raw: dict, site: dict[str, str]) -> dict | None:
         work_mode_source = "workplaceType"
     job_id = str(raw.get("id") or uuid.uuid5(uuid.NAMESPACE_URL, source_url))
 
-    raw_posted = raw.get("createdAt") or raw.get("updatedAt") or ""
-    if isinstance(raw_posted, (int, float)) or (isinstance(raw_posted, str) and raw_posted.isdigit() and len(raw_posted) > 10):
+    raw_posted = raw.get("createdAt") or ""
+    updated_at = str(raw.get("updatedAt") or "").strip()
+    if raw_posted and (isinstance(raw_posted, (int, float)) or (isinstance(raw_posted, str) and raw_posted.isdigit() and len(raw_posted) > 10)):
         try:
             ms = int(raw_posted)
             dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
@@ -818,7 +826,7 @@ def _normalize_lever_job(raw: dict, site: dict[str, str]) -> dict | None:
         except Exception:
             posted_at = str(raw_posted)
     else:
-        posted_at = str(raw_posted)
+        posted_at = str(raw_posted).strip() if raw_posted else ""
 
     return {
         "job_id": f"lever_{site['slug']}_{job_id}",
@@ -839,6 +847,7 @@ def _normalize_lever_job(raw: dict, site: dict[str, str]) -> dict | None:
         "work_mode_source": work_mode_source,
         "employment_type": str(categories.get("commitment") or ""),
         "posted_at": posted_at,
+        "updated_at": updated_at,
         "employer_website": f"https://jobs.lever.co/{site['slug']}",
         "recruiter_email": "",
         "recruiter_name": "",
@@ -861,11 +870,13 @@ def fetch_lever_jobs() -> list:
         data = _ats_request_json(url, "lever")
         raw_jobs = data if isinstance(data, list) else []
         accepted = 0
-        for raw in raw_jobs[:ATS_MAX_JOBS_PER_BOARD]:
+        for raw in raw_jobs:
             job = _normalize_lever_job(raw, site)
             if job:
                 jobs.append(job)
                 accepted += 1
+                if accepted >= ATS_MAX_JOBS_PER_BOARD:
+                    break
         logger.info(
             "LEVER_SITE | company=%s | raw=%d | accepted=%d",
             site["company"], len(raw_jobs), accepted,
@@ -931,11 +942,13 @@ def fetch_ashby_jobs() -> list:
         data = _ats_request_json(url, "ashby")
         raw_jobs = data.get("jobs", []) if isinstance(data, dict) else []
         accepted = 0
-        for raw in raw_jobs[:ATS_MAX_JOBS_PER_BOARD]:
+        for raw in raw_jobs:
             job = _normalize_ashby_job(raw, board)
             if job:
                 jobs.append(job)
                 accepted += 1
+                if accepted >= ATS_MAX_JOBS_PER_BOARD:
+                    break
         logger.info(
             "ASHBY_BOARD | company=%s | raw=%d | accepted=%d",
             board["company"], len(raw_jobs), accepted,
