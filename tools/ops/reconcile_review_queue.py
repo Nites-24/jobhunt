@@ -21,10 +21,10 @@ if hasattr(sys.stdout, "reconfigure"):
 REGION = "us-east-1"
 TABLE_NAME = "Jobsearch"
 SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "80"))
-MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "14"))
+MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "1"))
 ALLOWED_SOURCES = {
     source.strip().lower()
-    for source in os.environ.get("LIST_ALLOWED_SOURCES", "hackernews,hn,jsearch,google_cse,cse,adzuna,tejajob").split(",")
+    for source in os.environ.get("LIST_ALLOWED_SOURCES", "hackernews,hn,jsearch,google_cse,cse,adzuna,greenhouse,lever,ashby,tejajob").split(",")
     if source.strip()
 }
 
