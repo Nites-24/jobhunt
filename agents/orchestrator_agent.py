@@ -30,6 +30,7 @@ from .base_agent import (
 )
 from .qa_agent import QAAgent
 from .python_dev_agent import PythonDevAgent
+from .security_auditor_agent import SecurityAuditorAgent
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,7 @@ class OrchestratorAgent(BaseAgent):
 
         # Initialize sub-agents
         self.qa_agent = QAAgent()
+        self.security_agent = SecurityAuditorAgent()
         self.python_dev_agent = PythonDevAgent(session=session) if include_aws else None
 
         self.ai_engineer_agent = None
@@ -97,9 +99,27 @@ class OrchestratorAgent(BaseAgent):
                 message=f"QA Agent crashed: {str(e)}",
             ))
 
-        # Phase 2: Python Dev Agent (code quality)
+        # Phase 2: Security & Identity Auditor Agent (zero leaks, zero secrets, zero loops)
+        self.logger.info("Phase 2: Running Security Auditor Agent...")
+        try:
+            sec_summary = self.security_agent.run(context)
+            self.agent_results["SecurityAuditor"] = sec_summary
+            observations.append(AgentObservation(
+                source="orchestrator:security",
+                data=sec_summary,
+                severity=self._status_to_severity(sec_summary.get("status", "UNKNOWN")),
+                message=f"Security Auditor Agent: {sec_summary.get('status', 'UNKNOWN')}",
+            ))
+        except Exception as e:
+            observations.append(AgentObservation(
+                source="orchestrator:security",
+                severity=Severity.CRITICAL,
+                message=f"Security Auditor Agent crashed: {str(e)}",
+            ))
+
+        # Phase 3: Python Dev Agent (code quality)
         if self.python_dev_agent:
-            self.logger.info("Phase 2: Running Python Dev Agent...")
+            self.logger.info("Phase 3: Running Python Dev Agent...")
             try:
                 dev_summary = self.python_dev_agent.run(context)
                 self.agent_results["PythonDev"] = dev_summary
@@ -116,9 +136,9 @@ class OrchestratorAgent(BaseAgent):
                     message=f"Python Dev Agent error: {str(e)}",
                 ))
 
-        # Phase 3: Backend Engineer Agent (AWS infra)
+        # Phase 4: Backend Engineer Agent (AWS infra)
         if self.backend_engineer_agent:
-            self.logger.info("Phase 3: Running Backend Engineer Agent...")
+            self.logger.info("Phase 4: Running Backend Engineer Agent...")
             try:
                 backend_summary = self.backend_engineer_agent.run(context)
                 self.agent_results["BackendEngineer"] = backend_summary
@@ -135,9 +155,9 @@ class OrchestratorAgent(BaseAgent):
                     message=f"Backend Engineer error: {str(e)}",
                 ))
 
-        # Phase 4: AI Engineer Agent (LLM health)
+        # Phase 5: AI Engineer Agent (LLM health)
         if self.ai_engineer_agent:
-            self.logger.info("Phase 4: Running AI Engineer Agent...")
+            self.logger.info("Phase 5: Running AI Engineer Agent...")
             try:
                 ai_summary = self.ai_engineer_agent.run(context)
                 self.agent_results["AIEngineer"] = ai_summary
@@ -264,6 +284,13 @@ class OrchestratorAgent(BaseAgent):
         if qa_data.get("status") == "FAILED":
             recs.append("CRITICAL: Fix failing tests before deploying")
             for obs in qa_data.get("observations", []):
+                if obs.get("severity") == "CRITICAL":
+                    recs.append(f"  → {obs.get('message', '')}")
+
+        sec_data = self.agent_results.get("SecurityAuditor", {})
+        if sec_data.get("status") == "FAILED":
+            recs.append("CRITICAL: Resolve security auditor violations (identity leaks, secrets, or unbounded loops)")
+            for obs in sec_data.get("observations", []):
                 if obs.get("severity") == "CRITICAL":
                     recs.append(f"  → {obs.get('message', '')}")
 

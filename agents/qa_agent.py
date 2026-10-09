@@ -20,6 +20,7 @@ import logging
 import os
 import subprocess
 import hashlib
+import re
 import sys
 from typing import Optional
 
@@ -89,7 +90,7 @@ class QAAgent(BaseAgent):
         observations = []
         try:
             result = subprocess.run(
-                [sys.executable, "-m", "pytest", "--tb=short", "-q", "--no-header"],
+                [sys.executable, "-m", "pytest", "tests/", "--tb=short"],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
@@ -105,29 +106,19 @@ class QAAgent(BaseAgent):
             errors = 0
             failure_details = []
 
-            for line in output.split("\n"):
-                if "passed" in line or "failed" in line:
-                    # "2 failed, 35 passed in 28.66s" or "37 passed in 28.66s"
-                    parts = line.split()
-                    for i, part in enumerate(parts):
-                        # Strip commas: "failed," -> "failed"
-                        clean = part.rstrip(",")
-                        if clean == "passed":
-                            try:
-                                passed = int(parts[i - 1])
-                            except (ValueError, IndexError):
-                                pass
-                        if clean == "failed":
-                            try:
-                                failed = int(parts[i - 1])
-                            except (ValueError, IndexError):
-                                pass
-                        if clean in ("error", "errors"):
-                            try:
-                                errors = int(parts[i - 1])
-                            except (ValueError, IndexError):
-                                pass
+            m_pass = re.search(r"(\d+)\s+passed", output)
+            if m_pass:
+                passed = int(m_pass.group(1))
 
+            m_fail = re.search(r"(\d+)\s+failed", output)
+            if m_fail:
+                failed = int(m_fail.group(1))
+
+            m_err = re.search(r"(\d+)\s+error", output)
+            if m_err:
+                errors = int(m_err.group(1))
+
+            for line in output.split("\n"):
                 if "FAILED" in line:
                     failure_details.append(line.strip())
 

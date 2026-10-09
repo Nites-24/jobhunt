@@ -39,9 +39,8 @@ BANNED_WORDS = {
 }
 
 REQUIRED_URLS = [
-    "https://huggingface.co/spaces/vakaTeja/RetireIQ",
+    os.environ.get("RETIREIQ_URL", "https://huggingface.co/spaces/demo/RetireIQ"),
     "https://rivulet.info",
-    "https://linkedin.com/in/tejagopalreddyvaka/",
 ]
 
 REQUIRED_METRICS = ["33%", "87%"]

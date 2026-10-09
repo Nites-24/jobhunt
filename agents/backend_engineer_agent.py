@@ -331,8 +331,7 @@ class BackendEngineerAgent(BaseAgent):
         """Check S3 bucket accessibility and required files."""
         observations = []
         required_files = [
-            "data/resume/Teja_Vaka.txt",
-            "data/resume/Teja_Vaka.pdf",
+            os.environ.get("RESUME_KEY", "data/resume/resume.pdf"),
         ]
 
         try:

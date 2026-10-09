@@ -230,19 +230,20 @@ class TestAIEngineerAgent:
         ai.name = "AIEngineer"
         
         # Construct a valid email body
+        retireiq_url = os.environ.get("RETIREIQ_URL", "https://huggingface.co/spaces/demo/RetireIQ")
         body = (
             "Hi John,\n\n"
             "Hope you are doing well. I noticed Anthropic is building next-gen "
             "LLM infrastructure, and I have done similar work, reducing GPU costs "
             "by 33% and resolving 87% of support tickets autonomously.\n\n"
-            "My projects RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ) "
+            f"My projects RetireIQ ({retireiq_url}) "
             "is a retirement planning and financial decision support app, and "
             "Rivulet (https://rivulet.info) is a personal life management app.\n\n"
             "Would 20 minutes this week work to connect?\n\n"
             "Best,\n"
-            "Teja Gopal Reddy Vaka\n"
+            "Alex Hunter\n"
             "AI Engineer\n"
-            "https://linkedin.com/in/tejagopalreddyvaka/"
+            "https://linkedin.com/in/candidate/"
         )
 
         result = ai.validate_email("AI Engineer Role at Anthropic", body)
@@ -255,14 +256,15 @@ class TestAIEngineerAgent:
         ai = AIEngineerAgent.__new__(AIEngineerAgent)
         ai.name = "AIEngineer"
         
+        retireiq_url = os.environ.get("RETIREIQ_URL", "https://huggingface.co/spaces/demo/RetireIQ")
         body = (
             "Hi there,\n\n"
             "I am passionate about leveraging cutting-edge AI to create "
             "seamlessly innovative solutions. I am excited and thrilled about "
             "this opportunity. My work reduced costs by 33% and resolved 87% "
-            "of tickets. Check RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ) "
+            f"of tickets. Check RetireIQ ({retireiq_url}) "
             "and Rivulet (https://rivulet.info). "
-            "https://linkedin.com/in/tejagopalreddyvaka/"
+            "https://linkedin.com/in/candidate/"
         )
 
         result = ai.validate_email("Subject", body)
@@ -279,26 +281,27 @@ class TestAIEngineerAgent:
             "I have done great work reducing GPU costs by 33% and resolving "
             "87% of tickets. I would love to connect about this role.\n\n"
             "Would 20 minutes work?\n\n"
-            "Best, Teja"
+            "Best, Alex"
         )
 
         result = ai.validate_email("Subject", body)
         assert result["passed"] is False
-        # Should flag all 3 missing URLs
+        # Should flag all missing required URLs
         url_violations = [v for v in result["violations"] if "URL" in v]
-        assert len(url_violations) == 3
+        assert len(url_violations) == 2
 
     def test_email_validation_exclamation_point(self):
         """Exclamation points should be caught."""
         ai = AIEngineerAgent.__new__(AIEngineerAgent)
         ai.name = "AIEngineer"
         
+        retireiq_url = os.environ.get("RETIREIQ_URL", "https://huggingface.co/spaces/demo/RetireIQ")
         body = (
             "Hi there,\n\n"
             "This is amazing! I reduced costs by 33% and resolved 87% of "
-            "tickets. Check RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ) "
+            f"tickets. Check RetireIQ ({retireiq_url}) "
             "and Rivulet (https://rivulet.info). "
-            "https://linkedin.com/in/tejagopalreddyvaka/"
+            "https://linkedin.com/in/candidate/"
         )
 
         result = ai.validate_email("Subject", body)
@@ -336,6 +339,7 @@ class TestOrchestrator:
         assert "overall_status" in report
         assert "agent_statuses" in report
         assert "QAAgent" in report["agent_statuses"]
+        assert "SecurityAuditor" in report["agent_statuses"]
         assert "recommendations" in report
 
     @patch("agents.qa_agent.subprocess.run")
@@ -381,6 +385,7 @@ class TestAgentIntegration:
         from agents.qa_agent import QAAgent
         from agents.ai_engineer_agent import AIEngineerAgent
         from agents.python_dev_agent import PythonDevAgent
+        from agents.security_auditor_agent import SecurityAuditorAgent
         from agents.orchestrator_agent import OrchestratorAgent
         # BackendEngineerAgent needs AWS — skip import test
 
@@ -388,6 +393,7 @@ class TestAgentIntegration:
         assert QAAgent is not None
         assert AIEngineerAgent is not None
         assert PythonDevAgent is not None
+        assert SecurityAuditorAgent is not None
         assert OrchestratorAgent is not None
 
     def test_agent_observation_dataclass(self):

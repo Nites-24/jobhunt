@@ -1,12 +1,27 @@
 #!/usr/bin/env python3
 """
-Pipeline health-check CLI.
+Multi-Agent Operational Health Check & Diagnostic CLI (run_agents.py)
 
-Usage:
-  python tools/ops/run_agents.py              # Local orchestrator check
-  python tools/ops/run_agents.py --qa         # Run QA agent only
-  python tools/ops/run_agents.py --full       # Include AWS infrastructure agents
-  python tools/ops/run_agents.py --deploy     # Run checks in deploy mode
+Role & Architectural Placement:
+  Coordinates the JobHunt local diagnostic agent suite to verify code quality,
+  test suite regressions, secret safety, identity decoupling, and live AWS infrastructure.
+
+Diagnostic Agents:
+  - QAAgent: Runs offline pytest suites, measures test runtimes, and detects regressions.
+  - SecurityAuditorAgent: Enforces zero-trust identity decoupling, scans for secrets/credentials,
+    and analyzes Python ASTs for unbounded loops.
+  - PythonDevAgent: Inspects code syntax, packaging hygiene, and local file status.
+  - OrchestratorAgent: Aggregates observations across agents and synthesizes health grades (A-F).
+  - BackendEngineerAgent / AIEngineerAgent (enabled with --full): Verifies live AWS queues,
+    DynamoDB tables, Bedrock connectivity, and LLM telemetry.
+
+CLI Usage:
+  python tools/ops/run_agents.py              # Local orchestrator check (offline, zero-spend)
+  python tools/ops/run_agents.py --qa         # Run QA agent only (pytest suite)
+  python tools/ops/run_agents.py --security   # Run Security & Identity Auditor agent only
+  python tools/ops/run_agents.py --full       # Include live AWS infrastructure agents
+  python tools/ops/run_agents.py --deploy     # Run checks before promoting changes
+  python tools/ops/run_agents.py --json       # Output machine-readable JSON health report
 """
 
 import argparse
@@ -63,6 +78,7 @@ def main():
     parser = argparse.ArgumentParser(description="JobHunt multi-agent pipeline health check")
     parser.add_argument("--full", action="store_true", help="Run all agents including AWS checks")
     parser.add_argument("--qa", action="store_true", help="Run QA agent only")
+    parser.add_argument("--security", action="store_true", help="Run Security & Identity Auditor agent only")
     parser.add_argument("--deploy", action="store_true", help="Deploy mode after health check")
     parser.add_argument("--json", action="store_true", help="Output report as JSON")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
@@ -79,6 +95,32 @@ def main():
     print("\n" + "=" * 65)
     print("  JOBHUNT MULTI-AGENT SYSTEM")
     print("=" * 65)
+
+    if args.security:
+        from agents.security_auditor_agent import SecurityAuditorAgent
+        from agents.base_agent import Severity
+
+        sec = SecurityAuditorAgent()
+        print("\n  Running Security & Identity Auditor Agent...\n")
+        obs = sec.observe()
+        critical_count = sum(1 for o in obs if o.severity == Severity.CRITICAL)
+        warning_count = sum(1 for o in obs if o.severity == Severity.WARNING)
+
+        status_str = "HEALTHY" if critical_count == 0 else "FAILED"
+        print(f"  Status: {status_str}")
+        print(f"  Critical Issues: {critical_count}")
+        print(f"  Warnings: {warning_count}")
+
+        if obs:
+            print("\n  Findings:")
+            for o in obs:
+                label = _severity_label(o.severity.value)
+                print(f"    [{label}] {o.message}")
+        else:
+            print("\n  Result: Zero identity leaks, zero hardcoded secrets, and zero unbounded loops verified.")
+
+        print(f"\n{'=' * 65}\n")
+        return 0 if critical_count == 0 else 1
 
     include_aws = args.full or args.deploy
     context = {"deploy": True} if args.deploy else {}

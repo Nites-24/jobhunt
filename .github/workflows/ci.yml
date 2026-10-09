@@ -39,7 +39,7 @@ env:
   RAW_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/123456789012/job-raw-queue
   SNS_TOPIC_ARN: arn:aws:sns:us-east-1:123456789012:jobsearch-approvals
   S3_BUCKET_NAME: job-search-pipeline-memory
-  RESUME_KEY: data/resume/Teja_Vaka.txt
+  RESUME_KEY: data/resume/resume.txt
   SCORE_THRESHOLD: "80"
   BEDROCK_MODEL_ID: us.anthropic.claude-haiku-4-5-20251001-v1:0
   SENDER_LAMBDA_NAME: job-sender
@@ -47,9 +47,13 @@ env:
   TELEGRAM_SECRET_NAME: telegram
   JSEARCH_SECRET_NAME: jobserch/jsearch
   HUNTER_SECRET_NAME: jobsearch/hunterio
-  SENDER_EMAIL: vakateja24@gmail.com
+  CANDIDATE_NAME: "Alex Hunter"
+  TARGET_ROLE: "AI Engineer"
+  CANDIDATE_LOCATION: "open to remote, hybrid, or onsite"
+  SENDER_EMAIL: candidate@example.com
   SECRETS_NAME: jobserch_gmail
   RESUME_BUCKET: job-search-pipeline-memory
+  RETIREIQ_URL: "https://huggingface.co/spaces/demo/RetireIQ"
   CONTEXT_FOLDERS: "config/,data/"
 
 jobs:
