@@ -52,7 +52,7 @@ REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 JSEARCH_API_KEY = os.environ.get("JSEARCH_API_KEY", "")
 DYNAMODB_TABLE = "Jobsearch"
 S3_BUCKET = "job-search-pipeline-memory"
-RESUME_KEY = "data/resume/Teja_Vaka.txt"
+RESUME_KEY = os.environ.get("RESUME_KEY", "data/resume/resume.txt")
 BEDROCK_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 SCORE_THRESHOLD = 80
 
@@ -203,7 +203,7 @@ def step3_score(jobs):
     except Exception as e:
         print(f"  WARNING: Could not load resume from S3: {e}")
         resume = (
-            "Teja Gopal Reddy Vaka, AI Engineer. "
+            "Alex Hunter, AI Engineer. "
             "Python, PyTorch, AWS, RAG, LLMs, LangChain. "
             "33% GPU cost reduction, 87% autonomous ticket resolution."
         )
@@ -368,10 +368,10 @@ def step5_sender_sim(matched_jobs):
                 body = _sanitize_body(result["body"])
 
                 print(f"\n  --- EMAIL PREVIEW ---")
-                print(f"  From: vakateja24@gmail.com")
-                print(f"  To: {job.get('recruiter_email') or 'vakateja24@gmail.com (self, no recruiter found)'}")
+                print(f"  From: candidate@example.com")
+                print(f"  To: {job.get('recruiter_email') or 'candidate@example.com (self, no recruiter found)'}")
                 print(f"  Subject: {subject}")
-                print(f"  Attachment: Teja_Vaka_Resume.pdf")
+                print(f"  Attachment: resume.pdf")
                 print(f"  Tokens: {usage.get('inputTokens', '?')} in / {usage.get('outputTokens', '?')} out")
                 print(f"\n  Body:")
                 print(f"  {'~'*50}")

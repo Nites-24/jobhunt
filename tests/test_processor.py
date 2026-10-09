@@ -43,8 +43,8 @@ class TestProcessor:
         s3.create_bucket(Bucket="job-search-pipeline-memory")
         s3.put_object(
             Bucket="job-search-pipeline-memory",
-            Key="data/resume/Teja_Vaka.txt",
-            Body=b"Teja Vaka - AI Engineer, Python, PyTorch, RAG, LLMs",
+            Key="data/resume/resume.txt",
+            Body=b"Alex Hunter - AI Engineer, Python, PyTorch, RAG, LLMs",
         )
 
         sns = boto3.client("sns", region_name="us-east-1")
@@ -318,7 +318,7 @@ class TestProcessor:
             "job_id": "signal-test-001",
             "title": "AI Engineer Notification Test",
             "company": "Signal Test AI",
-            "location": "Wichita, Kansas",
+            "location": "Austin, Texas",
             "url": "https://example.com/signal-test-ai-engineer",
             "apply_url": "https://example.com/signal-test-ai-engineer",
             "source": "signal_test",
@@ -376,7 +376,7 @@ class TestProcessor:
     def test_processor_logs_source_query_yield_summary(self, mock_bedrock, mock_notify):
         """Batch completion should log compact per-source/query scoring outcomes."""
         mod, table, s3, sns = self._setup_infra()
-        job_high = {**SAMPLE_JOB, "job_id": "job-high", "source": "adzuna", "source_search_query": "AI Engineer"}
+        job_high = {**SAMPLE_JOB, "job_id": "job-high", "source": "google_cse", "source_search_query": "site:greenhouse.io AI Engineer"}
         job_low = {**SAMPLE_JOB, "job_id": "job-low", "source": "hackernews", "source_search_query": "hn_who_is_hiring"}
         table.put_item(Item={"job_id": "job-high", "status": "NEW"})
         table.put_item(Item={"job_id": "job-low", "status": "NEW"})
@@ -394,7 +394,7 @@ class TestProcessor:
         )
         payload = json.loads(summary_call.args[1])
         assert payload == [
-            {"source": "adzuna", "query": "AI Engineer", "evaluated": 1, "matched": 1, "rejected": 0, "failed": 0},
+            {"source": "google_cse", "query": "site:greenhouse.io AI Engineer", "evaluated": 1, "matched": 1, "rejected": 0, "failed": 0},
             {"source": "hackernews", "query": "hn_who_is_hiring", "evaluated": 1, "matched": 0, "rejected": 1, "failed": 0},
         ]
 

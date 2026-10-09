@@ -118,10 +118,10 @@ for block in response["output"]["message"]["content"]:
         body = _sanitize_body(result["body"])
 
         print(f"\n  --- EMAIL PREVIEW ---")
-        print(f"  From: vakateja24@gmail.com")
-        print(f"  To: {clean_job.get('recruiter_email') or 'vakateja24@gmail.com (no recruiter found)'}")
+        print(f"  From: candidate@example.com")
+        print(f"  To: {clean_job.get('recruiter_email') or 'candidate@example.com (no recruiter found)'}")
         print(f"  Subject: {subject}")
-        print(f"  Attachment: Teja_Vaka_Resume.pdf")
+        print(f"  Attachment: resume.pdf")
         print(f"  Tokens: {usage.get('inputTokens', '?')} in / {usage.get('outputTokens', '?')} out")
         print(f"\n  Body:")
         print(f"  {'~'*50}")

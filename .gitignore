@@ -33,3 +33,4 @@ Thumbs.db
 *.secret
 secrets.json
 aws_credentials*
+.purge_rules.txt

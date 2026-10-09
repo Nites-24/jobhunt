@@ -35,7 +35,7 @@ def _make_telegram_event(text, chat_id="99999", headers=None):
             "message": {
                 "text": text,
                 "chat": {"id": int(chat_id)},
-                "from": {"first_name": "Teja"},
+                "from": {"first_name": "Alex"},
             }
         })
     }
@@ -206,7 +206,7 @@ class TestRouter:
 
         msg = mock_tg.call_args[0][2]
         assert "no jobs" in msg.lower() or "search jobs" in msg.lower()
-        assert "tejajob" not in msg
+        assert "practice" not in msg
 
     @patch("job_router.lambda_function._send_telegram")
     def test_list_reports_unscored_backlog(self, mock_tg):
@@ -287,7 +287,7 @@ class TestRouter:
             "title": "AI Outbound Agent Engineer",
             "company": "Northstar Revenue AI",
             "status": "PENDING_APPROVAL",
-            "source": "tejajob",
+            "source": "practice",
             "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("94"),
         })
@@ -536,7 +536,7 @@ class TestRouter:
                 "status": "preview",
                 "email": {
                     "subject": "AI outbound agent role",
-                    "body": "Hi Company2 Team,\n\nPreview body.\n\nBest,\nTeja",
+                    "body": "Hi Company2 Team,\n\nPreview body.\n\nBest,\nAlex",
                 },
             }).encode("utf-8"))
         }
@@ -565,8 +565,8 @@ class TestRouter:
         assert table.get_item(Key={"job_id": "pending-003"})["Item"]["status"] == "PENDING_APPROVAL"
 
     @patch("job_router.lambda_function._send_telegram")
-    def test_tejajob_seeds_reviewable_job(self, mock_tg):
-        """'tejajob' should seed a neutral showcase row into the review queue."""
+    def test_practice_seeds_reviewable_job(self, mock_tg):
+        """'practice' should seed a neutral showcase row into the review queue."""
         mod, table = self._setup_infra()
         mod.ENABLE_PRACTICE_MODE = True
         mock_tg.return_value = True
@@ -580,21 +580,21 @@ class TestRouter:
             "match_score": Decimal("94"),
         })
 
-        event = _make_telegram_event("tejajob")
+        event = _make_telegram_event("practice")
         mod.lambda_handler(event, MockContext())
 
         jobs = mod._get_pending_jobs(limit=5)
         assert len(jobs) == 1
-        assert jobs[0]["source"] == "tejajob"
+        assert jobs[0]["source"] == "showcase"
         assert jobs[0]["company"] == "Northstar Revenue AI"
         assert jobs[0]["apply_url"] == ""
         assert table.get_item(Key={"job_id": "old-showcase"})["Item"]["status"] == "REJECTED"
-        assert "TejaJob workspace is ready" in mock_tg.call_args[0][2]
+        assert "Practice workspace is ready" in mock_tg.call_args[0][2]
         assert "practice opportunity" in mock_tg.call_args[0][2]
 
     @patch("job_router.lambda_function._send_telegram")
     @patch("job_router.lambda_function.lambda_client")
-    def test_apply_tejajob_completes_practice_without_fake_link(self, mock_lambda, mock_tg):
+    def test_apply_practice_completes_practice_without_fake_link(self, mock_lambda, mock_tg):
         """Applying to the practice item should not expose fake links or send email."""
         mod, table = self._setup_infra()
         mod.ENABLE_PRACTICE_MODE = True
@@ -614,27 +614,27 @@ class TestRouter:
         assert "example.com" not in msg
 
     @patch("job_router.lambda_function._send_telegram")
-    def test_tejajob_disabled_in_production(self, mock_tg):
+    def test_practice_disabled_in_production(self, mock_tg):
         """Practice rows should not be created when practice mode is disabled."""
         mod, table = self._setup_infra()
         mock_tg.return_value = True
         table.put_item(Item={
-            "job_id": "old-tejajob",
+            "job_id": "old-practice",
             "title": "AI Outbound Agent Engineer",
             "company": "Northstar Revenue AI",
             "status": "PENDING_APPROVAL",
-            "source": "tejajob",
+            "source": "practice",
             "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "match_score": Decimal("94"),
         })
 
-        event = _make_telegram_event("tejajob")
+        event = _make_telegram_event("practice")
         mod.lambda_handler(event, MockContext())
 
         msg = mock_tg.call_args[0][2]
         assert "Practice mode is disabled" in msg
         assert mod._get_pending_jobs(limit=5) == []
-        assert table.get_item(Key={"job_id": "old-tejajob"})["Item"]["status"] == "REJECTED"
+        assert table.get_item(Key={"job_id": "old-practice"})["Item"]["status"] == "REJECTED"
 
     @patch("job_router.lambda_function._send_telegram")
     def test_explain_shows_match_reason(self, mock_tg):
@@ -664,7 +664,7 @@ class TestRouter:
                 "status": "preview",
                 "email": {
                     "subject": "AI outbound agent role",
-                    "body": "Hi Company1 Team,\n\nPreview body.\n\nBest,\nTeja",
+                    "body": "Hi Company1 Team,\n\nPreview body.\n\nBest,\nAlex",
                 },
             }).encode("utf-8"))
         }
@@ -695,7 +695,7 @@ class TestRouter:
                 "generated_with_fallback": True,
                 "email": {
                     "subject": "AI Engineer role at Company1",
-                    "body": "Hi Company1 Team,\n\nFallback body.\n\nBest,\nTeja",
+                    "body": "Hi Company1 Team,\n\nFallback body.\n\nBest,\nAlex",
                 },
             }).encode("utf-8"))
         }
@@ -913,7 +913,7 @@ class TestRouter:
             "job_id": "signal-test-001",
             "title": "AI Engineer Notification Test",
             "company": "Signal Test AI",
-            "location": "Wichita, Kansas",
+            "location": "Austin, Texas",
             "status": "PENDING_APPROVAL",
             "source": "signal_test",
             "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -987,7 +987,7 @@ class TestRouter:
             "job_id": "signal-test-001",
             "title": "AI Engineer Notification Test",
             "company": "Signal Test AI",
-            "location": "Wichita, Kansas",
+            "location": "Austin, Texas",
             "status": "PENDING_APPROVAL",
             "source": "signal_test",
             "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -1139,9 +1139,8 @@ class TestRouter:
         mod.lambda_handler(event, MockContext())
 
         msg = mock_tg.call_args[0][2]
-        assert "Fresh AI-matched roles for Teja." in msg
-        assert "tejajob" not in msg
-        assert "complete practice" not in msg
+        assert "Fresh AI-matched roles ready for review." in msg
+        assert "practice" not in msg
         assert "Start with Next Match." in msg
         assert "Use Search for a new scan." in msg
         assert "Use Follow-up for jobs you acted on." in msg
@@ -1501,7 +1500,7 @@ class TestWorkModeUncertainty:
             "work_mode": "remote",
             "work_mode_source": "job_is_remote",
             "match_score": 90,
-            "source": "adzuna",
+            "source": "greenhouse",
         })
         assert "⚠️" not in card
         assert "remote" in card
@@ -2468,8 +2467,8 @@ def test_one_day_freshness_rule_filters_stale_jobs_from_review_queue(monkeypatch
         "job_id": "fresh-001",
         "title": "Fresh AI Engineer",
         "company": "Acme Fresh",
-        "source": "adzuna",
-        "url": "https://jobs.adzuna.com/details/fresh-1",
+        "source": "greenhouse",
+        "url": "https://boards.greenhouse.io/details/fresh-1",
         "status": "PENDING_APPROVAL",
         "match_score": 85,
         "posted_at": fresh_time,
@@ -2478,8 +2477,8 @@ def test_one_day_freshness_rule_filters_stale_jobs_from_review_queue(monkeypatch
         "job_id": "stale-001",
         "title": "Stale AI Engineer",
         "company": "Acme Stale",
-        "source": "adzuna",
-        "url": "https://jobs.adzuna.com/details/stale-1",
+        "source": "greenhouse",
+        "url": "https://boards.greenhouse.io/details/stale-1",
         "status": "PENDING_APPROVAL",
         "match_score": 90,
         "posted_at": stale_time,

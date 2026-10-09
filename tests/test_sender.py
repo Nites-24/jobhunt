@@ -30,7 +30,7 @@ class TestSender:
         """Create DynamoDB, S3, and Secrets resources."""
         import os
         os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
-        os.environ["RESUME_KEY"] = "data/resume/Teja_Vaka.pdf"  # Override conftest default
+        os.environ["RESUME_KEY"] = "data/resume/resume.pdf"  # Override conftest default
 
         dynamo = boto3.resource("dynamodb", region_name="us-east-1")
         table = dynamo.create_table(
@@ -45,7 +45,7 @@ class TestSender:
         s3.create_bucket(Bucket="job-search-pipeline-memory")
         s3.put_object(
             Bucket="job-search-pipeline-memory",
-            Key="data/resume/Teja_Vaka.pdf",
+            Key="data/resume/resume.pdf",
             Body=b"%PDF-1.4 test resume content",
         )
 
@@ -61,7 +61,7 @@ class TestSender:
         mod.s3_client = s3
         mod.secrets_client = sm
         mod.BUCKET = "job-search-pipeline-memory"
-        mod.RESUME_KEY = "data/resume/Teja_Vaka.pdf"
+        mod.RESUME_KEY = "data/resume/resume.pdf"
         mod.ALLOW_REAL_EMAIL_SEND = False
         mod._cached_resume = None
         mod._cached_creds = None
@@ -83,13 +83,13 @@ class TestSender:
                 "Anthropic's role points at reliable RAG evaluation and agent workflows. "
                 "My recent agent work is close to that: retrieve evidence, score results, "
                 "and keep a human approval step before action.\n\n"
-                "RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ) is a retirement "
+                "RetireIQ is a retirement "
                 "planning and financial decision support app, and Rivulet "
-                "(https://rivulet.info) is a personal life management app.\n\n"
-                "I am currently based in Wichita, Kansas, and I am open to remote, hybrid, "
+                "is a personal life management app.\n\n"
+                "I am currently based in San Francisco, CA, and I am open to remote, hybrid, "
                 "or onsite roles in any location, including relocation.\n\n"
                 "Would 20 minutes this week work to connect?\n\n"
-                "Best,\nTeja Gopal Reddy Vaka\nAI Engineer"
+                "Best,\nAlex Hunter\nAI Engineer"
             )
         return {
             "output": {
@@ -134,7 +134,7 @@ class TestSender:
         mod, table = self._setup_infra()
         mock_bedrock.converse.return_value = self._mock_bedrock_email_response(
             subject="AI outbound agent role",
-            body="Hi Anthropic Team,\n\nPreview body.\n\nBest,\nTeja",
+            body="Hi Anthropic Team,\n\nPreview body.\n\nBest,\nAlex",
         )
 
         result = mod.lambda_handler({"preview_only": True, "job": SAMPLE_JOB}, MockContext())
@@ -164,7 +164,7 @@ class TestSender:
         assert result["status"] == "preview"
         assert result["generated_with_fallback"] is True
         assert "role at Anthropic" in result["email"]["subject"]
-        assert "RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ)" in result["email"]["body"]
+        assert "RetireIQ" in result["email"]["body"]
         assert "Rivulet (https://rivulet.info)" not in result["email"]["body"]
         assert "If this looks relevant, would 20 minutes this week work to connect?" in result["email"]["body"]
         assert mock_sleep.call_count == mod.BEDROCK_THROTTLE_RETRIES
@@ -348,7 +348,7 @@ class TestSender:
         mod, _ = self._setup_infra()
         mock_bedrock.converse.return_value = self._mock_bedrock_email_response(
             subject="AI Engineer role",
-            body="Hi Engineering Square Team,\n\nI saw the role.\n\nBest,\nTeja",
+            body="Hi Engineering Square Team,\n\nI saw the role.\n\nBest,\nAlex",
         )
         job = {
             **SAMPLE_JOB,
@@ -373,7 +373,7 @@ class TestSender:
                 "Hi Engineering Square Team,\n\n"
                 "I've been building production AI systems at Empower for the past few years, "
                 "and your focus on shipping fast with ownership resonates with how I work.\n\n"
-                "Best,\nTeja"
+                "Best,\nAlex"
             ),
         )
         job = {
@@ -390,7 +390,7 @@ class TestSender:
         assert "shipping fast with ownership" not in email["body"]
         assert "resonates" not in email["body"]
         assert "Engineering Square stood out to me because the role is centered on Python, PyTorch, and RAG systems" in email["body"]
-        assert "RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ)" in email["body"]
+        assert "RetireIQ" in email["body"]
         assert "Rivulet (https://rivulet.info)" not in email["body"]
 
     @patch("job_sender.lambda_function.bedrock_client")
@@ -406,7 +406,7 @@ class TestSender:
                 "I've spent the last months working on agentic systems that reduce operational overhead, and I'm interested in how Hyperspell is approaching this problem at scale.\n\n"
                 "I've built RetireIQ, a financial decision support app that uses LLM orchestration to handle complex user queries, "
                 "and Rivulet, a personal life management system that coordinates multiple agent workflows.\n\n"
-                "Best,\nTeja"
+                "Best,\nAlex"
             ),
         )
         job = {
@@ -427,7 +427,7 @@ class TestSender:
         assert "personal life management system that coordinates multiple agent workflows" not in email["body"]
         assert "Hyperspell stood out to me because the role is centered on context and memory for AI agents" in email["body"]
         assert "private autonomous AI outreach agent" in email["body"]
-        assert "RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ)" not in email["body"]
+        assert "RetireIQ" not in email["body"]
         assert "Rivulet (https://rivulet.info)" not in email["body"]
 
     @patch("job_sender.lambda_function.bedrock_client")
@@ -437,7 +437,7 @@ class TestSender:
         mod, _ = self._setup_infra()
         mock_bedrock.converse.return_value = self._mock_bedrock_email_response(
             subject="AI Engineer at Hyperspell",
-            body="Hi Manu,\n\nHyperspell is building context and memory for AI agents.\n\nBest,\nTeja",
+            body="Hi Manu,\n\nHyperspell is building context and memory for AI agents.\n\nBest,\nAlex",
         )
         job = {
             **SAMPLE_JOB,
@@ -459,7 +459,7 @@ class TestSender:
         mod, _ = self._setup_infra()
         mock_bedrock.converse.return_value = self._mock_bedrock_email_response(
             subject="AI Engineer application",
-            body="Hi Engineering Square hiring team,\n\nEngineering Square's AI Engineer role looks close to the practical AI product work I want to keep doing.\n\nBest,\nTeja",
+            body="Hi Engineering Square hiring team,\n\nEngineering Square's AI Engineer role looks close to the practical AI product work I want to keep doing.\n\nBest,\nAlex",
         )
         job = {
             **SAMPLE_JOB,

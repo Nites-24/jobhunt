@@ -21,7 +21,7 @@ def test_summarize_feedback_counts_labels_sources_and_reasons():
             "label": "neutral",
             "stage": "review_feedback",
             "reason": "draft generic",
-            "job": {"source": "adzuna"},
+            "job": {"source": "google_cse"},
         },
         {
             "label": "positive",

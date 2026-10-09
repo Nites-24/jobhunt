@@ -235,7 +235,7 @@ class TestDeduplicator:
         job2 = {
             **SAMPLE_JOB,
             "job_id": "test-job-002",
-            "source": "adzuna",
+            "source": "google_cse",
             "source_search_query": "LLM Engineer",
         }
 
@@ -248,6 +248,6 @@ class TestDeduplicator:
         )
         payload = json.loads(summary_call.args[1])
         assert payload == [
-            {"source": "adzuna", "query": "LLM Engineer", "new": 1, "requeued": 0, "duplicate": 0, "failed": 0},
+            {"source": "google_cse", "query": "LLM Engineer", "new": 1, "requeued": 0, "duplicate": 0, "failed": 0},
             {"source": "jsearch", "query": "-", "new": 1, "requeued": 0, "duplicate": 0, "failed": 0},
         ]

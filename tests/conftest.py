@@ -62,7 +62,7 @@ def set_env_vars(monkeypatch):
         "BEDROCK_MODEL_ID": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
         "SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:123456789012:jobsearch-approvals",
         "S3_BUCKET_NAME": "job-search-pipeline-memory",
-        "RESUME_KEY": "data/resume/Teja_Vaka.txt",
+        "RESUME_KEY": "data/resume/resume.txt",
         "SCORE_THRESHOLD": "80",
         "CONTEXT_FOLDERS": "config/,data/",
         # Router
@@ -70,10 +70,14 @@ def set_env_vars(monkeypatch):
         "SENDER_LAMBDA_NAME": "job-sender",
         "INGESTOR_LAMBDA_NAME": "job-ingestor",
         "REQUIRE_TELEGRAM_WEBHOOK_SECRET": "false",
-        # Sender
-        "SENDER_EMAIL": "vakateja24@gmail.com",
+        # Candidate Identity Decoupling
+        "CANDIDATE_NAME": "Alex Hunter",
+        "TARGET_ROLE": "AI Engineer",
+        "CANDIDATE_LOCATION": "open to remote, hybrid, or onsite",
+        "SENDER_EMAIL": "candidate@example.com",
         "SECRETS_NAME": "jobserch_gmail",
         "RESUME_BUCKET": "job-search-pipeline-memory",
+        "RETIREIQ_URL": "https://huggingface.co/spaces/demo/RetireIQ",
     }
     for key, value in env.items():
         monkeypatch.setenv(key, value)
@@ -139,20 +143,20 @@ def s3_bucket():
         client.create_bucket(Bucket="job-search-pipeline-memory")
         # Upload a text resume
         resume_text = (
-            "Teja Gopal Reddy Vaka — Senior AI Engineer\n"
+            "Alex Hunter — Senior AI Engineer\n"
             "Skills: Python, PyTorch, AWS, LangChain, RAG, LLMs, Vector DBs\n"
-            "Experience: Empower — 33% GPU cost reduction, 87% ticket resolution\n"
+            "Experience: 33% GPU cost reduction, 87% ticket resolution\n"
             "Projects: RetireIQ (retirement planning and financial decision support), Rivulet (personal life management)\n"
-            "Location: Wichita, Kansas. Open to relocate. Open to remote, hybrid, or onsite roles in any location.\n"
+            "Location: San Francisco, CA. Open to relocate. Open to remote, hybrid, or onsite roles in any location.\n"
         )
         client.put_object(
             Bucket="job-search-pipeline-memory",
-            Key="data/resume/Teja_Vaka.txt",
+            Key="data/resume/resume.txt",
             Body=resume_text.encode("utf-8"),
         )
         client.put_object(
             Bucket="job-search-pipeline-memory",
-            Key="data/resume/Teja_Vaka.pdf",
+            Key="data/resume/resume.pdf",
             Body=b"%PDF-1.4 fake resume pdf bytes",
         )
         yield client

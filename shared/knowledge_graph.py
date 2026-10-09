@@ -1,19 +1,44 @@
-"""Compact candidate knowledge graph helpers.
+"""
+Candidate Knowledge Graph & Token-Efficient Memory Engine (knowledge_graph.py)
 
-These helpers turn verbose resume/project text into a small structured profile that
-can be reused across scorer and sender prompts. The goal is to reduce recurring
-prompt tokens while keeping the highest-signal evidence.
+Role & Architectural Placement:
+  Provides a structured, token-compact candidate memory representation shared across
+  evaluation (`job-processor`) and outreach drafting (`job-sender`).
+
+Why This Exists:
+  Raw candidate resumes consume 1,500 - 3,000 tokens per LLM invocation, driving up
+  inference costs and latency. The Knowledge Graph extracts high-signal, verifiable candidate
+  facts (skills, domain focus areas, real projects, verified quantitative metrics) into a
+  dense representation consuming < 150 prompt tokens.
+
+Core Design Invariants:
+  1. Identity Decoupling:
+     Candidate identity is decoupled from git-tracked code. All personal identifiers are injected
+     at runtime via environment variables (CANDIDATE_NAME, TARGET_ROLE, RETIREIQ_URL).
+  2. Grounded Evidence & Anti-Hallucination:
+     Outreach generators and scoring prompts are strictly constrained to facts present in the graph:
+     - Real projects: RetireIQ, Rivulet
+     - Quantitative evidence: 33% GPU cost reduction, 87% autonomous ticket resolution
+     - Work mode preferences: Open to remote, hybrid, onsite, any location.
+  3. Deterministic Extraction:
+     Uses regex pattern matching against candidate documents (`SKILL_PATTERNS`, `FOCUS_PATTERNS`,
+     `PROJECT_PATTERNS`) to produce consistent graph representations.
+
+Primary Exports:
+  - `build_candidate_graph(...)`: Extracts structured profile dictionary from text or defaults.
+  - `render_candidate_graph(...)`: Renders compact, prompt-ready markdown for Bedrock system prompts.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Iterable
 
 
 DEFAULT_GRAPH = {
-    "candidate_name": "Teja Gopal Reddy Vaka",
-    "target_role": "AI Engineer",
+    "candidate_name": os.environ.get("CANDIDATE_NAME", "AI Candidate").strip() or "AI Candidate",
+    "target_role": os.environ.get("TARGET_ROLE", "AI Engineer").strip() or "AI Engineer",
     "focus_areas": [
         "RAG pipelines",
         "LLM orchestration",
@@ -32,7 +57,7 @@ DEFAULT_GRAPH = {
         {
             "name": "RetireIQ",
             "summary": "retirement planning and financial decision support app",
-            "url": "https://huggingface.co/spaces/vakaTeja/RetireIQ",
+            "url": os.environ.get("RETIREIQ_URL", "https://huggingface.co/spaces/demo/RetireIQ"),
         },
         {
             "name": "Rivulet",
@@ -45,11 +70,9 @@ DEFAULT_GRAPH = {
         "87% autonomous ticket resolution",
     ],
     "preferences": [
-        "currently in Wichita, Kansas",
         "open to remote, hybrid, or onsite",
         "open to any location",
         "open to relocate",
-        "CPT student",
     ],
 }
 
@@ -79,7 +102,7 @@ PROJECT_PATTERNS = [
         "RetireIQ",
         r"\bretireiq\b",
         "retirement planning and financial decision support app",
-        "https://huggingface.co/spaces/vakaTeja/RetireIQ",
+        os.environ.get("RETIREIQ_URL", "https://huggingface.co/spaces/demo/RetireIQ"),
     ),
     (
         "Rivulet",
@@ -90,11 +113,9 @@ PROJECT_PATTERNS = [
 ]
 
 PREFERENCE_PATTERNS = [
-    ("currently in Wichita, Kansas", r"wichita|kansas"),
     ("open to remote, hybrid, or onsite", r"remote|onsite|on-site|hybrid"),
     ("open to any location", r"open to any location|all locations|any location|anywhere|relocat"),
     ("open to relocate", r"relocat"),
-    ("CPT student", r"\bcpt\b"),
 ]
 
 
@@ -144,14 +165,37 @@ def _extract_projects(text: str) -> list[dict]:
     return projects[:4]
 
 
-def build_candidate_graph(*text_parts: str) -> dict:
+def build_candidate_graph(
+    *text_parts: str,
+    candidate_name: str | None = None,
+    target_role: str | None = None,
+) -> dict:
     text = _normalized_text(text_parts)
+    effective_candidate = candidate_name or os.environ.get("CANDIDATE_NAME", "").strip()
+    if not effective_candidate:
+        name_match = re.match(r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\s+(?:AI|ML|Software|Data|Lead|Senior)\b", text)
+        if name_match:
+            effective_candidate = name_match.group(1).strip()
+        else:
+            effective_candidate = DEFAULT_GRAPH["candidate_name"]
+
+    effective_role = target_role or os.environ.get("TARGET_ROLE", "").strip()
+    if not effective_role:
+        role_match = re.search(r"\b(AI\s+Engineer|ML\s+Engineer|Machine\s+Learning\s+Engineer|Lead\s+ML\s+Architect)\b", text, re.IGNORECASE)
+        if role_match:
+            effective_role = role_match.group(1).strip()
+        else:
+            effective_role = DEFAULT_GRAPH["target_role"]
+
     if not text:
-        return dict(DEFAULT_GRAPH)
+        base = dict(DEFAULT_GRAPH)
+        base["candidate_name"] = effective_candidate
+        base["target_role"] = effective_role
+        return base
 
     graph = {
-        "candidate_name": DEFAULT_GRAPH["candidate_name"],
-        "target_role": DEFAULT_GRAPH["target_role"],
+        "candidate_name": effective_candidate,
+        "target_role": effective_role,
         "focus_areas": _extract_matches(text, FOCUS_PATTERNS) or list(DEFAULT_GRAPH["focus_areas"]),
         "skills": _extract_matches(text, SKILL_PATTERNS) or list(DEFAULT_GRAPH["skills"]),
         "projects": _extract_projects(text),
