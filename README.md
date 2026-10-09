@@ -243,7 +243,9 @@ python tools/ops/check_status.py
 
 ## Documentation
 
+- [AWS Step-by-Step Setup Guide](docs/aws_setup_guide.md) — Complete walkthrough from zero to deployed AWS pipeline
 - [Architecture Doc](docs/Architecture_Doc.md) — Full system design with diagrams
+- [Deployment & Rollback Guide](docs/deployment.md) — Production operations & configuration guide
 - [Implementation Log: May 13](docs/implementation_2026_05_13.md) — Production debug session
 - [Implementation Log: May 14](docs/implementation_2026_05_14.md) — UX and feedback improvements
 - [Sprint Report](docs/sprint_report_2026_05_12.md) — Initial architecture decisions
