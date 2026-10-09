@@ -28,19 +28,40 @@ logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# Sensitive personal patterns that must NEVER be committed in tracked code
-SENSITIVE_IDENTITY_PATTERNS = [
-    (r"\bTeja\s+Gopal\s+Reddy\s+Vaka\b", "Full personal name 'Teja Gopal Reddy Vaka'"),
-    (r"\bTeja\s+Vaka\b", "Personal name 'Teja Vaka'"),
-    (r"\bvakateja24@gmail\.com\b", "Personal email 'vakateja24@gmail.com'"),
-    (r"\bteja@deepmind\.com\b", "Hardcoded email 'teja@deepmind.com'"),
-    (r"\bCPT\s+student\b", "Immigration/visa status 'CPT student'"),
-    (r"\bWichita,\s*Kansas\b", "Personal location 'Wichita, Kansas'"),
-    (r"linkedin\.com/in/tejagopalreddyvaka", "Personal LinkedIn URL"),
-    (r"data/resume/Teja_Vaka\.(pdf|txt)", "Personal resume path 'Teja_Vaka'"),
-    (r"\bvakaTeja\b", "Personal handle 'vakaTeja'"),
-    (r"\btejajob\b", "Personal practice identifier 'tejajob'"),
-]
+def get_identity_patterns() -> List[Tuple[str, str]]:
+    """Dynamically resolve identity patterns from runtime environment & generic PII regexes."""
+    patterns: List[Tuple[str, str]] = [
+        (r"\b[a-zA-Z0-9_.+-]+@(gmail|yahoo|hotmail|outlook)\.com\b", "Personal email domain in tracked code"),
+        (r"\b\+1[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", "Personal phone number in tracked code"),
+        (r"\bCPT\s+student\b", "Immigration/visa status 'CPT student'"),
+        (r"data/resume/[A-Za-z]+_[A-Za-z]+\.(pdf|txt)", "Personal resume path pattern"),
+    ]
+
+    # Dynamically inject candidate identity if configured in runtime environment
+    candidate_name = os.environ.get("CANDIDATE_NAME")
+    if candidate_name and candidate_name.strip() and candidate_name.lower() not in ("candidate name", "alex hunter"):
+        name_parts = [re.escape(p) for p in candidate_name.strip().split()]
+        patterns.append((r"\b" + r"\s+".join(name_parts) + r"\b", f"Candidate name '{candidate_name}'"))
+
+    sender_email = os.environ.get("SENDER_EMAIL")
+    if sender_email and sender_email.strip() and sender_email.lower() not in ("candidate@example.com", "sender@example.com"):
+        patterns.append((re.escape(sender_email.strip()), f"Candidate email '{sender_email}'"))
+
+    candidate_loc = os.environ.get("CANDIDATE_LOCATION")
+    if candidate_loc and candidate_loc.strip() and candidate_loc.lower() not in ("open to remote", "remote", "any"):
+        patterns.append((re.escape(candidate_loc.strip()), f"Candidate location '{candidate_loc}'"))
+
+    linkedin = os.environ.get("CANDIDATE_LINKEDIN")
+    if linkedin and "linkedin.com/in/" in linkedin and "example" not in linkedin:
+        handle = linkedin.rstrip("/").split("/")[-1]
+        if handle and len(handle) > 3:
+            patterns.append((re.escape(handle), f"Candidate LinkedIn handle '{handle}'"))
+
+    return patterns
+
+
+# Sensitive personal patterns resolved dynamically
+SENSITIVE_IDENTITY_PATTERNS = get_identity_patterns()
 
 # Secret patterns
 SECRET_PATTERNS = [
