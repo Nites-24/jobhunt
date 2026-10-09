@@ -1,3 +1,18 @@
+"""
+Lambda Configuration Inspector (check_config.py)
+
+Role & Operational Context:
+  Inspects the active configuration of deployed AWS Lambda functions in the JobHunt pipeline,
+  specifically checking environment variables like SEARCH_QUERIES on the `job-ingestor` function.
+
+Usage:
+  python tools/ops/check_config.py
+
+Outputs:
+  Prints current SEARCH_QUERIES configured in AWS Lambda, allowing operators to verify
+  that production Lambdas are using the correct queries for Hacker News, Google CSE, and ATS boards.
+"""
+
 import os, boto3
 
 with open(".env") as f:

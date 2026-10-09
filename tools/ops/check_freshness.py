@@ -1,4 +1,24 @@
-"""Check how fresh the pending jobs are."""
+"""
+Pending Job Freshness & Ingestor Configuration Auditor (check_freshness.py)
+
+Role & Operational Context:
+  Audits the posting freshness of all opportunities in 'PENDING_APPROVAL' status
+  and inspects the current date/freshness configuration of the `job-ingestor` Lambda.
+
+Workflow:
+  1. Computes current UTC timestamp.
+  2. Scans DynamoDB 'Jobsearch' table for all pending jobs.
+  3. Parses each job's 'posted_at' timestamp and calculates elapsed age in hours/days.
+  4. Prints human-readable age breakdowns sorted newest-first.
+  5. Queries the AWS Lambda API for `job-ingestor` environment variables:
+     - DATE_POSTED
+     - FRESHNESS_HOURS
+     - SEARCH_QUERIES
+     - NUM_PAGES
+
+Usage:
+  python tools/ops/check_freshness.py
+"""
 import os, boto3
 from datetime import datetime, timezone
 

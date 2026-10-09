@@ -1,9 +1,20 @@
 """
-Canonical URL validation utilities for job search pipeline.
+Canonical URL & SSRF Defense Utilities (url_validation.py)
 
-Enforces strict source URL requirements so that unverifiable leads, placeholder
-values (e.g. 'Unavailable', 'N/A'), malformed links, or internal addresses
-never enter the review, draft, or application pipelines.
+Role & Architectural Placement:
+  Enforces strict source URL requirements and SSRF (Server-Side Request Forgery) protection
+  across all stages of the JobHunt pipeline (ingestion, processing, review, and dispatch).
+
+Why This Exists:
+  1. Grounding Invariant: Unverifiable leads, placeholder text ('Unavailable', 'N/A', 'None'),
+     or malformed links must never enter the candidate review or outreach pipelines.
+  2. SSRF Protection: Blocks attempts to query internal networks, localhost, link-local addresses,
+     or AWS instance metadata (`169.254.169.254`) during outbound link fetching.
+  3. Format Standardization: Ensures web addresses are strictly HTTP/HTTPS with valid public FQDNs.
+
+Primary Functions:
+  - `is_valid_canonical_url(url)`: Returns True if the string is a valid, non-internal HTTP/HTTPS URL.
+  - `get_canonical_job_url(job)`: Extracts the first valid URL from `url` or `apply_url` fields.
 """
 
 from typing import Any

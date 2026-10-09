@@ -1,4 +1,21 @@
-"""Find a real recruiter email for a job and update DynamoDB, then you can 'apply' in Telegram."""
+"""
+Targeted Recruiter Discovery & Contact Injection Utility (find_recruiter.py)
+
+Role & Operational Context:
+  Performs live queries against the Hunter.io Domain Search API to discover verified
+  Human Resources / Talent Acquisition contacts for target companies and injects them
+  directly into DynamoDB job records.
+
+Workflow:
+  1. Retrieves Hunter.io credentials from AWS Secrets Manager (`jobsearch/hunterio`).
+  2. Scans DynamoDB 'Jobsearch' for top 'PENDING_APPROVAL' jobs.
+  3. Queries Hunter.io domain search filtering by department=human_resources.
+  4. Injects discovered recruiter name and email into DynamoDB.
+  5. Prepares the job record for Telegram 'apply <n>' outreach dispatch.
+
+Usage:
+  python tools/ops/find_recruiter.py
+"""
 
 import os, json, boto3, urllib.request
 

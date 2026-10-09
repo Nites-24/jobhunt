@@ -1,4 +1,20 @@
-"""Fix job-router IAM: add lambda:InvokeFunction permission and check env vars."""
+"""
+IAM Permission & Environment Repair Utility (fix_iam.py)
+
+Role & Operational Context:
+  Inspects the IAM execution role and configuration of `job-router` and attaches
+  necessary permissions for direct Lambda-to-Lambda invocation.
+
+Workflow:
+  1. Inspects `job-router` execution role, timeout, memory, and environment variables.
+  2. Lists all attached and inline IAM policies on the role.
+  3. Attaches the `invoke-pipeline-lambdas` inline policy granting `lambda:InvokeFunction`
+     permissions targeting `job-ingestor` (for search jobs) and `job-sender` (for draft preview).
+  4. Audits environment variables across all 5 production Lambdas.
+
+Usage:
+  python tools/ops/fix_iam.py
+"""
 
 import os, json, boto3
 

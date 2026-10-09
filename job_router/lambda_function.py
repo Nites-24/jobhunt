@@ -1,12 +1,63 @@
 """
-Job Router Lambda - Telegram command center.
+Job Router Lambda — Telegram Control Plane & Human-in-the-Loop Gateway
 
-Handles:
-  1. SNS notifications from job-processor and forwards them to Telegram.
-  2. Telegram webhook commands for search, list, apply, reject, status, and help.
+=============================================================================
+PIPELINE ROLE & ARCHITECTURE
+=============================================================================
+Trigger 1:  API Gateway HTTP POST from Telegram Webhook (user commands & callbacks)
+Trigger 2:  Amazon SNS topic 'jobsearch-approvals' (high-match alerts from job-processor)
+Invocation: Invokes job-ingestor (async for 'search jobs') and job-sender (sync for 'draft'/'send')
+Datastore:  Reads/updates opportunity state in DynamoDB ('Jobsearch' table)
 
-The review queue intentionally hides stale rows and old source experiments. This keeps
-the demo aligned with the product promise: fresh, high-confidence AI roles only.
+=============================================================================
+SUPPORTED TELEGRAM COMMANDS & CONTROLS
+=============================================================================
+- Discovery:
+  * 'search jobs'    → Invokes job-ingestor to scan all configured sources asynchronously.
+  * 'list'           → Displays top reviewable pending jobs ranked by match score.
+  * 'next'           → Presents the single freshest, highest-match card with action buttons.
+  * 'why [N]'        → Explains scoring rationale, strengths, and gaps from stored eval data.
+- Outreach & Decisions:
+  * 'draft [N]'      → Invokes job-sender in preview mode to generate a concise outreach draft.
+  * 'apply [N]'      → Displays direct apply link & contact for manual follow-up (AIR-GAPPED).
+  * 'skip [reason]'  → Rejects the current card and stores the skip reason for eval modeling.
+  * 'send 1'         → Triggers real email delivery ONLY if both security gates are enabled.
+- Feedback & Learning Loop:
+  * 'interested N' / 'meh N <reason>' / 'not interested N <reason>' → Persists labeled preferences.
+  * 'followups' / 'applied' / 'not applied <reason>' → Tracks real-world application outcomes.
+- Diagnostics & Onboarding:
+  * 'status'         → Shows queue counts, stage distributions, and source breakdown.
+  * 'practice'       → Seeds an interview-safe practice card to explore the bot workflow.
+
+=============================================================================
+SECURITY & OPERATIONAL INVARIANTS
+=============================================================================
+- Air-Gapped Outreach (Gate 1): 'apply' NEVER sends email. Real email dispatch via
+  'send 1' requires ALLOW_TELEGRAM_EMAIL_SEND=true AND Gate 2 on job-sender.
+- Review Queue Freshness: Enforces strict freshness (1 day generic, 3 days HN) so the
+  candidate never sees stale or expired postings.
+- Source Link Integrity: Unverifiable or missing source links are filtered out of review.
+- Webhook Secret Validation: Optional X-Telegram-Bot-Api-Secret-Token header check.
+
+=============================================================================
+ENVIRONMENT VARIABLES & SECRETS
+=============================================================================
+- TELEGRAM_SECRET_NAME:            Secrets Manager secret ID for bot token & chat ID
+- DYNAMODB_TABLE:                  DynamoDB table name (default: 'Jobsearch')
+- SENDER_LAMBDA_NAME:              Name of job-sender Lambda function (default: 'job-sender')
+- INGESTOR_LAMBDA_NAME:            Name of job-ingestor Lambda function (default: 'job-ingestor')
+- SCORE_THRESHOLD:                 Review threshold score (default: 80)
+- MAX_JOB_AGE_DAYS:                Review queue freshness window in days (default: 1)
+- HN_MAX_JOB_AGE_DAYS:             Hacker News freshness window in days (default: 3)
+- ALLOW_TELEGRAM_EMAIL_SEND:       Gate 1 flag to allow 'send' command (default: false)
+- REQUIRE_TELEGRAM_WEBHOOK_SECRET: Whether to enforce webhook token header (default: false)
+
+=============================================================================
+DEVELOPER & MAINTENANCE GUIDE
+=============================================================================
+- Modifying Telegram keyboards: Update `_build_help_navigation()` and `_make_review_keyboard()`.
+- Adding new commands: Register pattern in `_route_command()` and implement handler.
+- Testing: Thoroughly covered by 60+ mocked test cases in tests/test_router.py.
 """
 
 import json
@@ -56,7 +107,7 @@ LIST_ALLOWED_SOURCES = {
     source.strip().lower()
     for source in os.environ.get(
         "LIST_ALLOWED_SOURCES",
-        "hackernews,hn,jsearch,google_cse,cse,adzuna,greenhouse,lever,ashby,tejajob,signal_test",
+        "hackernews,hn,jsearch,google_cse,cse,greenhouse,lever,ashby,showcase,practice,signal_test",
     ).split(",")
     if source.strip()
 }
@@ -345,12 +396,12 @@ def _is_synthetic_job(job: dict) -> bool:
     url = _source_url(job).lower()
     model_id = str(job.get("model_id", "")).strip().lower()
     entity_type = str(job.get("entity_type", "")).strip().lower()
-    if source in {"showcase", "tejajob"} and ENABLE_PRACTICE_MODE:
+    if source in {"showcase", "practice"} and ENABLE_PRACTICE_MODE:
         return False
     return bool(
         entity_type in {"telegram_review_session", "telegram_callback", "telegram_action_token"}
         or str(job.get("job_id", "")).startswith(("telegram_session_", "cb:", "tok:"))
-        or source in {"signal_test", "tejajob", "showcase"}
+        or source in {"signal_test", "showcase", "practice"}
         or job.get("signal_test")
         or model_id == "showcase-seed"
         or url.startswith("https://example.com/")
@@ -359,7 +410,7 @@ def _is_synthetic_job(job: dict) -> bool:
 
 def _source_allowed(job: dict) -> bool:
     source = str(job.get("source", "")).strip().lower()
-    if source in {"showcase", "tejajob"} and not ENABLE_PRACTICE_MODE:
+    if source in {"showcase", "practice"} and not ENABLE_PRACTICE_MODE:
         return False
     return bool(source and source in LIST_ALLOWED_SOURCES)
 
@@ -368,7 +419,7 @@ def _source_label(job: dict) -> str:
     source = str(job.get("source", "")).strip().lower()
     if source in {"hackernews", "hn"}:
         return "Hacker News Who is Hiring"
-    if source in {"showcase", "tejajob"}:
+    if source in {"showcase", "practice"}:
         return "Practice item"
     if source == "signal_test":
         return "Notification test seed"
@@ -376,8 +427,6 @@ def _source_label(job: dict) -> str:
         return "Google Custom Search"
     if source == "jsearch":
         return "JSearch RapidAPI"
-    if source == "adzuna":
-        return "Adzuna Jobs API"
     if source == "greenhouse":
         return "Greenhouse Job Board"
     if source == "lever":
@@ -388,7 +437,7 @@ def _source_label(job: dict) -> str:
 
 
 def _is_practice_job(job: dict) -> bool:
-    return str(job.get("source", "")).strip().lower() in {"showcase", "tejajob"}
+    return str(job.get("source", "")).strip().lower() in {"showcase", "practice"}
 
 
 def _source_url(job: dict) -> str:
@@ -655,7 +704,7 @@ def _help_text(page: str) -> str:
             "JobAlert",
             "AI Job Copilot",
             "",
-            "Fresh AI-matched roles for Teja.",
+            "Fresh AI-matched roles ready for review.",
             "",
             "Start with Next Match.",
             "Use Search for a new scan.",
@@ -1209,7 +1258,7 @@ def _make_showcase_job() -> dict:
     """Create a neutral, interview-safe showcase opportunity."""
     now = datetime.now(timezone.utc)
     return {
-        "job_id": f"tejajob_agent_{now.strftime('%Y%m%d')}",
+        "job_id": f"practice_agent_{now.strftime('%Y%m%d')}",
         "title": "AI Outbound Agent Engineer",
         "company": "Northstar Revenue AI",
         "location": "San Francisco Bay Area",
@@ -1222,7 +1271,7 @@ def _make_showcase_job() -> dict:
         ),
         "url": "",
         "apply_url": "",
-        "source": "tejajob",
+        "source": "showcase",
         "salary": "$130,000 - $180,000",
         "is_remote": False,
         "employment_type": "FULL_TIME",
@@ -1242,7 +1291,7 @@ def _make_showcase_job() -> dict:
 
 
 def _retire_old_showcase_rows(active_job_id: str) -> None:
-    """Hide prior showcase/tejajob rows so the review queue stays clean."""
+    """Hide prior showcase rows so the review queue stays clean."""
     try:
         scan_args = {
             "ProjectionExpression": "job_id, #s, #src",
@@ -1255,7 +1304,7 @@ def _retire_old_showcase_rows(active_job_id: str) -> None:
                 if (
                     item.get("job_id") != active_job_id
                     and item.get("status") == "PENDING_APPROVAL"
-                    and source in {"showcase", "tejajob"}
+                    and source in {"showcase", "practice"}
                 ):
                     _update_job_status(item["job_id"], "REJECTED")
             if "LastEvaluatedKey" not in response:
@@ -1437,7 +1486,7 @@ def _handle_showcase(bot_token: str, chat_id: str) -> None:
         _send_telegram(
             bot_token,
             chat_id,
-            "TejaJob workspace is ready.\n\n"
+            "Practice workspace is ready.\n\n"
             f"Added one practice opportunity to your review queue:\n"
             f"[{job['match_score']}%] {job['title']}\n"
             f"{job['company']} | {job['location']}\n\n"
@@ -1482,7 +1531,7 @@ def _handle_list(bot_token: str, chat_id: str) -> None:
             return
         empty_msg = (
             "Your review queue is empty.\n\n"
-            "Use tejajob to practice the workflow, or search jobs to scan live sources."
+            "Use practice to explore the workflow, or search jobs to scan live sources."
             if ENABLE_PRACTICE_MODE
             else
             "Your review queue is empty.\n\n"
@@ -1504,7 +1553,7 @@ def _handle_list(bot_token: str, chat_id: str) -> None:
         posted = _format_posted(job.get("posted_at", ""))
         recruiter = (job.get("recruiter_email") or "").strip()
         source_url = _source_url(job)
-        is_practice = job.get("source") == "tejajob"
+        is_practice = job.get("source") in {"showcase", "practice"}
 
         lines.append(f"{i}. {title}")
         lines.append(f"   {company} | {location}")
@@ -1583,7 +1632,7 @@ def _handle_apply(
         jobs = _get_pending_jobs(limit=20)
         if not jobs:
             empty_msg = (
-                "Your review queue is empty.\n\nUse tejajob to practice the workflow, or search jobs to scan live sources."
+                "Your review queue is empty.\n\nUse practice to explore the workflow, or search jobs to scan live sources."
                 if ENABLE_PRACTICE_MODE
                 else
                 "Your review queue is empty.\n\nUse search jobs to scan live sources, then list to review real matches."
@@ -1628,7 +1677,7 @@ def _handle_apply(
                 jobs = _get_pending_jobs(limit=20)
                 if not jobs:
                     empty_msg = (
-                        "Your review queue is empty.\n\nUse tejajob to practice the workflow, or search jobs to scan live sources."
+                        "Your review queue is empty.\n\nUse practice to explore the workflow, or search jobs to scan live sources."
                         if ENABLE_PRACTICE_MODE
                         else
                         "Your review queue is empty.\n\nUse search jobs to scan live sources, then list to review real matches."
@@ -1647,7 +1696,7 @@ def _handle_apply(
             jobs = _get_pending_jobs(limit=20)
             if not jobs:
                 empty_msg = (
-                    "Your review queue is empty.\n\nUse tejajob to practice the workflow, or search jobs to scan live sources."
+                    "Your review queue is empty.\n\nUse practice to explore the workflow, or search jobs to scan live sources."
                     if ENABLE_PRACTICE_MODE
                     else
                     "Your review queue is empty.\n\nUse search jobs to scan live sources, then list to review real matches."
@@ -1666,7 +1715,7 @@ def _handle_apply(
     job_id = job["job_id"]
     recruiter = (job.get("recruiter_email") or "").strip()
     source_url = _source_url(job)
-    is_practice = job.get("source") == "tejajob"
+    is_practice = job.get("source") in {"showcase", "practice"}
 
     if not is_practice and not source_url:
         item_ref = f"match #{resolved_index}" if resolved_index else job.get("company", "this role")
@@ -1737,7 +1786,7 @@ def _handle_apply(
             f"Company: {job.get('company', 'Unknown')}\n"
             f"Match: {job.get('match_score', '?')}%\n\n"
             "No real application was submitted and no email was sent.\n"
-            "Use tejajob anytime to reset the practice opportunity.",
+            "Use practice anytime to reset the practice opportunity.",
         )
         if callback_query_id:
             _record_callback_state(callback_query_id, "COMPLETED" if delivery_ok else "FAILED", chat_id=chat_id, target_job_id=job_id)
@@ -1916,7 +1965,7 @@ def _handle_explain(
         jobs = _get_pending_jobs(limit=20)
         if not jobs:
             msg = (
-                "Your review queue is empty. Use tejajob or search jobs to add matches."
+                "Your review queue is empty. Use practice or search jobs to add matches."
                 if ENABLE_PRACTICE_MODE
                 else
                 "Your review queue is empty. Use search jobs to scan live sources."
@@ -2006,7 +2055,7 @@ def _handle_next(bot_token: str, chat_id: str) -> None:
     jobs = _get_pending_jobs(limit=20)
     if not jobs:
         msg = (
-            "Your review queue is empty. Use tejajob or search jobs to add matches."
+            "Your review queue is empty. Use practice or search jobs to add matches."
             if ENABLE_PRACTICE_MODE
             else
             "No fresh reviewable match is ready.\n\nUse backlog to inspect the older jobs archive, or search jobs for a fresh scan."
@@ -2061,7 +2110,7 @@ def _handle_draft(
         jobs = _get_pending_jobs(limit=20)
         if not jobs:
             msg = (
-                "Your review queue is empty. Use tejajob or search jobs to add matches."
+                "Your review queue is empty. Use practice or search jobs to add matches."
                 if ENABLE_PRACTICE_MODE
                 else
                 "Your review queue is empty. Use search jobs to scan live sources."
@@ -2134,7 +2183,7 @@ def _handle_send(bot_token: str, chat_id: str, index: int = 1, confirmed: bool =
     job = jobs[index - 1]
     recruiter = (job.get("recruiter_email") or "").strip()
     source_url = _source_url(job)
-    if job.get("source") == "tejajob":
+    if job.get("source") in {"showcase", "practice"}:
         _send_telegram(bot_token, chat_id, "Practice jobs cannot send real email.")
         return
     if not recruiter:
@@ -2381,7 +2430,7 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
         _handle_signal_test(bot_token, chat_id)
         return
 
-    if cmd in ("tejajob", "teja job", "showcase", "showcase agent", "agent showcase", "seed showcase", "showcase mode"):
+    if cmd in ("practice", "practice job", "practicejob", "showcase", "showcase agent", "agent showcase", "seed showcase", "showcase mode"):
         _handle_showcase(bot_token, chat_id)
         return
 

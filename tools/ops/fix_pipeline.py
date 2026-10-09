@@ -1,8 +1,31 @@
 """
-Fix live pipeline issues:
-1. Clean corrupted DynamoDB records
-2. Re-queue stuck NEW jobs for scoring
-3. Deploy latest code
+Pipeline Recovery & Remediation Utility (fix_pipeline.py)
+
+Role & Operational Context:
+  Diagnoses and resolves state divergence and backlogged records in the live AWS
+  pipeline. Used by operators when DynamoDB records have corrupted status attributes
+  or when newly ingested jobs remain in 'NEW' status without being processed by
+  `job-processor`.
+
+Remediation Workflow:
+  1. Status Sanitization:
+     - Scans the DynamoDB 'Jobsearch' table for whitespace/newline corruption in status fields.
+     - Strips trailing/leading newlines or carriage returns (e.g., 'NEW\\n' -> 'NEW').
+     - Resets 'MISSING', 'UNKNOWN', or empty statuses back to 'NEW' for evaluation.
+  2. Scoring Requeue:
+     - Discovers unscored 'NEW' records in DynamoDB.
+     - Constructs standard pipeline payloads and re-enqueues them to `job-filtered-queue`.
+     - Triggers asynchronous processing by `job-processor` via Bedrock Claude scoring.
+  3. Queue Health Verification:
+     - Inspects SQS depths for `job-raw-queue` and `job-filtered-queue` (waiting vs. in-flight).
+
+Usage:
+  python tools/ops/fix_pipeline.py
+
+Safety & Invariants:
+  - Requires valid AWS credentials in .env.
+  - Idempotent: Does not mutate scored jobs (PENDING_APPROVAL, APPROVED, REJECTED, SENT).
+  - Only unscored records are re-queued.
 """
 import os, json, boto3, time
 

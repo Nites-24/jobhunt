@@ -1,16 +1,70 @@
 """
-Job Sender Lambda — Email Outreach Engine (v2.0)
+Job Sender Lambda — Autonomous Outreach & High-Signal Email Dispatch Engine (v2.0)
 
-Pipeline: job-router (approve) → Generate personalized email via Bedrock → SMTP send → DynamoDB update
+Role & Architectural Placement:
+  This serverless microservice is the final execution stage in the JobHunt autonomous
+  pipeline. It is triggered asynchronously by AWS SQS (`job-send-queue`), which receives
+  messages queued by the Telegram control plane (`job-router`) when a candidate approves
+  or applies to a high-scoring job lead. Alternatively, it can be directly invoked in preview
+  mode to generate an email draft for inline Telegram review without dispatching.
 
-Improvements over v1:
-  - Batch SQS processing with partial failure handling
-  - Resume + secrets warm-start caching
-  - Idempotency guard (skip already-SENT jobs)
-  - SMTP connection reuse across batch
-  - Migrated to Bedrock Converse API with forced tool-calling
-  - Enhanced sanitization (exclamation points, em dashes, etc.)
-  - Real-send kill switch for production demos
+End-to-End Pipeline Context:
+  Job Discovery (job-ingestor)
+       │
+       ▼
+  Deduplication & Storage (job-deduplicator)
+       │
+       ▼
+  AI Evaluation & Scoring (job-processor) ──[Score >= 80]──► SNS Notification
+                                                                 │
+                                                                 ▼
+  Telegram Approval / Draft Review (job-router) ─────────────────┘
+       │
+       ▼ [SQS: job-send-queue]
+  Outreach Synthesis & Dispatch (job-sender) [THIS SERVICE]
+       │
+       ├─► Amazon Bedrock Converse (Claude 3 Haiku / Sonnet via forced tool calling)
+       ├─► Knowledge Graph Context (candidate facts, projects, verified metrics)
+       ├─► Dual-Key Airgap Verification (ALLOW_TELEGRAM_EMAIL_SEND & ALLOW_REAL_EMAIL_SEND)
+       ├─► S3 Attachment Fetch (Candidate PDF resume)
+       ├─► SMTP / SES Dispatch (TLS secured, credential caching, pooled connection reuse)
+       └─► DynamoDB Status Update (transitions status to SENT or marks FAILED)
+
+Core Design Invariants & Guardrails:
+  1. Dual-Key Security Airgap:
+     To ensure 100% human-in-the-loop safety and prevent unauthorized autonomous email delivery:
+     - Gate 1: ALLOW_TELEGRAM_EMAIL_SEND=true (configured on job-router)
+     - Gate 2: ALLOW_REAL_EMAIL_SEND=true (configured on job-sender)
+     If either gate evaluates to false or is unset, the engine generates full preview drafts
+     and attachments but suppresses external SMTP socket delivery.
+  2. Identity Decoupling:
+     Candidate personal claims and contact details are never hardcoded in source code.
+     They are injected dynamically via environment variables (CANDIDATE_NAME, SENDER_EMAIL,
+     CANDIDATE_LOCATION, S3_RESUME_KEY, CANDIDATE_LINKEDIN, RETIREIQ_URL) and synthesized via
+     `shared.knowledge_graph.build_candidate_graph`.
+  3. Structured Tool Calling (Bedrock Converse API):
+     Rather than unconstrained markdown generation, Bedrock is invoked with forced tool calling
+     (`toolChoice: {"tool": {"name": "propose_outreach_email"}}`). The model must return
+     structured JSON adhering to schema properties: `subject`, `greeting`, `body_paragraphs`,
+     `call_to_action`, and `signoff`.
+  4. Anti-AI Tone & Grounding Guardrails:
+     - Concise outreach: Total email body is constrained to under 130 words.
+     - Single relevant project: Focuses on exactly one relevant project matching the job posting,
+       avoiding generic project dumps.
+     - Banned AI buzzwords: Strict rejection/sanitization of tropes like "thrilled", "passionate",
+       "synergy", "cutting-edge", "dynamic", "pleasure".
+     - Punctuation hygiene: Strict elimination of exclamation marks and em dashes.
+     - Contact Person Heuristic: Resolves named recruiter > authentic HN author > hiring team fallback.
+  5. Enterprise Operational Hygiene:
+     - Batch SQS processing with partial failure reporting via `batchItemFailures`.
+     - Warm-start caching for AWS Secrets Manager credentials, candidate knowledge graphs, and S3 resume bytes.
+     - SMTP connection reuse across batch items with graceful fallback.
+     - Idempotency guard: Skips jobs already marked as SENT or APPROVED to prevent duplicate outreach.
+
+Developer Guidance:
+  - When modifying email prompts or schemas, verify against `tests/test_sender.py`.
+  - Never bypass the dual-key airgap checks in production code.
+  - Test suites must execute completely offline using moto mocks without invoking live SES/SMTP.
 """
 
 import json
@@ -48,26 +102,31 @@ dynamodb = boto3.resource("dynamodb", config=aws_config)
 # ---------------------------------------------------------------------------
 # 3. CONFIGURATION
 # ---------------------------------------------------------------------------
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "vakateja24@gmail.com")
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "").strip()
 SECRET_ID = os.environ.get("SECRETS_NAME", "jobserch_gmail")
 TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "Jobsearch")
 BUCKET = os.environ.get("RESUME_BUCKET", "job-search-pipeline-memory")
-RESUME_KEY = os.environ.get("RESUME_KEY", "data/resume/Teja_Vaka.pdf")
+RESUME_KEY = os.environ.get("RESUME_KEY", "data/resume/resume.pdf")
 MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
 ALLOW_REAL_EMAIL_SEND = os.environ.get("ALLOW_REAL_EMAIL_SEND", "false").strip().lower() == "true"
 BEDROCK_THROTTLE_RETRIES = int(os.environ.get("BEDROCK_THROTTLE_RETRIES", "2"))
+CANDIDATE_NAME = os.environ.get("CANDIDATE_NAME", "AI Candidate").strip() or "AI Candidate"
+TARGET_ROLE = os.environ.get("TARGET_ROLE", "AI Engineer").strip() or "AI Engineer"
+CANDIDATE_LOCATION = os.environ.get("CANDIDATE_LOCATION", "Open to remote, hybrid, or onsite in any location").strip() or "Open to remote, hybrid, or onsite in any location"
+CANDIDATE_LINKEDIN = os.environ.get("CANDIDATE_LINKEDIN", "https://linkedin.com/in/profile").strip() or "https://linkedin.com/in/profile"
+RETIREIQ_URL = os.environ.get("RETIREIQ_URL", "https://huggingface.co/spaces/demo/RetireIQ").strip() or "https://huggingface.co/spaces/demo/RetireIQ"
+RESUME_FILENAME = os.environ.get("RESUME_FILENAME", "Resume.pdf").strip() or "Resume.pdf"
 
 table = dynamodb.Table(TABLE_NAME)
 
 CANDIDATE_GRAPH_CONTEXT = render_candidate_graph(
     build_candidate_graph(
-        "Teja Gopal Reddy Vaka AI Engineer focused on RAG pipelines, "
+        f"{CANDIDATE_NAME} {TARGET_ROLE} focused on RAG pipelines, "
         "LLM orchestration, agentic systems, Python, PyTorch, AWS, LangChain, "
         "evaluation pipelines. Projects include RetireIQ, a retirement planning "
         "and financial decision support app, and Rivulet, a personal life management "
         "app. Achievements include 33% GPU cost reduction and 87% autonomous ticket "
-        "resolution. Currently based in Wichita, Kansas. Open to remote, hybrid, or "
-        "onsite roles in any location and open to relocate. CPT student."
+        f"resolution. {CANDIDATE_LOCATION}."
     )
 )
 
@@ -75,7 +134,7 @@ CANDIDATE_GRAPH_CONTEXT = render_candidate_graph(
 # 4. SYSTEM PROMPT — The "Brain"
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "You are Teja Gopal Reddy Vaka, an AI Engineer. You're writing a short, warm "
+    f"You are {CANDIDATE_NAME}, an {TARGET_ROLE}. You're writing a short, warm "
     "cold email to a hiring manager or recruiter. This person skims 50 emails a day. "
     "Your goal is to sound like a real human who read the role and wrote a useful note, not an AI.\n\n"
 
@@ -485,7 +544,7 @@ def _extract_opening_sentence(generated_body: str, job: dict) -> str:
             continue
         if lowered.startswith(("i've built", "i built", "my recent", "i am ", "i'm ", "i have ")):
             continue
-        if any(token in lowered for token in ("retireiq", "rivulet", "wichita", "preview body")):
+        if any(token in lowered for token in ("retireiq", "rivulet", "preview body")):
             continue
         if "interesting" in lowered or "stood out" in lowered:
             continue
@@ -513,7 +572,7 @@ def _select_project_line(job: dict) -> str:
             "I built Rivulet (https://rivulet.info), a personal life management app that uses LLM workflows for voice journaling, planning, and memory organization."
         )
     return (
-        "I built RetireIQ (https://huggingface.co/spaces/vakaTeja/RetireIQ), a retirement planning and financial decision support app with hybrid retrieval, "
+        f"I built RetireIQ ({RETIREIQ_URL}), a retirement planning and financial decision support app with hybrid retrieval, "
         "guardrails, and low-cost inference optimization."
     )
 
@@ -536,12 +595,12 @@ def _compose_final_email(job: dict, subject: str, generated_body: str) -> dict:
         f"{greeting}\n\n"
         f"{opener}\n\n"
         f"{_select_project_line(job)}\n\n"
-        "I am currently based in Wichita, Kansas, and I am open to remote, hybrid, or onsite roles in any location, including relocation.\n\n"
+        "I am open to remote, hybrid, or onsite roles in any location, including relocation.\n\n"
         f"{_cta_line(job)}\n\n"
         "Best,\n"
-        "Teja Gopal Reddy Vaka\n"
-        "AI Engineer\n"
-        "https://linkedin.com/in/tejagopalreddyvaka/"
+        f"{CANDIDATE_NAME}\n"
+        f"{TARGET_ROLE}\n"
+        f"{CANDIDATE_LINKEDIN}"
     )
     final_subject = re.sub(r"\s+", " ", str(subject or "").strip())
     if not final_subject:
@@ -623,8 +682,8 @@ def _build_mime_message(sender: str, recipient: str, subject: str, body: str, re
     msg["To"] = recipient
     msg.attach(MIMEText(body, "plain", "utf-8"))
 
-    attachment = MIMEApplication(resume_bytes, Name="Teja_Vaka_Resume.pdf")
-    attachment["Content-Disposition"] = 'attachment; filename="Teja_Vaka_Resume.pdf"'
+    attachment = MIMEApplication(resume_bytes, Name=RESUME_FILENAME)
+    attachment["Content-Disposition"] = f'attachment; filename="{RESUME_FILENAME}"'
     msg.attach(attachment)
     return msg
 

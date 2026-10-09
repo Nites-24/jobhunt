@@ -1,3 +1,16 @@
+"""
+API Gateway HTTP API Route Inspector (check_routes.py)
+
+Role & Operational Context:
+  Inspects the active API Gateway v2 HTTP API configurations for the JobHunt Telegram webhook:
+  - Validates registered RouteKeys (e.g., POST /telegram, GET /health).
+  - Inspects Integration targets linking routes to the `job-router` Lambda ARN.
+  - Verifies Stage deployment states (e.g., $default, prod) and auto-deploy settings.
+
+Usage:
+  python tools/ops/check_routes.py
+"""
+
 import os, boto3, json
 
 with open(".env") as f:

@@ -1,4 +1,23 @@
-"""Quick diagnostic: find corrupted data in DynamoDB."""
+"""
+DynamoDB Anomaly & Lambda Deployment Diagnostics (diagnose.py)
+
+Role & Operational Context:
+  Fast diagnostic utility to detect state anomalies in DynamoDB and inspect
+  the deployment freshness of all 5 serverless Lambdas.
+
+Diagnostics Performed:
+  1. Corrupted Status Detection:
+     - Scans DynamoDB 'Jobsearch' records for whitespace/newline corruption or invalid status values.
+     - Flags records not in recognized states ('NEW', 'PENDING_APPROVAL', 'APPROVED', 'SENT', 'REJECTED', 'FAILED').
+  2. Unscored Backlog Detection:
+     - Identifies 'NEW' jobs that were ingested but never picked up by `job-processor`.
+  3. Lambda Deployment Verification:
+     - Queries AWS Lambda API for CodeSize and LastModified timestamps across all 5 functions:
+       `job-ingestor`, `job-deduplicator`, `job-processor`, `job-router`, `job-sender`.
+
+Usage:
+  python tools/ops/diagnose.py
+"""
 import os, boto3, json
 
 with open(".env") as f:

@@ -1,13 +1,56 @@
 """
-Job Processor Lambda — Unified Scorer (v2.0)
-Merges job-processor + job-evaluator into a single scoring brain.
+Job Processor Lambda — AI Scoring & Candidate Match Brain
 
-Pipeline: SQS (filtered-jobs) → Score via Bedrock → DynamoDB update → SNS alert (80%+)
+=============================================================================
+PIPELINE ROLE & ARCHITECTURE
+=============================================================================
+Trigger:    SQS event batches from 'job-filtered-queue' (dispatched by job-deduplicator)
+Cognitive:  Amazon Bedrock Converse API (Claude 3.5 Haiku) with forced tool-calling
+Datastore:  Updates scoring attributes and status in DynamoDB ('Jobsearch' table)
+Fan-out:    Publishes high-match opportunities (>= SCORE_THRESHOLD) to SNS ('jobsearch-approvals')
+Downstream: job-router receives SNS alerts and notifies the candidate via Telegram
 
-Uses:
-  - Bedrock Converse API with forced tool-calling for deterministic JSON output
-  - S3 memory context (resume, config, projects) with warm-start caching
-  - SQS partial batch failure handling for reliable retries
+=============================================================================
+DETERMINISTIC PRE-FILTERING GUARDRAILS (ZERO TOKEN WASTE)
+=============================================================================
+To protect Bedrock token spend and maintain high candidate signal, deterministic
+Python guardrails evaluate opportunities before or alongside model invocation:
+1. Freshness Rule:
+   - Jobs older than MAX_JOB_AGE_DAYS (default: 14) are capped at STALE_SCORE_CAP (55).
+2. Missing Date Rule:
+   - Postings without verifiable dates are capped at MISSING_DATE_SCORE_CAP (70).
+3. Low AI/ML Signal Rule:
+   - Postings lacking AI/ML/LLM/RAG signal are capped at LOW_AI_SIGNAL_SCORE_CAP (50).
+4. Unverifiable Source Rule:
+   - Jobs with missing or non-canonical source links are capped at MISSING_SOURCE_SCORE_CAP (40).
+
+=============================================================================
+STRUCTURED TOOL CALLING & TELEMETRY
+=============================================================================
+- Bedrock Converse API enforces structured tool calling (`evaluate_job` schema).
+  Free-form conversational text is banned, guaranteeing clean JSON parseability.
+- Candidate Context: Warm-cached candidate knowledge graph loaded from S3 (`data/`).
+- Telemetry: Emits `LLM_TELEMETRY` log lines with inputTokens, outputTokens, and latency.
+
+=============================================================================
+ENVIRONMENT VARIABLES
+=============================================================================
+- BEDROCK_MODEL_ID:          Claude model ID (default: us.anthropic.claude-haiku-4-5-20251001-v1:0)
+- SNS_TOPIC_ARN:             SNS Topic ARN for approvals (e.g., arn:aws:sns:...:jobsearch-approvals)
+- S3_BUCKET_NAME:            S3 memory context bucket (default: job-search-pipeline-memory)
+- RESUME_KEY:                S3 key for candidate resume / profile (default: data/resume/resume.txt)
+- SCORE_THRESHOLD:           Approval threshold percentage (default: 80)
+- MAX_JOB_AGE_DAYS:          Max age threshold before stale penalty (default: 14)
+- STALE_SCORE_CAP:           Max score cap for stale postings (default: 55)
+- LOW_AI_SIGNAL_SCORE_CAP:   Max score cap for weak AI signal (default: 50)
+- MISSING_SOURCE_SCORE_CAP:  Max score cap for invalid source URLs (default: 40)
+
+=============================================================================
+DEVELOPER & MAINTENANCE GUIDE
+=============================================================================
+- Updating scoring criteria: Run offline benchmarks using tools/ops/eval_scoring.py
+  before changing system prompts. Evals > Vibes.
+- Testing: Fully mocked offline with moto and Bedrock mocks in tests/test_processor.py.
 """
 
 import json
@@ -49,7 +92,7 @@ MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-202
 TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "Jobsearch")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "job-search-pipeline-memory")
-RESUME_KEY = os.environ.get("RESUME_KEY", "data/resume/Teja_Vaka.txt")
+RESUME_KEY = os.environ.get("RESUME_KEY", "data/resume/resume.txt")
 SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "80"))
 DEFAULT_EVAL_PROFILE_VERSION = f"2026-05-13-th{SCORE_THRESHOLD}"
 JOB_EVAL_PROFILE_VERSION = os.environ.get("JOB_EVAL_PROFILE_VERSION", DEFAULT_EVAL_PROFILE_VERSION)
@@ -148,15 +191,18 @@ def _build_context_from_s3() -> str:
         parts.append(f"<candidate_resume>\n{resume_text}\n</candidate_resume>")
     else:
         logger.warning("RESUME_MISSING: %s not found, using fallback", RESUME_KEY)
+        candidate_name = os.environ.get("CANDIDATE_NAME", "AI Candidate").strip() or "AI Candidate"
+        target_role = os.environ.get("TARGET_ROLE", "AI Engineer").strip() or "AI Engineer"
+        location_pref = os.environ.get("CANDIDATE_LOCATION", "Open to remote, hybrid, or onsite in any location").strip()
         parts.append(
             "<candidate_resume>\n"
-            "Teja Gopal Reddy Vaka — AI Engineer\n"
+            f"{candidate_name} — {target_role}\n"
             "Specializing in RAG pipelines, LLM orchestration, agentic systems.\n"
             "Python, PyTorch, AWS, LangChain, vector databases.\n"
             "Achievements: 33% GPU cost reduction, 87% autonomous ticket resolution.\n"
             "Projects: RetireIQ (retirement planning and financial decision support), "
             "Rivulet (personal life management)\n"
-            "Location: currently Wichita, Kansas. Open to relocate and open to remote, hybrid, or onsite roles in any location.\n"
+            f"Location: {location_pref}. Open to relocate.\n"
             "</candidate_resume>"
         )
 
@@ -212,14 +258,16 @@ def _build_candidate_graph_context() -> str:
         raw_char_count += len(resume_text)
     else:
         logger.warning("RESUME_MISSING: %s not found, using graph fallback", RESUME_KEY)
+        candidate_name = os.environ.get("CANDIDATE_NAME", "AI Candidate").strip() or "AI Candidate"
+        target_role = os.environ.get("TARGET_ROLE", "AI Engineer").strip() or "AI Engineer"
+        location_pref = os.environ.get("CANDIDATE_LOCATION", "Open to remote, hybrid, or onsite in any location").strip()
         raw_text_parts.append(
-            "Teja Gopal Reddy Vaka AI Engineer specializing in RAG pipelines, "
+            f"{candidate_name} {target_role} specializing in RAG pipelines, "
             "LLM orchestration, agentic systems, Python, PyTorch, AWS, LangChain, "
             "vector databases. Achievements include 33% GPU cost reduction and 87% "
             "autonomous ticket resolution. Projects include RetireIQ, a retirement planning "
             "and financial decision support app, and Rivulet, a personal life management app. "
-            "The candidate is currently based in Wichita, Kansas, is open to relocate, "
-            "is open to remote, hybrid, or onsite roles in any location, and is a CPT student."
+            f"Preferences: {location_pref}. Open to relocate."
         )
 
     for folder in CONTEXT_FOLDERS:
@@ -271,9 +319,9 @@ SYSTEM_INSTRUCTION = (
     "CRITICAL GUARDRAILS:\n"
     "- FRESHNESS: If the job was posted more than 14 days ago, or if the date is missing/stale, "
     "reduce the final score by 30 points. We prioritize FRESH leads.\n"
-    "- LOCATION: The candidate is currently based in Wichita, Kansas and is open to relocate. "
-    "Strong remote, hybrid, and onsite roles in any location should still score well. "
-    "Do not hard-penalize a strong AI role only because it is outside Kansas or requires relocation.\n"
+    "- LOCATION: The candidate is open to remote, hybrid, onsite, and relocation to any location. "
+    "Strong remote, hybrid, and onsite roles should score well. "
+    "Do not hard-penalize a strong AI role that requires relocation or onsite attendance.\n"
     "- RELEVANCE: If the job is purely Frontend (React), Backend (Java/Kotlin), "
     "or generic Full Stack without heavy AI/LLM/ML focus, the score MUST be below 50.\n\n"
     "Score 0-100. Be extremely strict. Only true, fresh, local AI/ML/LLM roles should score 85+.\n\n"

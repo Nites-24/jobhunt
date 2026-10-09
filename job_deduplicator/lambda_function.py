@@ -1,12 +1,45 @@
 """
-Job Deduplicator Lambda (v2.0)
+Job Deduplicator Lambda — Deduplication, Normalization & Requeue Pipeline
 
-Pipeline: SQS (raw-jobs) → Deduplicate via DynamoDB hash → SQS (filtered-jobs)
+=============================================================================
+PIPELINE ROLE & ARCHITECTURE
+=============================================================================
+Trigger:    SQS event batches from 'job-raw-queue' (dispatched by job-ingestor)
+Output:     Sends unique, normalized job records to SQS (job-filtered-queue)
+Datastore:  Stores / updates tracking rows in DynamoDB ('Jobsearch' table)
+Downstream: job-processor consumes 'job-filtered-queue' for Bedrock AI scoring
 
-Fixes:
-  - Pass-through ALL fields (stop stripping recruiter_email, salary, etc.)
-  - Correct SQS partial batch failure return format
-  - Race-condition safe with ConditionalCheckFailedException
+=============================================================================
+DEDUPLICATION & REQUEUE LOGIC
+=============================================================================
+1. Normalization:
+   - Normalizes company name, title, and canonical job URL to prevent trivial duplicates
+     (e.g., casing differences, tracking parameters, whitespace).
+2. Deterministic Hash:
+   - Computes a deterministic 16-character SHA-256 hash as the primary key `job_id`.
+3. Atomic Deduplication:
+   - Writes to DynamoDB with condition `attribute_not_exists(job_id)`.
+   - If ConditionalCheckFailedException is raised, the job already exists in the system.
+4. Evaluation Profile Version Requeue:
+   - If an existing job was scored under an older `JOB_EVAL_PROFILE_VERSION`, it is
+     refreshed and requeued to 'job-filtered-queue' so new candidate criteria apply.
+5. SQS Partial Batch Failures:
+   - Returns standard AWS SQS format `{"batchItemFailures": [{"itemIdentifier": msg_id}]}`
+     so transient failures are retried without processing successful items twice.
+
+=============================================================================
+ENVIRONMENT VARIABLES
+=============================================================================
+- FILTERED_QUEUE_URL:         Target SQS URL (e.g., https://sqs.../job-filtered-queue)
+- DYNAMODB_TABLE:             DynamoDB table name (default: 'Jobsearch')
+- JOB_EVAL_PROFILE_VERSION:   Active candidate evaluation version tag (e.g., '2026-05-13-th80')
+
+=============================================================================
+DEVELOPER & MAINTENANCE GUIDE
+=============================================================================
+- Schema Invariant: All incoming payload fields (recruiter_email, salary, source_url)
+  MUST pass through to SQS unmutated so downstream scorer & sender retain full context.
+- Testing: Fully covered by mocked unit tests in tests/test_deduplicator.py.
 """
 
 import json

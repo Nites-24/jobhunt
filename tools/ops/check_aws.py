@@ -1,3 +1,15 @@
+"""
+AWS Connectivity & DynamoDB Schema Inspector (check_aws.py)
+
+Role & Operational Context:
+  Verifies AWS IAM credentials loaded from .env, tests connectivity to us-east-1,
+  and inspects all deployed DynamoDB tables, validating KeySchema and GSIs
+  (e.g., Jobsearch primary keys and StatusIndex / UrlHashIndex GSIs).
+
+Usage:
+  python tools/ops/check_aws.py
+"""
+
 import os, boto3
 
 # Load .env

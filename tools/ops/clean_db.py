@@ -1,3 +1,23 @@
+"""
+Pending Queue Reset Utility (clean_db.py)
+
+Role & Operational Context:
+  Clears the candidate's pending review queue in DynamoDB by transitioning all
+  'PENDING_APPROVAL' jobs to 'REJECTED_OLD'.
+
+When to Use:
+  - When the candidate evaluation criteria or target role changes significantly.
+  - When old pending jobs accumulate and an operator wants to start fresh with newly ingested,
+    high-freshness opportunities.
+
+Usage:
+  python tools/ops/clean_db.py
+
+Safety & Invariants:
+  - Does NOT delete DynamoDB items; only updates the status field to 'REJECTED_OLD'.
+  - Preserves history, URLs, and evaluation scores for auditability.
+"""
+
 import os, boto3
 
 with open(".env") as f:

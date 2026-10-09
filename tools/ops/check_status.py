@@ -1,3 +1,26 @@
+"""
+Pipeline Job Status Dashboard (check_status.py)
+
+Role & Operational Context:
+  Provides a fast operational summary of all opportunities currently tracked in
+  the DynamoDB 'Jobsearch' table across their lifecycle stages.
+
+Workflow:
+  1. Scans the 'Jobsearch' DynamoDB table with pagination handling.
+  2. Aggregates jobs by lifecycle status:
+     - PENDING_APPROVAL: Jobs scored >= 80 awaiting Telegram candidate review.
+     - NEW: Newly ingested jobs awaiting Bedrock evaluation.
+     - APPROVED: Jobs approved by candidate for outreach.
+     - SENT: Jobs where outreach email was dispatched.
+     - REJECTED: Low-scoring, stale, or discarded opportunities.
+     - FAILED: Failed processing or sending operations.
+  3. Displays record counts and preview details (match score, title, recruiter email)
+     for the top jobs in each category.
+
+Usage:
+  python tools/ops/check_status.py
+"""
+
 import os, json, sys, boto3
 from decimal import Decimal
 

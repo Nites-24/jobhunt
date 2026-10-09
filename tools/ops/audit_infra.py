@@ -1,4 +1,19 @@
-"""Full infrastructure audit: Lambdas, SQS, SNS, triggers, and wiring."""
+"""
+Comprehensive AWS Cloud Infrastructure Auditor (audit_infra.py)
+
+Role & Operational Context:
+  Performs an end-to-end read-only audit across all AWS resources composing the JobHunt system:
+  1. Lambda Functions: Code sizes, runtimes, timeouts, memory, and last-modified timestamps
+     across all 5 microservices (`job-ingestor`, `job-deduplicator`, `job-processor`, `job-router`, `job-sender`).
+  2. Event Source Mappings: SQS-to-Lambda trigger wiring, batch sizes, and enabled/disabled states.
+  3. SQS Queues: Message depths (waiting vs. in-flight) and DLQ RedrivePolicy configurations.
+  4. SNS Topics: Subscriptions and notification wiring for `jobsearch-approvals`.
+  5. S3 Buckets: Presence and permissions of candidate resume/memory storage (`job-search-pipeline-memory`).
+  6. DynamoDB Table: Table status, item count, size, and GSI health on `Jobsearch`.
+
+Usage:
+  python tools/ops/audit_infra.py
+"""
 
 import os, json, boto3
 from datetime import datetime

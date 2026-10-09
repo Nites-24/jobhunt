@@ -1,3 +1,22 @@
+"""
+CloudWatch Multi-Lambda Log Stream Inspector (check_logs.py)
+
+Role & Operational Context:
+  Fetches and prints recent execution logs from AWS CloudWatch for the primary
+  production Lambda functions in the JobHunt pipeline:
+  - /aws/lambda/job-router (Telegram bot webhook & command processing)
+  - /aws/lambda/job-ingestor (Job fetching from Hacker News, Google CSE, and ATS boards)
+  - /aws/lambda/job-processor (Bedrock LLM scoring and DynamoDB persistence)
+
+Features:
+  - Queries logs over a configurable sliding time window (default: last 30 minutes).
+  - Automatically suppresses boilerplate AWS Lambda START, END, and REPORT telemetry lines
+    to highlight application logic, errors, and LLM telemetry.
+
+Usage:
+  python tools/ops/check_logs.py
+"""
+
 import os, boto3, time
 from datetime import datetime, timedelta
 

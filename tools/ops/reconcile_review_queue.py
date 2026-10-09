@@ -1,6 +1,26 @@
-"""Clean old pending rows that no longer meet the production review policy.
+"""
+Pending Review Queue Policy Reconciler (reconcile_review_queue.py)
 
-Default mode is dry-run. Use --apply to update DynamoDB.
+Role & Operational Context:
+  Cleans and reconciles the candidate's pending review queue in DynamoDB (`status == 'PENDING_APPROVAL'`)
+  to strictly enforce the latest production policy:
+  - Minimum match score: 80% (configurable via SCORE_THRESHOLD).
+  - Maximum age: 1 day (configurable via MAX_JOB_AGE_DAYS).
+  - Valid source providers only (hackernews, greenhouse, lever, ashby, google_cse).
+  - Valid canonical URLs (no placeholders, local hostnames, or missing links).
+
+Workflow:
+  1. Queries the DynamoDB `StatusIndex` GSI for all 'PENDING_APPROVAL' items.
+  2. Evaluates each candidate opportunity against the 4 quality guardrails.
+  3. Transitions non-compliant opportunities to 'REJECTED' status with detailed reason logs.
+  4. Keeps only pristine, verifiable, high-signal leads visible in Telegram.
+
+Operational Safety:
+  - Default mode is dry-run. Requires `--apply` to update DynamoDB.
+
+Usage:
+  python tools/ops/reconcile_review_queue.py          # Dry-run audit
+  python tools/ops/reconcile_review_queue.py --apply  # Purge stale/low-score pending jobs
 """
 
 import argparse
@@ -24,7 +44,7 @@ SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "80"))
 MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "1"))
 ALLOWED_SOURCES = {
     source.strip().lower()
-    for source in os.environ.get("LIST_ALLOWED_SOURCES", "hackernews,hn,jsearch,google_cse,cse,adzuna,greenhouse,lever,ashby,tejajob").split(",")
+    for source in os.environ.get("LIST_ALLOWED_SOURCES", "hackernews,hn,jsearch,google_cse,cse,greenhouse,lever,ashby,practice").split(",")
     if source.strip()
 }
 

@@ -1,4 +1,20 @@
-"""Find recruiter emails for top pending jobs and update DynamoDB."""
+"""
+Recruiter Email Enrichment Utility (enrich_emails.py)
+
+Role & Operational Context:
+  Enriches top pending job opportunities in DynamoDB with verified recruiter contact
+  information using the Hunter.io Domain Search API.
+
+Workflow:
+  1. Retrieves the Hunter.io API key securely from AWS Secrets Manager (`jobsearch/hunterio`).
+  2. Scans DynamoDB for all opportunities in 'PENDING_APPROVAL' status, sorted by match_score descending.
+  3. For jobs lacking recruiter contact info, maps company names to official domain names.
+  4. Queries Hunter.io `/v2/domain-search` for verified recruiter/talent acquisition contacts.
+  5. Updates DynamoDB record with `recruiter_email` and `recruiter_name`.
+
+Usage:
+  python tools/ops/enrich_emails.py
+"""
 import os, json, boto3, urllib.request
 
 with open(".env") as f:

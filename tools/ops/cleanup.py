@@ -1,4 +1,23 @@
-"""Bulk-reject jobs under 80% and clear out the pending list."""
+"""
+Threshold Enforcement & Queue Cleanup Utility (cleanup.py)
+
+Role & Operational Context:
+  Enforces the high-match threshold policy (match_score >= 80) across all jobs
+  currently in 'PENDING_APPROVAL' status in DynamoDB.
+
+Workflow:
+  1. Scans the 'Jobsearch' table for all items with status == 'PENDING_APPROVAL'.
+  2. Displays candidate jobs with their match scores, titles, and companies.
+  3. Identifies any pending jobs with match_score < 80 (e.g. from legacy scoring runs or lower thresholds).
+  4. Automatically transitions sub-80 jobs to 'REJECTED' status in DynamoDB.
+  5. Leaves only high-confidence (80%+) opportunities in the candidate's review queue.
+
+Usage:
+  python tools/ops/cleanup.py
+
+Post-Execution:
+  After running, using the Telegram 'list' command will display only verified >= 80% matches.
+"""
 import os, boto3
 
 with open(".env") as f:

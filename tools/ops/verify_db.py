@@ -1,3 +1,15 @@
+"""
+DynamoDB Pending Approval Verifier (verify_db.py)
+
+Role & Operational Context:
+  Fast read-only verification script that scans DynamoDB 'Jobsearch' to check
+  the exact count and display top sample items currently awaiting candidate
+  action ('PENDING_APPROVAL').
+
+Usage:
+  python tools/ops/verify_db.py
+"""
+
 import os, boto3
 with open('.env') as f:
     for l in f:

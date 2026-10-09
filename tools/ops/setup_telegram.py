@@ -1,4 +1,18 @@
-"""Check and set Telegram webhook to point to job-router API Gateway."""
+"""
+Telegram Bot Webhook Setup & Discovery Utility (setup_telegram.py)
+
+Role & Operational Context:
+  Automates the initial registration and health verification of the Telegram Bot webhook
+  with the deployed AWS API Gateway HTTP API v2:
+  1. API Gateway Resolution: Discovers the HTTP API endpoint (`krewl8w46c` / `prod`).
+  2. Secret Retrieval: Loads `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` from AWS Secrets Manager.
+  3. Webhook Registration: Calls Telegram API `setWebhook` with the public API Gateway HTTPS URL.
+  4. Webhook Status Verification: Inspects `getWebhookInfo` to verify connectivity, pending updates, and zero errors.
+  5. Live Test Dispatch: Sends an operational readiness ping directly to the candidate's chat.
+
+Usage:
+  python tools/ops/setup_telegram.py
+"""
 
 import os, json, boto3, urllib.request
 

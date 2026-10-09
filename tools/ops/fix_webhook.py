@@ -1,4 +1,20 @@
-"""Fix webhook URL back to the correct /prod/telegram path."""
+"""
+Telegram Webhook Recovery & Health Check (fix_webhook.py)
+
+Role & Operational Context:
+  Restores the Telegram bot webhook to the canonical API Gateway stage endpoint
+  (`https://<api-id>.execute-api.us-east-1.amazonaws.com/prod/telegram`), verifies
+  webhook registration with the Telegram Bot API, and dispatches a test heartbeat.
+
+Workflow:
+  1. Retrieves Telegram bot credentials securely from AWS Secrets Manager (`telegram`).
+  2. Calls Telegram Bot API `setWebhook` targeting the API Gateway `/prod/telegram` endpoint.
+  3. Queries `getWebhookInfo` to verify pending update count, error status, and registered URL.
+  4. Dispatches a diagnostic test message to the configured candidate Telegram chat.
+
+Usage:
+  python tools/ops/fix_webhook.py
+"""
 import os, json, urllib.request, boto3
 
 with open(".env") as f:
