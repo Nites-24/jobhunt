@@ -98,11 +98,20 @@ DEFAULT_GREENHOUSE_BOARDS = [
     {"slug": "scaleai", "company": "Scale AI"},
     {"slug": "fireworksai", "company": "Fireworks AI"},
     {"slug": "cohere", "company": "Cohere"},
+    {"slug": "pinecone", "company": "Pinecone"},
+    {"slug": "elevenlabs", "company": "ElevenLabs"},
+    {"slug": "baseten", "company": "Baseten"},
+    {"slug": "character", "company": "Character.ai"},
+    {"slug": "runpod", "company": "RunPod"},
+    {"slug": "groq", "company": "Groq"},
+    {"slug": "huggingface", "company": "Hugging Face"},
+    {"slug": "harvey", "company": "Harvey AI"},
 ]
 
 DEFAULT_LEVER_SITES = [
     {"slug": "mistral", "company": "Mistral AI"},
     {"slug": "writer", "company": "Writer"},
+    {"slug": "databricks", "company": "Databricks"},
 ]
 
 DEFAULT_ASHBY_BOARDS = [
@@ -114,6 +123,10 @@ DEFAULT_ASHBY_BOARDS = [
     {"slug": "replicate", "company": "Replicate"},
     {"slug": "cognition", "company": "Cognition AI"},
     {"slug": "qdrant", "company": "Qdrant"},
+    {"slug": "sierra", "company": "Sierra AI"},
+    {"slug": "decagon", "company": "Decagon"},
+    {"slug": "synthesia", "company": "Synthesia"},
+    {"slug": "phind", "company": "Phind"},
 ]
 
 
