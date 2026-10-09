@@ -7,7 +7,7 @@ This document breaks down the multi-agent architecture of the JobHunt pipeline: 
 ## Current Production Snapshot
 
 * **Live AWS path:** Telegram -> API Gateway/Lambda router -> Lambda ingestion -> SQS -> deduplication -> SQS -> processor -> DynamoDB.
-* **Active live sources:** Hacker News Who is Hiring and Adzuna are returning real jobs.
+* **Active live sources:** Hacker News Who is Hiring and Direct ATS boards (Greenhouse, Lever, Ashby) are returning real jobs.
 * **Configured but blocked sources:** Google CSE credentials exist, but Google returns HTTP 403 until Custom Search JSON API is enabled for that Google Cloud project. JSearch is configured but currently rate-limited with HTTP 429.
 * **Safety controls:** Telegram `draft 1` previews outreach, `apply 1` moves a role to manual follow-up, and `send 1` is the only command that can send email. Real SMTP still requires `ALLOW_REAL_EMAIL_SEND=true` on the sender Lambda and `ALLOW_TELEGRAM_EMAIL_SEND=true` on the router Lambda.
 * **Operational controls:** Both SQS queues have DLQs. CloudWatch alarms cover Lambda errors/throttles, queue backlog, and DLQ messages.

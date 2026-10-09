@@ -15,25 +15,61 @@ The product promise is not "more jobs." The promise is **fewer, fresher, better-
 
 ## Architecture
 
-```
-Telegram → API Gateway → job-router (Lambda)
-                              ↓
-                        job-ingestor (Lambda)
-                              ↓
-                     SQS (job-raw-queue)
-                              ↓
-                    job-deduplicator (Lambda)
-                              ↓
-                   SQS (job-filtered-queue)
-                              ↓
-                     job-processor (Lambda)
-                     ├── AWS Bedrock (Claude)
-                     ├── DynamoDB (state)
-                     └── SNS → job-router → Telegram
-                              ↓
-                      job-sender (Lambda)
-                     ├── Gmail SMTP (gated)
-                     └── Telegram preview
+```mermaid
+flowchart TD
+    subgraph S["Live Sources"]
+        HN["Hacker News ('Who is Hiring')<br/>3-day Freshness Limit"]
+        ATS["Direct ATS Boards<br/>Greenhouse · Lever · Ashby"]
+        CSE["Google Custom Search<br/>Targeted ATS Queries"]
+    end
+
+    subgraph L1["Layer 1: Ingestion & SSRF Defense"]
+        ING["job-ingestor Lambda<br/>EventBridge Cron or 'search jobs'"]
+        RAW_Q["SQS: job-raw-queue<br/>DLQ: job-raw-queue-dlq"]
+    end
+
+    subgraph L2["Layer 2: Deduplication & Versioning"]
+        DEDUP["job-deduplicator Lambda<br/>SHA-256 Hashing & Normalization"]
+        DDB[("Amazon DynamoDB<br/>Jobsearch Table")]
+        FILT_Q["SQS: job-filtered-queue<br/>DLQ: job-filtered-queue-dlq"]
+    end
+
+    subgraph L3["Layer 3: AI Scoring & Pre-Filtering"]
+        PROC["job-processor Lambda<br/>Deterministic Guardrails (Freshness, AI signal)"]
+        BEDROCK["Amazon Bedrock<br/>Claude 3.5 Haiku (Forced Tool-Calling)"]
+        KG["Candidate Knowledge Graph<br/>Runtime Profile & Evidence (<150 tokens)"]
+        SNS["Amazon SNS<br/>jobsearch-approvals Topic"]
+    end
+
+    subgraph L4["Layer 4: Control Plane & Decision Engine"]
+        APIGW["API Gateway HTTP API v2<br/>POST /prod/telegram"]
+        ROUTER["job-router Lambda<br/>Telegram Webhook & State Machine"]
+        TG(("Candidate Telegram Chat<br/>'list', 'next', 'why', 'apply'"))
+    end
+
+    subgraph L5["Layer 5: Guarded Outreach & Airgap"]
+        SENDER["job-sender Lambda<br/>Bedrock Outreach Synthesis (<130 words)"]
+        AIRGAP{"Dual-Key Airgap<br/>ALLOW_TELEGRAM_EMAIL_SEND<br/>ALLOW_REAL_EMAIL_SEND"}
+        SMTP["Gmail / SES SMTP Dispatch<br/>(Only when both keys = true)"]
+    end
+
+    HN & ATS & CSE -->|Fetch| ING -->|Batch Push| RAW_Q
+    RAW_Q --> DEDUP
+    DEDUP <-->|Hash Lookup / Requeue| DDB
+    DEDUP -->|Unique Jobs| FILT_Q
+    FILT_Q --> PROC
+    PROC <-->|Structured Eval| BEDROCK
+    PROC -.->|Candidate Facts| KG
+    PROC -->|Update Score & Status| DDB
+    PROC -->|Score >= 80| SNS
+    SNS --> ROUTER
+    TG <-->|Webhook Commands| APIGW <--> ROUTER
+    ROUTER <-->|Query Pending & Save Decisions| DDB
+    ROUTER -->|Draft Preview / Send Invocation| SENDER
+    SENDER <-->|Tone Constrained Pitch| BEDROCK
+    SENDER --> AIRGAP
+    AIRGAP -->|Authorized Send| SMTP
+    AIRGAP -->|Preview Mode Default| TG
 ```
 
 See [Architecture Doc](docs/Architecture_Doc.md) for the full system design with Mermaid diagrams.
@@ -42,7 +78,7 @@ See [Architecture Doc](docs/Architecture_Doc.md) for the full system design with
 
 | Feature | How It Works |
 |---------|-------------|
-| **Multi-source ingestion** | Hacker News, Adzuna, Google CSE, JSearch |
+| **Multi-source ingestion** | Hacker News, Direct ATS boards (Greenhouse, Lever, Ashby), Google CSE, JSearch |
 | **Smart deduplication** | SHA-256 hash on (title, company, URL) + evaluation versioning |
 | **Deterministic guardrails** | Pre-LLM rejection for stale, missing-date, low-signal, no-URL jobs |
 | **LLM scoring** | Bedrock Claude with forced tool-calling for structured JSON output |
@@ -56,8 +92,15 @@ See [Architecture Doc](docs/Architecture_Doc.md) for the full system design with
 
 ```
 jobhunt/
+├── .agents/workflows/        # Agent executive charters & workflows
+│   ├── founding-ai-engineer.md
+│   ├── orchestrator.md
+│   ├── tester.md
+│   ├── security-auditor.md
+│   └── open-source-expert.md
+│
 ├── .github/workflows/        # CI/CD, monitoring, analytics
-│   ├── ci.yml                # Tests + scoring evals + lint
+│   ├── ci.yml                # Tests + scoring evals + lint + security audit
 │   ├── deploy.yml            # Selective Lambda deployment
 │   ├── health-monitor.yml    # 6-hourly production health checks
 │   ├── pipeline-analytics.yml # Daily 90-day metrics report
@@ -70,8 +113,8 @@ jobhunt/
 ├── job_router/               # Lambda: Telegram control plane
 ├── job_sender/               # Lambda: email preview/send
 │
-├── shared/                   # Shared runtime (knowledge_graph.py)
-├── agents/                   # Local health-check agents
+├── shared/                   # Shared runtime (knowledge_graph.py, url_validation.py)
+├── agents/                   # Local diagnostic agents (QA, SecurityAuditor, PythonDev, Orchestrator)
 ├── tests/                    # Unit tests (moto mocks)
 │   └── live/                 # Opt-in AWS smoke tests
 ├── tools/ops/                # Deployment, diagnostics, ops scripts
@@ -94,7 +137,7 @@ jobhunt/
 - Python 3.11+
 - AWS account with Lambda, DynamoDB, SQS, SNS, S3, Bedrock
 - Telegram bot token
-- Source API credentials (Adzuna, Google CSE, Hunter.io)
+- Source API credentials (Google CSE, Hunter.io, JSearch)
 
 ### Local Development
 
@@ -102,13 +145,16 @@ jobhunt/
 # Install test dependencies
 pip install pytest moto[all] boto3
 
-# Run unit tests (no AWS needed)
+# Run unit tests (offline moto mocks, no AWS needed)
 pytest -q
 
 # Run scoring guardrail evals
 python tools/ops/eval_scoring.py
 
-# Run local agents
+# Run zero-trust security & identity audit
+python tools/ops/run_agents.py --security
+
+# Run QA agent check
 python tools/ops/run_agents.py --qa
 ```
 
@@ -146,6 +192,35 @@ python tools/ops/run_agents.py --full
 | `status` | Pipeline health + counts |
 | `backlog` | Show hidden pending jobs |
 | `interested` / `meh` / `not interested` | Feedback capture |
+
+## Production Operations & Stale Job Management
+
+### How Stale Jobs are Eliminated
+1. **Source Freshness Policies**:
+   - **Hacker News**: Postings older than 3 days are rejected at ingestion (`HN_MAX_JOB_AGE_DAYS=3`).
+   - **Direct ATS Boards**: Live active postings from Greenhouse, Lever, and Ashby boards are ingested directly without scraping delays.
+2. **Review Queue Freshness Policy**:
+   - `job-router` enforces a strict 1-day freshness cutoff (`MAX_JOB_AGE_DAYS=1`). Older opportunities are automatically excluded from `list` and `next` review views.
+3. **Deterministic Scoring Caps**:
+   - In `job-processor`, stale jobs (>14 days, HN >3 days) are capped at 55% score (`STALE_SCORE_CAP=55`), automatically marking them `REJECTED` and preventing Bedrock token spend.
+
+### How to Reconcile & Clear Existing Stale Jobs in Production
+To purge or sweep stale items already stored in the DynamoDB `Jobsearch` table:
+
+```bash
+# 1. Audit pending review queue freshness (read-only):
+python tools/ops/check_freshness.py
+
+# 2. Reconcile review queue against 1-day freshness & 80%+ match policy:
+python tools/ops/reconcile_review_queue.py         # Dry-run audit
+python tools/ops/reconcile_review_queue.py --apply # Transitions stale jobs to REJECTED
+
+# 3. Purge sub-80% matches from pending review:
+python tools/ops/cleanup.py
+
+# 4. Verify clean queue state:
+python tools/ops/check_status.py
+```
 
 ## CI/CD & Monitoring
 

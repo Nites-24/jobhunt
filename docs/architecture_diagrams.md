@@ -6,7 +6,7 @@
 graph TD
     subgraph "Data Sources"
         HN["Hacker News API"]
-        ADZ["Adzuna API"]
+        ATS["ATS Boards (Greenhouse, Lever, Ashby)"]
         GCSE["Google CSE API"]
         JS["JSearch API"]
     end
@@ -14,7 +14,7 @@ graph TD
     subgraph "Layer 1: Ingestion"
         ING["job-ingestor Lambda"]
         HN --> ING
-        ADZ --> ING
+        ATS --> ING
         GCSE --> ING
         JS --> ING
         ING --> SQS_RAW["SQS: job-raw-queue"]
@@ -285,7 +285,7 @@ flowchart LR
     DEV["Developer Push"] --> CI["CI Workflow"]
 
     subgraph CI["CI Workflow"]
-        TEST["pytest<br/>91+ tests"]
+        TEST["pytest<br/>252 tests"]
         EVAL["Scoring Evals<br/>5 labeled cases"]
         LINT["Ruff Lint"]
     end

@@ -6,17 +6,17 @@ production changes that do not match the actual job-search workflow.
 
 ## Mission
 
-Build and maintain a Telegram-controlled autonomous job pipeline for Teja Gopal
-Reddy Vaka. The system should find fresh, real AI engineering opportunities,
-score them against the candidate profile, explain the evidence, draft concise
-outreach, and keep a human approval gate before any real email is sent.
+Build and maintain a Telegram-controlled autonomous job pipeline. The system
+finds fresh, real AI engineering opportunities, scores them against the candidate
+profile, explains the evidence, drafts concise outreach, and keeps a human approval
+gate before any real email is sent.
 
 The product promise is not "more jobs." The promise is fewer, fresher, better
 grounded opportunities with source evidence.
 
 ## Current Architecture
 
-- `job_ingestor/`: fetches live jobs from Hacker News, Adzuna, Google CSE, and
+- `job_ingestor/`: fetches live jobs from Hacker News, Google CSE, ATS boards, and
   JSearch when configured.
 - `job_deduplicator/`: normalizes duplicates, refreshes old rows, and requeues
   jobs when the evaluation profile changes.
@@ -51,27 +51,32 @@ classes already found: dedup reprocessing, threshold versioning, IAM gaps,
 Bedrock throttling, Google CSE API disablement, JSearch rate limiting, work mode
 refresh gaps, and sender tone quality.
 
-## Candidate Truth
+## Candidate Truth & Identity Decoupling
 
-Do not invent or expand candidate claims.
+Do not invent or expand candidate claims. The codebase must remain 100% identity-agnostic.
+Personal identity must NEVER be hardcoded into tracked source code, Lambda functions,
+or committed tests.
 
-Canonical facts:
+Canonical profile attributes are injected strictly at runtime via environment variables:
+- `CANDIDATE_NAME`: Candidate full name (injected at runtime via Secrets or .env)
+- `TARGET_ROLE`: Target role (defaults to "AI Engineer")
+- `CANDIDATE_LOCATION`: Location preferences (defaults to open to remote, hybrid, onsite, any location)
+- `SENDER_EMAIL`: Verified sender email address
+- `CANDIDATE_LINKEDIN`: Public LinkedIn profile URL
+- `RESUME_KEY`: S3 key for resume attachment (e.g., "data/resume/resume.pdf")
+- `RETIREIQ_URL`: Public RetireIQ demo URL
 
-- Name: Teja Gopal Reddy Vaka
-- Target role: AI Engineer
-- Location: Wichita, Kansas
-- Preferences: open to remote, hybrid, onsite, any location, and relocation
-- Status: CPT student
+Domain focus areas & verified evidence:
 - Focus: RAG pipelines, LLM orchestration, agentic systems, evaluation pipelines
 - Skills: Python, PyTorch, AWS, LangChain, Bedrock, vector databases
 - Projects:
   - RetireIQ: retirement planning and financial decision support app
   - Rivulet: personal life management app
-- Evidence already used by the system:
+- Evidence already verified:
   - 33% GPU cost reduction
   - 87% autonomous ticket resolution
 
-When facts change, update `shared/knowledge_graph.py` and the relevant tests.
+When profile models change, update `shared/knowledge_graph.py` and the relevant unit tests.
 
 ## Production Safety Rules
 
@@ -127,7 +132,7 @@ Current known source issues:
 
 ## Draft Quality Rules
 
-Drafts must sound like Teja read the specific source.
+Drafts must sound like the candidate read the specific source.
 
 Required behavior:
 
@@ -189,20 +194,22 @@ an agent to auto-change production prompts after one thumbs-down.
 
 ## Local Agent System
 
-The local `agents/` package is for operational checks:
+The local `agents/` package is for operational diagnostics and quality gates:
 
-- `QAAgent`: runs tests and basic integrity checks.
-- `PythonDevAgent`: checks code quality and deployment hygiene.
+- `QAAgent`: runs offline pytest suites, measures test speed, and reports regression status.
+- `SecurityAuditorAgent`: enforces zero-trust identity decoupling, audits for secrets/credentials, and runs AST analysis for bounded loops.
+- `PythonDevAgent`: checks code quality, syntax, and deployment hygiene.
 - `BackendEngineerAgent`: checks AWS infrastructure when enabled.
 - `AIEngineerAgent`: checks Bedrock/scoring/email quality when AWS is enabled.
-- `OrchestratorAgent`: coordinates the above agents.
+- `OrchestratorAgent`: coordinates all specialized agents and computes overall system health.
 
 Use:
 
 ```powershell
-python tools/ops/run_agents.py --qa
-python tools/ops/run_agents.py
-python tools/ops/run_agents.py --full
+python tools/ops/run_agents.py --security   # Identity, secret, and loop audit
+python tools/ops/run_agents.py --qa         # QA test suite only
+python tools/ops/run_agents.py              # Orchestrator health check (offline)
+python tools/ops/run_agents.py --full       # Include live AWS infrastructure agents
 ```
 
 `--full` can touch AWS and should be treated as a live operation.
@@ -221,24 +228,31 @@ python tools/ops/run_agents.py --full
 Do not bundle unrelated fixes. In this project, bundled fixes waste credits and
 make production behavior harder to trust.
 
-## Current Priority Queue
+## Current Priority Queue & Milestone Status
 
-Handle one at a time:
-
-1. Build project-level agent operating contract. This file is that contract.
-2. Improve Hacker News source grounding. Implemented first pass:
+Milestones Completed:
+1. Agent operating contract and Executive charters established (`AGENTS.md`, `.agents/workflows/`).
+2. Hacker News source grounding:
    - 3-day freshness policy for HN reviewability
-   - obfuscated email extraction
-   - HN author/contact extraction
-   - outbound link enrichment where safe and bounded
-3. Improve sender personalization:
-   - source-specific opener
-   - one relevant project
-   - no generic project dump
-   - Telegram preview and Gmail/send consistency
-4. Add Telegram feedback capture:
-   - `good`, `bad`, `meh`
-   - feedback persistence in DynamoDB
-   - export/eval tooling
-5. Revisit Google CSE and JSearch once source grounding and draft quality are
-   stable.
+   - Obfuscated email extraction (`careers [at] example.ai`)
+   - Outbound link enrichment with SSRF protection
+3. Direct ATS board adapters:
+   - Greenhouse, Lever, and Ashby integration with deterministic pre-filtering
+4. Adzuna decommissioned:
+   - Full purge of Adzuna endpoints, queries, and test references
+5. Sender personalization & tone constraints:
+   - Source-specific opener, exactly one relevant project, under 130 words, zero hype phrases
+   - Telegram preview and Gmail/send path parity
+6. Telegram feedback loop:
+   - `interested`, `meh <reason>`, `not interested <reason>`, `applied`, `followups`
+   - DynamoDB feedback persistence and offline eval export tooling (`export_feedback.py`, `feedback_summary.py`)
+7. Zero-trust candidate identity decoupling:
+   - 100% identity-agnostic codebase with runtime environment variable injection
+8. Dedicated Security Auditor Agent:
+   - PII scrubbing, credential scanning, and AST zero-loop analysis (`run_agents.py --security`)
+9. Production code documentation:
+   - In-file architecture docstrings and developer documentation across all 5 Lambdas, shared utilities, and ops scripts
+
+Active Next Steps:
+1. Revisit Google CSE quota resolution and Custom Search JSON API configuration.
+2. JSearch query schedule spreading and backoff optimization.

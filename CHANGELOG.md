@@ -2,15 +2,22 @@
 
 All notable changes to this project are documented in this file.
 
-## [Unreleased]
+## [0.7.0] - 2026-10-09
 
 ### Added
-- GitHub Actions CI/CD workflows (ci, deploy, health-monitor, pipeline-analytics, feedback-export, source-quality-audit)
-- Professional README with architecture overview and project structure
-- CONTRIBUTING.md with development guidelines
-- SECURITY.md with security policy
-- CHANGELOG.md version history
-- Architecture diagram documentation
+- Direct ATS job board adapters for Greenhouse, Lever, and Ashby in `job_ingestor`.
+- Zero-Trust Security Auditor Agent (`agents/security_auditor_agent.py`) with `--security` CLI flag.
+- Executive agent charters and workflows in `.agents/workflows/` (`founding-ai-engineer`, `orchestrator`, `tester`, `security-auditor`, `open-source-expert`).
+- Enterprise-grade architecture docstrings and developer documentation across all 5 Lambda handlers, shared utilities, and ops scripts.
+- SSRF defense blocking RFC 1918 private subnets and AWS metadata (`169.254.169.254`).
+- AST static analysis enforcing bounded loops and socket timeouts ($\le 4$s).
+- Full test suite expansion to 252 offline unit and integration tests.
+
+### Changed
+- Decommissioned and completely purged Adzuna ingestion across pipeline, ops scripts, and test suite.
+- Enforced strict 1-day freshness policy on `job-router` review queue and 3-day on Hacker News ingestion.
+- Decoupled candidate identity into 100% identity-agnostic core with runtime environment injection.
+- Replaced all test fixtures with mock identity (`Alex Hunter`, `candidate@example.com`).
 
 ## [0.6.0] - 2026-05-14
 
