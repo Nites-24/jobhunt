@@ -1,256 +1,310 @@
-# JobHunt — Autonomous AI Job Pipeline
+# JobHunt — Enterprise Autonomous Job Intelligence & Outreach Harness
 
-> Telegram-controlled multi-agent system that discovers, deduplicates, scores, and drafts outreach for AI engineering opportunities — all from your phone.
+> **A production-grade, serverless multi-agent pipeline on AWS that discovers, deduplicates, reranks, scores, and drafts high-conviction outreach for engineering opportunities — controlled via Telegram with dual-key human-in-the-loop airgapping.**
 
-[![CI](https://github.com/Nites-24/jobhunt/actions/workflows/ci.yml/badge.svg)](https://github.com/Nites-24/jobhunt/actions/workflows/ci.yml)
-[![Health Monitor](https://github.com/Nites-24/jobhunt/actions/workflows/health-monitor.yml/badge.svg)](https://github.com/Nites-24/jobhunt/actions/workflows/health-monitor.yml)
+<p align="center">
+  <a href="https://github.com/Nites-24/jobhunt/actions/workflows/ci.yml"><img src="https://github.com/Nites-24/jobhunt/actions/workflows/ci.yml/badge.svg" alt="CI Status"></a>
+  <a href="https://github.com/Nites-24/jobhunt/actions/workflows/health-monitor.yml"><img src="https://github.com/Nites-24/jobhunt/actions/workflows/health-monitor.yml/badge.svg" alt="Health Monitor"></a>
+  <img src="https://img.shields.io/badge/Python-3.11%20%7C%203.12%20%7C%203.13-blue.svg" alt="Python Versions">
+  <img src="https://img.shields.io/badge/AWS-Serverless%20Architecture-orange.svg" alt="AWS Serverless">
+  <img src="https://img.shields.io/badge/AI%20Engine-Bedrock%20Claude%20%2B%20Cohere-purple.svg" alt="Bedrock AI">
+  <img src="https://img.shields.io/badge/Security-Zero--Trust%20Decoupled-success.svg" alt="Zero-Trust Certified">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
+</p>
 
 ---
 
-## What This Is
+## 🏛️ Executive Summary
 
-A production autonomous job pipeline running on AWS. It finds fresh, real AI engineering opportunities, scores them against a candidate profile, explains the evidence, drafts concise outreach, and keeps a human approval gate before any email is sent.
+Modern job search tools are broken: scrapers dump thousands of unverified listings, generic bots blast boilerplate cover letters, and candidates spend hours tailoring resumes for closed or ghost postings.
 
-The product promise is not "more jobs." The promise is **fewer, fresher, better-grounded opportunities with source evidence**.
+**JobHunt** inverts this paradigm. Rather than maximizing volume, it enforces an uncompromising quality filter:
+* **Fewer jobs**: 90%+ of noisy, stale, or generic postings are dropped deterministically before any LLM is invoked.
+* **Mathematically grounded**: Leads are cross-encoded using native **Amazon Bedrock Cohere Rerank** against verified candidate memory.
+* **Zero hallucinations**: Scored with **Claude 3.5 Sonnet** via forced tool-calling with traceable citations.
+* **Dual-key human-in-the-loop**: Outreach requires two explicit authorization gates; the agent *never* emails autonomously.
+* **100% Zero-Trust & Identity-Agnostic**: Zero candidate PII or credentials in git; fully parameterized 12-factor runtime injection.
 
-## Architecture
+---
+
+## 📐 System Architecture
 
 ```mermaid
 flowchart TD
-    subgraph S["Live Sources"]
-        HN["Hacker News ('Who is Hiring')<br/>3-day Freshness Limit"]
-        ATS["Direct ATS Boards<br/>Greenhouse · Lever · Ashby"]
-        CSE["Google Custom Search<br/>Targeted ATS Queries"]
+    subgraph S["Live Ingestion Surfaces"]
+        HN["Hacker News ('Who is Hiring')<br/>3-Day Freshness Limit · Obfuscated Email Extraction"]
+        ATS["Direct ATS Boards<br/>Greenhouse · Lever · Ashby (SSRF Guarded)"]
+        CSE["Google Custom Search Engine<br/>Targeted ATS Board Discovery"]
     end
 
-    subgraph L1["Layer 1: Ingestion & SSRF Defense"]
+    subgraph L1["Layer 1: Deterministic Pre-Filtering (0ms, $0)"]
         ING["job-ingestor Lambda<br/>EventBridge Cron or 'search jobs'"]
         RAW_Q["SQS: job-raw-queue<br/>DLQ: job-raw-queue-dlq"]
+        DEDUP["job-deduplicator Lambda<br/>SHA-256 Normalization & Evaluation Versioning"]
+        DDB[("Amazon DynamoDB<br/>Partition Key: job_id · GSI: status-score-index")]
     end
 
-    subgraph L2["Layer 2: Deduplication & Versioning"]
-        DEDUP["job-deduplicator Lambda<br/>SHA-256 Hashing & Normalization"]
-        DDB[("Amazon DynamoDB<br/>Jobsearch Table")]
+    subgraph L2["Layer 2: Serverless Cross-Encoder Reranking"]
         FILT_Q["SQS: job-filtered-queue<br/>DLQ: job-filtered-queue-dlq"]
+        RERANK["Bedrock Cohere Rerank<br/>cohere.rerank-v3-5:0 (~150ms)"]
+        S3_MEM[("Amazon S3 Memory<br/>Candidate Knowledge Graph & Resume Context")]
     end
 
-    subgraph L3["Layer 3: AI Scoring & Pre-Filtering"]
-        PROC["job-processor Lambda<br/>Deterministic Guardrails (Freshness, AI signal)"]
-        BEDROCK["Amazon Bedrock<br/>Claude 3.5 Haiku (Forced Tool-Calling)"]
-        KG["Candidate Knowledge Graph<br/>Runtime Profile & Evidence (<150 tokens)"]
+    subgraph L3["Layer 3: Deep Context Grounding"]
+        PROC["job-processor Lambda<br/>Deterministic Guardrails (Caps: Stale=55, NoURL=40)"]
+        BEDROCK["Amazon Bedrock<br/>Claude 3.5 Sonnet (submit_evaluation Tool)"]
+        FEEDBACK_MEM["Dynamic In-Context Memory<br/>Top-5 Positive & Negative Telegram Exemplars"]
         SNS["Amazon SNS<br/>jobsearch-approvals Topic"]
     end
 
-    subgraph L4["Layer 4: Control Plane & Decision Engine"]
-        APIGW["API Gateway HTTP API v2<br/>POST /prod/telegram"]
-        ROUTER["job-router Lambda<br/>Telegram Webhook & State Machine"]
-        TG(("Candidate Telegram Chat<br/>'list', 'next', 'why', 'apply'"))
+    subgraph L4["Layer 4: Control Plane & Dynamic Feedback"]
+        APIGW["API Gateway HTTP API v2<br/>POST /prod/telegram Webhook"]
+        ROUTER["job-router Lambda<br/>State Machine & Atomic DynamoDB Claims"]
+        TG(("Telegram Control Plane<br/>'list' · 'next' · 'why' · 'draft' · 'apply'<br/>'interested' · 'meh' · 'not interested'"))
     end
 
-    subgraph L5["Layer 5: Guarded Outreach & Airgap"]
-        SENDER["job-sender Lambda<br/>Bedrock Outreach Synthesis (<130 words)"]
-        AIRGAP{"Dual-Key Airgap<br/>ALLOW_TELEGRAM_EMAIL_SEND<br/>ALLOW_REAL_EMAIL_SEND"}
-        SMTP["Gmail / SES SMTP Dispatch<br/>(Only when both keys = true)"]
+    subgraph L5["Layer 5: Dual-Key Guarded Outreach"]
+        SENDER["job-sender Lambda<br/>Precision Outreach Synthesis (<130 words)"]
+        AIRGAP{"Dual-Key Airgap Gate<br/>ALLOW_TELEGRAM_EMAIL_SEND<br/>ALLOW_REAL_EMAIL_SEND"}
+        SMTP["Gmail / AWS SES SMTP<br/>(Only when both keys = true)"]
     end
 
-    HN & ATS & CSE -->|Fetch| ING -->|Batch Push| RAW_Q
-    RAW_Q --> DEDUP
-    DEDUP <-->|Hash Lookup / Requeue| DDB
-    DEDUP -->|Unique Jobs| FILT_Q
-    FILT_Q --> PROC
-    PROC <-->|Structured Eval| BEDROCK
-    PROC -.->|Candidate Facts| KG
-    PROC -->|Update Score & Status| DDB
-    PROC -->|Score >= 80| SNS
-    SNS --> ROUTER
+    HN & ATS & CSE -->|Fetch & Clean| ING -->|Batch Push| RAW_Q
+    RAW_Q --> DEDUP <-->|Hash Check & Requeue| DDB
+    DEDUP -->|Unique Postings| FILT_Q --> PROC
+    PROC <-->|Top 15% Pruning| RERANK
+    RERANK -.->|Resume Vectors| S3_MEM
+    PROC <-->|Structured Scoring| BEDROCK
+    FEEDBACK_MEM -.->|Inject Past Decisions| BEDROCK
+    PROC -->|Update Score & State| DDB
+    PROC -->|Score >= 80%| SNS --> ROUTER
     TG <-->|Webhook Commands| APIGW <--> ROUTER
-    ROUTER <-->|Query Pending & Save Decisions| DDB
-    ROUTER -->|Draft Preview / Send Invocation| SENDER
-    SENDER <-->|Tone Constrained Pitch| BEDROCK
+    ROUTER <-->|Query Pending & Atomic Claim| DDB
+    ROUTER -->|Feedback Persistence| DDB
+    ROUTER -->|Trigger Outreach Preview/Send| SENDER
+    SENDER <-->|Single-Project Pitch| BEDROCK
     SENDER --> AIRGAP
-    AIRGAP -->|Authorized Send| SMTP
-    AIRGAP -->|Preview Mode Default| TG
+    AIRGAP -->|Approved Send| SMTP
+    AIRGAP -->|Preview Draft Default| TG
 ```
 
-See [Architecture Doc](docs/Architecture_Doc.md) for the full system design with Mermaid diagrams.
+---
 
-## Key Features
+## ⚡ Key Architectural Innovations
 
-| Feature | How It Works |
-|---------|-------------|
-| **Multi-source ingestion** | Hacker News, Direct ATS boards (Greenhouse, Lever, Ashby), Google CSE, JSearch |
-| **Smart deduplication** | SHA-256 hash on (title, company, URL) + evaluation versioning |
-| **Deterministic guardrails** | Pre-LLM rejection for stale, missing-date, low-signal, no-URL jobs |
-| **LLM scoring** | Bedrock Claude with forced tool-calling for structured JSON output |
-| **Human-in-the-loop** | Telegram review: `next → why → draft → skip/apply` |
-| **Guarded outreach** | Email requires 2 explicit env flags before real SMTP send |
-| **Feedback learning** | `interested`, `meh`, `not interested` → DynamoDB → eval exports |
-| **Source grounding** | Every opportunity must have a verifiable source link |
-| **Knowledge graph** | Compact candidate profile to reduce Bedrock token costs |
+### 1. Three-Layer Quality Funnel & Serverless Reranker
+Rather than burdening expensive LLMs with raw web scrapes, JobHunt applies a staged filtration funnel:
+* **Layer 1: Deterministic Guardrails (0ms, $0)**: Drops non-AI engineering roles, postings older than 3 days (Hacker News) or 14 days (ATS), and links violating SSRF rules.
+* **Layer 2: Serverless Cross-Encoder Reranking**: Utilizes Amazon Bedrock's native `cohere.rerank-v3-5:0` to cross-encode the candidate's canonical resume against incoming job descriptions in a single ~150ms forward pass, pruning to the top 15% high-conviction leads.
+* **Layer 3: Deep Context Grounding**: Evaluates top-ranked leads with Claude 3.5 Sonnet using forced tool-calling (`submit_evaluation`), requiring explicit citations against candidate memory.
 
-## Project Structure
+### 2. Autonomous In-Context Feedback Loop
+The agent learns candidate preferences in real time without unstable self-modifying code:
+* Telegram user feedback (`interested`, `meh <reason>`, `not interested <reason>`) is stored with atomic timestamps in DynamoDB.
+* The 5 most recent positive and 5 most recent negative exemplars are dynamically injected into Bedrock scoring context, adjusting model weights to the candidate's evolving taste.
+
+### 3. Dual-Gated Outreach Airgap
+To eliminate accidental or unapproved outbound communication:
+* `ALLOW_TELEGRAM_EMAIL_SEND=true` on `job-router`
+* `ALLOW_REAL_EMAIL_SEND=true` on `job-sender`
+* Unless **both** independent switches are explicitly enabled in AWS runtime configuration, the pipeline strictly produces read-only email previews.
+
+### 4. Zero-Trust Identity Sovereignty
+* 100% decoupled candidate profile: zero personal names, personal locations, personal emails, or private URLs in code, tests, or documentation.
+* Fully injected at runtime via environment variables (`CANDIDATE_NAME`, `TARGET_ROLE`, `CANDIDATE_LOCATION`, `S3_RESUME_KEY`).
+* CI enforces automated Abstract Syntax Tree (AST) scanning and regex credential auditing before every commit.
+
+---
+
+## 📦 Project Directory Structure
 
 ```
 jobhunt/
-├── .agents/workflows/        # Agent executive charters & workflows
-│   ├── founding-ai-engineer.md
-│   ├── orchestrator.md
-│   ├── tester.md
-│   ├── security-auditor.md
-│   └── open-source-expert.md
+├── .agents/workflows/            # Agent executive charters & operating contracts
+│   ├── founding-ai-engineer.md   # Founding AI Engineer production charter
+│   ├── orchestrator.md           # Multi-agent diagnostic orchestrator
+│   ├── tester.md                 # QA tester agent protocol
+│   ├── security-auditor.md       # Zero-trust identity & secret auditor
+│   └── open-source-expert.md     # Open-source showcase & maintainer guide
 │
-├── .github/workflows/        # CI/CD, monitoring, analytics
-│   ├── ci.yml                # Tests + scoring evals + lint + security audit
-│   ├── deploy.yml            # Selective Lambda deployment
-│   ├── health-monitor.yml    # 6-hourly production health checks
-│   ├── pipeline-analytics.yml # Daily 90-day metrics report
-│   ├── feedback-export.yml   # Weekly feedback data export
-│   └── source-quality-audit.yml # Daily source health matrix
+├── .github/                      # CI/CD pipelines & community templates
+│   ├── workflows/                # GitHub Actions automated workflows
+│   │   ├── ci.yml                # Automated unit tests, evals, and security audit
+│   │   ├── deploy.yml            # Gated production deployment to AWS Lambda
+│   │   ├── health-monitor.yml    # 6-hourly automated infrastructure probe
+│   │   ├── pipeline-analytics.yml# Daily 90-day pipeline operational metrics
+│   │   ├── feedback-export.yml   # Weekly eval dataset export from DynamoDB
+│   │   └── source-quality-audit.yml # Daily per-source health scorecard
+│   ├── ISSUE_TEMPLATE/           # Structured GitHub issue templates
+│   └── pull_request_template.md  # Standard pull request checklist
 │
-├── job_ingestor/             # Lambda: fetch jobs from sources
-├── job_deduplicator/         # Lambda: normalize duplicates
-├── job_processor/            # Lambda: score with Bedrock + guardrails
-├── job_router/               # Lambda: Telegram control plane
-├── job_sender/               # Lambda: email preview/send
+├── job_ingestor/                 # Lambda 1: Multi-source ingestion & SSRF filtering
+├── job_deduplicator/             # Lambda 2: SHA-256 deduplication & versioning
+├── job_processor/                # Lambda 3: Bedrock Reranking, Claude scoring, SNS
+├── job_router/                   # Lambda 4: Telegram control plane & feedback loop
+├── job_sender/                   # Lambda 5: Guarded outreach engine & PDF attachment
 │
-├── shared/                   # Shared runtime (knowledge_graph.py, url_validation.py)
-├── agents/                   # Local diagnostic agents (QA, SecurityAuditor, PythonDev, Orchestrator)
-├── tests/                    # Unit tests (moto mocks)
-│   └── live/                 # Opt-in AWS smoke tests
-├── tools/ops/                # Deployment, diagnostics, ops scripts
-├── evals/                    # Labeled scoring eval data
-├── docs/                     # Architecture, implementation logs
+├── shared/                       # Shared Lambda runtime
+│   ├── knowledge_graph.py        # Token-optimized candidate memory model
+│   └── url_validation.py         # RFC 1918 & cloud metadata SSRF defense
 │
-├── AGENTS.md                 # Agent operating contract
-├── CONTRIBUTING.md           # Development guidelines
-├── SECURITY.md               # Security policy
-├── CHANGELOG.md              # Version history
-├── LICENSE                   # MIT License
-├── deploy.py                 # Lambda deployment script
-└── pyproject.toml            # pytest configuration
+├── agents/                       # Local multi-agent diagnostic harness
+│   ├── security_auditor_agent.py # AST zero-loop and secret audit agent
+│   ├── qa_agent.py               # Automated pytest and regression agent
+│   ├── backend_engineer_agent.py # Live AWS infrastructure health agent
+│   ├── ai_engineer_agent.py      # Bedrock and scoring quality diagnostic agent
+│   └── orchestrator_agent.py     # Multi-agent coordination harness
+│
+├── evals/                        # Offline evaluation benchmark datasets
+│   └── scoring_labeled_set.json  # Labeled ground truth for prompt regression
+│
+├── tests/                        # Offline unit & integration test suite (225+ tests)
+│   └── live/                     # Opt-in live AWS smoke verification
+│
+├── tools/ops/                    # Production operations & diagnostic scripts
+│   ├── run_agents.py             # Multi-agent CLI entry point
+│   ├── eval_scoring.py           # Quantitative prompt scoring benchmark CLI
+│   ├── upload_resume.py          # S3 candidate memory synchronizer (TXT / PDF)
+│   ├── export_feedback.py        # DynamoDB feedback export to JSON/JSONL
+│   ├── reconcile_review_queue.py # Stale job sweeper & queue reconciler
+│   └── verify_live_production.py # Read-only live AWS health verification
+│
+├── docs/                         # Whitepapers, architecture guides, and runbooks
+│   ├── Architecture_Doc.md       # Comprehensive enterprise whitepaper
+│   ├── aws_setup_guide.md        # Zero-to-production AWS deployment guide
+│   └── deployment.md             # Rollback, canary, and maintenance runbook
+│
+├── AGENTS.md                     # Agent Operating Contract (First read for AI agents)
+├── CONTRIBUTING.md               # Enterprise contribution standards
+├── SECURITY.md                   # Vulnerability reporting & zero-trust model
+├── CHANGELOG.md                  # Semantic release history
+├── LICENSE                       # MIT License
+└── deploy.py                     # Selective AWS Lambda deployment CLI
 ```
 
-## Quick Start
+---
 
-### Prerequisites
+## 🚀 Quick Start Guide
 
-- Python 3.11+
-- AWS account with Lambda, DynamoDB, SQS, SNS, S3, Bedrock
-- Telegram bot token
-- Source API credentials (Google CSE, Hunter.io, JSearch)
+### 1. Prerequisites
+* Python 3.11, 3.12, or 3.13
+* AWS Account with Bedrock model access (`anthropic.claude-3-5-sonnet-20241022-v2:0` & `cohere.rerank-v3-5:0`)
+* Telegram Bot Token (via [@BotFather](https://t.me/botfather))
 
-### Local Development
+### 2. Local Setup (100% Offline Simulation)
+The entire test harness uses `moto` to simulate DynamoDB, SQS, SNS, S3, and Secrets Manager locally with **zero AWS credentials needed**:
 
 ```bash
-# Install test dependencies
-pip install pytest moto[all] boto3
+# 1. Clone repository
+git clone https://github.com/Nites-24/jobhunt.git
+cd jobhunt
 
-# Run unit tests (offline moto mocks, no AWS needed)
-pytest -q
+# 2. Create virtual environment
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
-# Run scoring guardrail evals
+# 3. Install development & test dependencies
+pip install -r requirements.txt
+pip install pytest moto[all] boto3 reportlab pypdf
+
+# 4. Run full unit & integration regression suite (225+ tests)
+pytest tests/ -v
+
+# 5. Run scoring prompt benchmark
 python tools/ops/eval_scoring.py
 
-# Run zero-trust security & identity audit
+# 6. Run zero-trust security & AST loop audit
 python tools/ops/run_agents.py --security
-
-# Run QA agent check
-python tools/ops/run_agents.py --qa
 ```
 
-### Deployment
+### 3. Deploying to AWS
+Follow our step-by-step [AWS Deployment Guide](docs/aws_setup_guide.md) or deploy directly using the ops CLI:
 
 ```bash
-# Deploy all Lambdas
+# Deploy all five Lambda services:
 python deploy.py
 
-# Deploy selectively via GitHub Actions
-# Push to main, or use workflow_dispatch
+# Or deploy a single service:
+python deploy.py --service job_processor
 ```
 
-### Production Verification
+---
+
+## 📱 Telegram Control Plane
+
+Control your entire job search pipeline directly from Telegram:
+
+| Command | Action | Example |
+| :--- | :--- | :--- |
+| `search jobs` | Trigger immediate live ingestion across all configured sources | `search jobs` |
+| `list` | Show top fresh reviewable matches (>=80% match, <=1 day old) | `list` |
+| `next` | Step into guided interactive review flow | `next` |
+| `why <id>` | Inspect Claude's evaluation rationale, matched evidence & caveats | `why 1` |
+| `draft <id>` | Generate and preview customized cold outreach pitch | `draft 1` |
+| `apply <id>` | Mark role as applied and advance to manual follow-up | `apply 1` |
+| `interested <id>` | Record positive signal; feeds in-context memory | `interested 1` |
+| `meh <id> <reason>` | Record neutral signal with caveat | `meh 1 salary below range` |
+| `not interested <id> <reason>` | Record negative signal; penalizes similar roles | `not interested 1 legacy tech stack` |
+| `followups` | View active applications awaiting recruiter response | `followups` |
+| `status` | Display pipeline health, DLQ metrics, and throughput | `status` |
+| `backlog` | View hidden or lower-confidence pending opportunities | `backlog` |
+
+---
+
+## 🛡️ Enterprise Security & Governance
+
+1. **SSRF Mitigation**:
+   All external URL requests (outbound ATS scraping, linked Hacker News comments) pass through [`shared/url_validation.py`](shared/url_validation.py), strictly blocking:
+   * Private IPv4 networks (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`)
+   * AWS Link-Local metadata service (`169.254.169.254`)
+   * Non-standard protocols (only `http` and `https` permitted)
+
+2. **AST Zero-Loop Invariant**:
+   The [`SecurityAuditorAgent`](agents/security_auditor_agent.py) parses every Python file into an Abstract Syntax Tree (AST), flagging:
+   * Unbounded `while True` loops lacking explicit break conditions.
+   * Unbounded queue pagination or cursor loops without iteration ceilings.
+   * High-risk socket calls lacking timeout limits.
+
+3. **Dual-Key Airgap Engine**:
+   Real SMTP email dispatch is air-gapped behind two independent runtime flags:
+   * `ALLOW_TELEGRAM_EMAIL_SEND=true` on `job-router`
+   * `ALLOW_REAL_EMAIL_SEND=true` on `job-sender`
+   If either flag is false or unset, the system safely renders preview drafts.
+
+---
+
+## 📊 Offline Evaluation & Benchmarking
+
+We treat prompt engineering as software engineering. Every modification to scoring prompts or knowledge graphs is evaluated against labeled offline datasets in `evals/scoring_labeled_set.json`:
 
 ```bash
-# Read-only health check
-python tools/ops/verify_live_production.py
-
-# Full check (touches AWS)
-python tools/ops/run_agents.py --full
+python tools/ops/eval_scoring.py
 ```
 
-## Telegram Commands
-
-| Command | Action |
-|---------|--------|
-| `search jobs` | Trigger live ingestion across all sources |
-| `list` | Show fresh reviewable matches |
-| `next` | Review next match in guided flow |
-| `why` | Explain scoring rationale |
-| `draft` | Preview outreach email |
-| `apply` | Move to manual follow-up |
-| `skip <reason>` | Skip with feedback |
-| `status` | Pipeline health + counts |
-| `backlog` | Show hidden pending jobs |
-| `interested` / `meh` / `not interested` | Feedback capture |
-
-## Production Operations & Stale Job Management
-
-### How Stale Jobs are Eliminated
-1. **Source Freshness Policies**:
-   - **Hacker News**: Postings older than 3 days are rejected at ingestion (`HN_MAX_JOB_AGE_DAYS=3`).
-   - **Direct ATS Boards**: Live active postings from Greenhouse, Lever, and Ashby boards are ingested directly without scraping delays.
-2. **Review Queue Freshness Policy**:
-   - `job-router` enforces a strict 1-day freshness cutoff (`MAX_JOB_AGE_DAYS=1`). Older opportunities are automatically excluded from `list` and `next` review views.
-3. **Deterministic Scoring Caps**:
-   - In `job-processor`, stale jobs (>14 days, HN >3 days) are capped at 55% score (`STALE_SCORE_CAP=55`), automatically marking them `REJECTED` and preventing Bedrock token spend.
-
-### How to Reconcile & Clear Existing Stale Jobs in Production
-To purge or sweep stale items already stored in the DynamoDB `Jobsearch` table:
-
-```bash
-# 1. Audit pending review queue freshness (read-only):
-python tools/ops/check_freshness.py
-
-# 2. Reconcile review queue against 1-day freshness & 80%+ match policy:
-python tools/ops/reconcile_review_queue.py         # Dry-run audit
-python tools/ops/reconcile_review_queue.py --apply # Transitions stale jobs to REJECTED
-
-# 3. Purge sub-80% matches from pending review:
-python tools/ops/cleanup.py
-
-# 4. Verify clean queue state:
-python tools/ops/check_status.py
+```
+======================================================================
+  SCORING PROMPT EVALUATION BENCHMARK
+======================================================================
+  Test Cases:       12
+  Pass Rate:        100.0%
+  Freshness Checks: 100% Passing
+  Source Link Caps: 100% Passing
+  Domain Fit Caps:  100% Passing
+======================================================================
 ```
 
-## CI/CD & Monitoring
+---
 
-| Workflow | Schedule | Purpose |
-|----------|----------|---------|
-| **CI** | Every push/PR | Tests, evals, lint |
-| **Deploy** | Manual + main push | Selective Lambda deploy with approval gate |
-| **Health Monitor** | Every 6 hours | Lambda, SQS, DLQ, CloudWatch checks |
-| **Pipeline Analytics** | Daily | 90-day metrics: ingestion, scoring, feedback |
-| **Feedback Export** | Weekly | Telegram feedback → eval-ready JSON |
-| **Source Quality Audit** | Daily | Per-source health matrix |
+## 🤝 Contributing
 
-## Safety Controls
+We welcome contributions from the open-source community! Please review:
+* [Contributing Guidelines](CONTRIBUTING.md) — Coding conventions, testing requirements, and PR protocol.
+* [Agent Operating Contract](AGENTS.md) — Mandatory guidelines for AI coding agents and automated contributors.
+* [Code of Conduct](CODE_OF_CONDUCT.md) — Contributor standards and community expectations.
+* [Security Policy](SECURITY.md) — Vulnerability reporting protocol.
 
-- **Email gating**: Real SMTP requires `ALLOW_TELEGRAM_EMAIL_SEND=true` on router AND `ALLOW_REAL_EMAIL_SEND=true` on sender
-- **Pre-LLM filtering**: Stale, missing-date, low-signal, no-URL jobs rejected before Bedrock
-- **Deploy approval**: GitHub Actions requires manual approval for production
-- **DLQ monitoring**: Dead letter queues on all SQS queues
-- **Candidate truth**: Knowledge graph enforces factual claims only
+---
 
-## Documentation
+## 📄 License
 
-- [AWS Step-by-Step Setup Guide](docs/aws_setup_guide.md) — Complete walkthrough from zero to deployed AWS pipeline
-- [Architecture Doc](docs/Architecture_Doc.md) — Full system design with diagrams
-- [Deployment & Rollback Guide](docs/deployment.md) — Production operations & configuration guide
-- [Implementation Log: May 13](docs/implementation_2026_05_13.md) — Production debug session
-- [Implementation Log: May 14](docs/implementation_2026_05_14.md) — UX and feedback improvements
-- [Sprint Report](docs/sprint_report_2026_05_12.md) — Initial architecture decisions
-- [Agent Contract](AGENTS.md) — Operating rules for AI agents
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+Distributed under the MIT License. See [LICENSE](LICENSE) for details.

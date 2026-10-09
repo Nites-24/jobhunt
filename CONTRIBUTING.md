@@ -1,126 +1,105 @@
 # Contributing to JobHunt
 
-## Development Setup
+Thank you for your interest in contributing to **JobHunt**! This project is an enterprise-grade autonomous AI job pipeline and outreach harness running on AWS serverless infrastructure.
 
-1. **Clone the repository**
+We hold code quality, mathematical grounding, token economics, and zero-trust security to the highest institutional standards.
 
-   ```bash
-   git clone https://github.com/Nites-24/jobhunt.git
-   cd jobhunt
-   ```
+---
 
-2. **Install dependencies**
+## 🛠️ 1. Local Development Setup
 
-   ```bash
-   pip install pytest moto[all] boto3 ruff
-   ```
+JobHunt is built so that **100% of the unit test suite and local simulation runs completely offline** using `moto` to mock AWS services (DynamoDB, SQS, SNS, S3, Secrets Manager). You do **not** need an active AWS account to develop or test locally.
 
-3. **Set up environment**
-
-   Copy `.env.example` to `.env` and fill in your AWS credentials:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-4. **Run tests**
-
-   ```bash
-   pytest -q
-   ```
-
-## Code Organization
-
-Each Lambda function lives in its own directory with a single `lambda_function.py`:
-
-```
-job_ingestor/lambda_function.py     # Fetches jobs from sources
-job_deduplicator/lambda_function.py # Deduplicates via DynamoDB hash
-job_processor/lambda_function.py    # Scores with Bedrock + guardrails
-job_router/lambda_function.py       # Telegram control plane
-job_sender/lambda_function.py       # Email preview/send
-```
-
-Shared runtime code goes in `shared/` and is packaged into every Lambda zip.
-
-## Testing
-
-- **Unit tests** (`tests/test_*.py`): Use `moto` to mock all AWS services. No real credentials needed.
-- **Live tests** (`tests/live/`): Opt-in tests that hit real AWS. Only run when deploying or debugging.
-- **Scoring evals** (`tools/ops/eval_scoring.py`): Offline guardrail regression tests against labeled cases.
-
+### Step 1: Clone the Repository
 ```bash
-# Run all unit tests
-pytest -q
+git clone https://github.com/Nites-24/jobhunt.git
+cd jobhunt
+```
 
-# Run specific test file
-pytest tests/test_router.py -q
+### Step 2: Set Up Virtual Environment & Dependencies
+```bash
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
-# Run scoring evals
+pip install -r requirements.txt
+pip install pytest moto[all] boto3 reportlab pypdf ruff
+```
+
+### Step 3: Configure Environment
+Copy `.env.example` to `.env`. For local offline testing, mock values are sufficient:
+```bash
+cp .env.example .env
+```
+
+---
+
+## 🏛️ 2. Architectural Design Principles
+
+When proposing changes, ensure your implementation adheres to our core design principles:
+
+1. **Deterministic Python Over LLM Freedom**:
+   Solve filtering, deduplication, URL validation, and freshness in deterministic Python before invoking Bedrock. Every LLM call consumes tokens, introduces latency, and adds variance.
+2. **Three-Layer Quality Funnel**:
+   - Layer 1: Deterministic Quality Pre-Filters (0ms, $0)
+   - Layer 2: Serverless Cross-Encoder Reranker (`cohere.rerank-v3-5:0`)
+   - Layer 3: Deep Context Grounding (Claude 3.5 Sonnet with forced tool-calling)
+3. **Zero-Trust Identity Sovereignty**:
+   Candidate personal identity must **never** be hardcoded in tracked files, tests, or documentation. Always use runtime environment variable decoupling (`CANDIDATE_NAME`, `TARGET_ROLE`, `CANDIDATE_LOCATION`, `S3_RESUME_KEY`).
+4. **AST-Enforced Static Safety**:
+   Every loop, queue consumer, or network poll must have bounded iterations and explicit timeouts. Unbounded `while True` loops are forbidden.
+5. **Air-Gapped Outreach Security**:
+   Email dispatch requires **both** `ALLOW_TELEGRAM_EMAIL_SEND=true` on `job-router` and `ALLOW_REAL_EMAIL_SEND=true` on `job-sender`.
+
+---
+
+## 🧪 3. Quality & Security Verification Gates
+
+Before submitting a Pull Request, you must verify all three local quality gates pass:
+
+```powershell
+# Gate 1: Zero-Trust Security & Identity Audit
+python tools/ops/run_agents.py --security
+
+# Gate 2: Full Unit & Integration Regression Suite (225+ tests)
+pytest tests/ -v
+
+# Gate 3: Quantitative Prompt Scoring Benchmark
 python tools/ops/eval_scoring.py
 ```
 
-## Making Changes
+### Gate Standards:
+* **Critical Issues**: Must be **0**.
+* **Pytest**: Must be **100% passing**.
+* **Code Style**: Code must adhere to `ruff check .` with clean syntax.
 
-### Working Protocol
+---
 
-1. Identify one bounded problem
-2. Inspect the relevant code and tests before editing
-3. Make focused changes only for that problem
-4. Add or update targeted tests
-5. Run targeted tests
-6. Report what changed, what was verified, and what remains
+## 📝 4. Commit Conventions
 
-### Do Not
+We follow the [Conventional Commits](https://www.conventionalcommits.org/) specification:
 
-- Bundle unrelated fixes in one commit
-- Run live ingestion/scoring as a first diagnostic step
-- Use Bedrock or live APIs to answer questions that can be answered from code, tests, or docs
-- Delete DynamoDB rows to force behavior — use evaluation versioning instead
+* `feat(processor)`: add Bedrock Cohere reranker integration
+* `fix(sender)`: correct email template escaping
+* `docs(readme)`: update architecture diagrams
+* `security(core)`: enforce SSRF blocklist on outbound fetches
+* `test(router)`: add coverage for telegram feedback commands
 
-### Commit Messages
+---
 
-Use conventional commit format:
+## 🚀 5. Deployment Protocol
 
-```
-feat: add Telegram feedback capture
-fix: correct dedup reprocessing for threshold changes
-chore: update deployment script
-docs: add May 13 production debug log
-```
-
-## Deployment
-
-### Local Deploy
+Production deployments are managed via GitHub Actions (`.github/workflows/deploy.yml`) or via the deployment CLI:
 
 ```bash
+# Dry-run or deploy all services:
 python deploy.py
+
+# Deploy a specific Lambda:
+python deploy.py --service job_processor
 ```
 
-### CI/CD Deploy
+---
 
-Push to `main` with changes in Lambda directories, or use the GitHub Actions `Deploy` workflow dispatch.
+## 📄 6. Community Standards
 
-### Safety Rules
-
-- Real email sending requires **both** `ALLOW_TELEGRAM_EMAIL_SEND=true` (router) and `ALLOW_REAL_EMAIL_SEND=true` (sender)
-- `apply` does not send email — it moves to manual follow-up
-- Live tests (`tests/live/`) and `verify_live_production.py` are opt-in live operations
-
-## Code Quality
-
-```bash
-# Lint
-ruff check . --select E,F,W --ignore E501
-
-# Type checking (optional)
-mypy shared/ --ignore-missing-imports
-```
-
-## Production Safety
-
-Before making production changes, read:
-
-- [AGENTS.md](AGENTS.md) — Operating contract
-- [docs/implementation_2026_05_13.md](docs/implementation_2026_05_13.md) — Known failure classes
-- [docs/implementation_2026_05_14.md](docs/implementation_2026_05_14.md) — UX decisions
+All contributors are expected to uphold our [Code of Conduct](CODE_OF_CONDUCT.md). For security vulnerabilities, review our [Security Policy](SECURITY.md).
