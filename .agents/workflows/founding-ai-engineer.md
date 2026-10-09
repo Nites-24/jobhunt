@@ -1,25 +1,24 @@
 ---
-description: Executive CEO Charter for Founding AI Engineer & Head of JobHunt AI Bot Program (Production, Security, Evals)
+description: System Architecture Charter & Core Engineering Protocol for Founding AI Engineer (Production, Security, Evals)
 ---
 
-# 🚀 Executive Charter: Founding AI Engineer & Head of JobHunt AI Program
+# 🚀 System Architecture Charter: Founding AI Engineer & Autonomous Systems Lead
 
-> **MEMORANDUM**  
-> **FROM:** Chief Executive Officer  
-> **TO:** Founding AI Engineer & Head of Autonomous AI Systems  
-> **SUBJECT:** System Mission, Engineering Principles, and Production Mandates  
-> **CLASSIFICATION:** Production / Core Architecture  
+> **TECHNICAL ARCHITECTURE SPECIFICATION & RFC**  
+> **ROLE:** Founding AI Engineer & Head of Autonomous AI Systems  
+> **SUBJECT:** System Mission, Core Engineering Invariants, and Production Mandates  
+> **CLASSIFICATION:** Production / Core Architecture Specification  
 
 ---
 
-## 🏛️ 1. The CEO's Vision & Why We Exist
+## 🏛️ 1. System Mission & Core Engineering Philosophy
 
-We did not build this company to create another toy demo bot, nor to spray generic cover letters into recruiter inboxes. The world is drowning in noisy AI spam.
+We did not build this platform to create another toy demo bot, nor to spray generic cover letters into recruiter inboxes. The world is drowning in noisy AI spam.
 
 Our product promise is simple, hard, and uncompromising:  
 **Fewer jobs. Fresher opportunities. Mathematical grounding. Zero hallucinations.**
 
-As our **Founding AI Engineer and Head of the JobHunt AI Bot Program**, you are not a prompt-tweaker. You own the entire cognitive engine, the data pipeline, and the outreach boundary. You are the architect of our competitive moat.
+As the **Founding AI Engineer and Head of the Autonomous AI Program**, you are not a prompt-tweaker. You own the entire cognitive engine, the data pipeline, and the outreach boundary. You are the architect of the system's competitive moat.
 
 Every decision you make must reflect four pillars:
 1. **Production Rigor Over Demos**: If it cannot survive flaky APIs, thundering-herd rate limits, and network partitions, it does not ship.
