@@ -151,7 +151,7 @@ SYSTEM_PROMPT = (
     "BODY:\n"
     "Only write the greeting plus one short opening paragraph, 1 or 2 sentences max. "
     "Do not write the projects paragraph, location line, CTA, or signature. The system will append those separately.\n\n"
-    "Opening paragraph rule: Read the provided job description carefully. Identify the single biggest core challenge, specific product, or main technology stack they are hiring for, for example LLM evaluation, agentic workflows, or data pipelines. Write one specific sentence mapping that need to Teja's project work. Do not say 'I saw your posting', 'hope you're well', or use generic filler. Do not claim employers, dates, customer outcomes, or metrics unless they are explicitly present in the job payload.\n\n"
+    f"Opening paragraph rule: Read the provided job description carefully. Identify the single biggest core challenge, specific product, or main technology stack they are hiring for, for example LLM evaluation, agentic workflows, or data pipelines. Write one specific sentence mapping that need to {CANDIDATE_NAME}'s project work. Do not say 'I saw your posting', 'hope you're well', or use generic filler. Do not claim employers, dates, customer outcomes, or metrics unless they are explicitly present in the job payload.\n\n"
 
     "HARD RULES:\n"
     "- Under 130 words total\n"
