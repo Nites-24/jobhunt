@@ -78,6 +78,34 @@ Domain focus areas & verified evidence:
 
 When profile models change, update `shared/knowledge_graph.py` and the relevant unit tests.
 
+## Three-Layer Quality Funnel & Serverless Reranking Policy
+
+To guarantee maximum job-match accuracy without manual per-application resume tailoring
+or the operational burden of self-hosting dedicated decision models (e.g., Laya / ModernBERT),
+the pipeline strictly enforces a Three-Layer Quality Funnel:
+
+1. **Layer 1: Deterministic Quality Pre-Filters (0ms, $0)**:
+   - Freshness: Hacker News ≤ 3 days (`HN_MAX_JOB_AGE_DAYS`), ATS boards ≤ 14 days (`MAX_JOB_AGE_DAYS`).
+   - Domain & Title: Compiled regex drops non-AI roles (pure React/frontend, legacy Java/PHP, IT, sales) before model invocation.
+   - Grounding: Canonical HTTPS URL and SSRF validation required.
+
+2. **Layer 2: Serverless Cross-Encoder Reranker (Bedrock Cohere Rerank)**:
+   - Rather than deploying dedicated GPU instances, batches of raw opportunities can be
+     cross-encoded using native Amazon Bedrock Rerank (`cohere.rerank-v3-5:0`).
+   - Projects the candidate's canonical resume and project memory in S3 against job descriptions
+     in a single ~150ms forward pass, pruning to the top 15% high-conviction leads.
+   - 100% serverless, zero infrastructure maintenance, funded via AWS credits.
+
+3. **Layer 3: Deep Context Grounding (Claude 3.5 Sonnet on Bedrock)**:
+   - Top-ranked leads are evaluated using Claude 3.5 Sonnet with forced tool-calling (`submit_evaluation`).
+   - Requires explicit `match_reasons` citing candidate memory and `missing_requirements` identifying caveats.
+   - Guardrail caps (stale capped at 55, missing date capped at 70, missing link capped at 40) enforce hard ceilings.
+
+4. **Layer 4: Autonomous In-Context Feedback Loop**:
+   - Telegram user decisions (`interested`, `meh <reason>`, `not interested <reason>`) stored in DynamoDB
+     are dynamically injected into Bedrock prompt context as the 5 most recent positive and negative exemplars.
+   - The agent continuously adapts to user preference in real time without unstable self-modifying code.
+
 ## Production Safety Rules
 
 - Do not run live ingestion, live scoring, live sender, deployment, or AWS

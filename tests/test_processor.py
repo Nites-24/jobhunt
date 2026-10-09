@@ -496,3 +496,48 @@ class TestProcessor:
         wm_source = str(job_no_wm.get("work_mode_source") or "").strip()
         wm_evidence = wm_source if wm_source else "not stated in source"
         assert "not stated" in wm_evidence
+
+    def test_rerank_jobs_batch_disabled(self):
+        """When reranker is disabled, order remains unchanged."""
+        mod, _, _, _ = self._setup_infra()
+        mod.ENABLE_BEDROCK_RERANKER = False
+        batch = [("m1", {"title": "Job 1"}), ("m2", {"title": "Job 2"})]
+        result = mod._rerank_jobs_batch(batch, "AI Engineer")
+        assert result == batch
+
+    def test_rerank_jobs_batch_invokes_bedrock_cohere(self):
+        """When enabled, invokes Bedrock invoke_model and sorts by relevance."""
+        mod, _, _, _ = self._setup_infra()
+        mod.ENABLE_BEDROCK_RERANKER = True
+        batch = [
+            ("m1", {"title": "Junior Python Dev", "description": "Write scripts"}),
+            ("m2", {"title": "Senior AI Engineer", "description": "Build RAG Bedrock"}),
+        ]
+
+        mock_body = MagicMock()
+        mock_body.read.return_value = json.dumps({
+            "results": [
+                {"index": 1, "relevance_score": 0.95},
+                {"index": 0, "relevance_score": 0.40},
+            ]
+        }).encode("utf-8")
+
+        with patch.object(mod.bedrock, "invoke_model", return_value={"body": mock_body}) as mock_invoke:
+            result = mod._rerank_jobs_batch(batch, "AI Engineer RAG")
+            assert mock_invoke.called
+            assert result[0][1]["title"] == "Senior AI Engineer"
+            assert result[0][1]["rerank_score"] == 0.95
+            assert result[1][1]["title"] == "Junior Python Dev"
+
+    def test_rerank_jobs_batch_fallback_on_exception(self):
+        """On Bedrock exception, gracefully falls back to raw order."""
+        mod, _, _, _ = self._setup_infra()
+        mod.ENABLE_BEDROCK_RERANKER = True
+        batch = [
+            ("m1", {"title": "Job A", "description": "A"}),
+            ("m2", {"title": "Job B", "description": "B"}),
+        ]
+
+        with patch.object(mod.bedrock, "invoke_model", side_effect=Exception("ThrottlingException")):
+            result = mod._rerank_jobs_batch(batch, "AI Engineer")
+            assert result == batch

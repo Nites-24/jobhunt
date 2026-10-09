@@ -89,6 +89,8 @@ s3 = boto3.client("s3", region_name="us-east-1", config=aws_config)
 # 3. CONFIGURATION — All from environment variables with sane defaults
 # ---------------------------------------------------------------------------
 MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+RERANKER_MODEL_ID = os.environ.get("BEDROCK_RERANKER_MODEL_ID", "cohere.rerank-v3-5:0")
+ENABLE_BEDROCK_RERANKER = os.environ.get("ENABLE_BEDROCK_RERANKER", "false").strip().lower() == "true"
 TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "Jobsearch")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME", "job-search-pipeline-memory")
@@ -470,6 +472,75 @@ def evaluate_job(job: Dict[str, Any], context: str) -> Tuple[int, str, Dict[str,
         }
 
 
+def _rerank_jobs_batch(
+    records_with_jobs: list[tuple[str, Dict[str, Any]]],
+    query_context: str,
+    top_n: int = 15,
+) -> list[tuple[str, Dict[str, Any]]]:
+    """
+    Rerank a batch of (message_id, job) pairs against candidate background using
+    native Amazon Bedrock Cohere Rerank (cohere.rerank-v3-5:0).
+    Gracefully falls back to original order if disabled, unavailable, or throttled.
+    """
+    if not ENABLE_BEDROCK_RERANKER or len(records_with_jobs) <= 1:
+        return records_with_jobs
+
+    documents = []
+    valid_entries = []
+    for msg_id, job in records_with_jobs:
+        desc = (str(job.get("title") or "") + "\n" + str(job.get("description") or ""))[:1200].strip()
+        if desc:
+            documents.append(desc)
+            valid_entries.append((msg_id, job))
+
+    if not documents:
+        return records_with_jobs
+
+    try:
+        query_text = (
+            query_context.replace("<candidate_resume>", "").replace("</candidate_resume>", "")
+        )[:1000].strip()
+        if not query_text:
+            query_text = "AI Engineer machine learning RAG pipelines LLM systems PyTorch"
+
+        payload = {
+            "query": query_text,
+            "documents": documents,
+            "top_n": min(top_n, len(documents)),
+        }
+        resp = bedrock.invoke_model(
+            modelId=RERANKER_MODEL_ID,
+            contentType="application/json",
+            body=json.dumps(payload),
+        )
+        res_data = json.loads(resp["body"].read().decode("utf-8"))
+        results = res_data.get("results", [])
+
+        reranked = []
+        seen_indices = set()
+        for item in results:
+            idx = item.get("index")
+            if idx is not None and 0 <= idx < len(valid_entries):
+                msg_id, job = valid_entries[idx]
+                job["rerank_score"] = float(item.get("relevance_score", 0.0))
+                reranked.append((msg_id, job))
+                seen_indices.add(idx)
+
+        # Append remaining entries in original order
+        for idx, entry in enumerate(valid_entries):
+            if idx not in seen_indices:
+                reranked.append(entry)
+
+        logger.info(
+            "BEDROCK_RERANK_SUCCESS | total=%d | reranked_top_n=%d | model=%s",
+            len(records_with_jobs), len(results), RERANKER_MODEL_ID,
+        )
+        return reranked
+    except Exception as e:
+        logger.warning("BEDROCK_RERANK_FALLBACK | error=%s | continuing with raw order", str(e))
+        return records_with_jobs
+
+
 def _parse_posted_at(value: Any) -> Optional[datetime]:
     """Parse common job posting timestamp formats into UTC datetimes."""
     if value in (None, ""):
@@ -762,13 +833,23 @@ def lambda_handler(event, context):
     stats = {"evaluated": 0, "matched": 0, "rejected": 0, "failed": 0}
     source_query_results = []
 
+    parsed_entries: list[tuple[str, Dict[str, Any]]] = []
     for record in records:
-        message_id = record.get("messageId", "unknown")
+        msg_id = record.get("messageId", "unknown")
+        try:
+            parsed_entries.append((msg_id, json.loads(record.get("body", "{}"))))
+        except Exception as e:
+            logger.error("RECORD_PARSE_ERROR | msg_id=%s | error=%s", msg_id, str(e))
+            batch_item_failures.append({"itemIdentifier": msg_id})
+            stats["failed"] += 1
+
+    # Apply Bedrock cross-encoder reranker if enabled
+    ordered_entries = _rerank_jobs_batch(parsed_entries, profile_context)
+
+    for message_id, job in ordered_entries:
         job_id = "unknown"
-        job: Dict[str, Any] = {}
 
         try:
-            job = json.loads(record["body"])
             job_id = job.get("job_id", "unknown")
             source, query = _source_key(job)
 
