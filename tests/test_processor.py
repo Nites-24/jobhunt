@@ -541,3 +541,40 @@ class TestProcessor:
         with patch.object(mod.bedrock, "invoke_model", side_effect=Exception("ThrottlingException")):
             result = mod._rerank_jobs_batch(batch, "AI Engineer")
             assert result == batch
+
+    def test_load_recent_feedback_context_empty(self):
+        """When DynamoDB has no feedback items, returns empty string."""
+        mod, table, _, _ = self._setup_infra()
+        mod._cached_feedback_context = ""
+        mod._feedback_loaded_at = 0.0
+        res = mod._load_recent_feedback_context()
+        assert res == ""
+
+    def test_load_recent_feedback_context_injects_likes_and_dislikes(self):
+        """Builds in-context feedback blocks from DynamoDB rows."""
+        mod, table, _, _ = self._setup_infra()
+        mod._cached_feedback_context = ""
+        mod._feedback_loaded_at = 0.0
+
+        # Insert feedback items
+        table.put_item(Item={
+            "job_id": "fb-liked",
+            "title": "Staff AI Engineer",
+            "company": "Anthropic",
+            "user_feedback": "interested",
+            "user_feedback_at": 1700000010,
+            "user_feedback_reason": "love agent evals",
+        })
+        table.put_item(Item={
+            "job_id": "fb-disliked",
+            "title": "Lead MLOps",
+            "company": "LegacyCorp",
+            "user_feedback": "not_interested",
+            "user_feedback_at": 1700000020,
+            "user_feedback_reason": "requires 10 years experience",
+        })
+
+        res = mod._load_recent_feedback_context()
+        assert "<candidate_recent_preferences>" in res
+        assert "Anthropic" in res
+        assert "requires 10 years experience" in res

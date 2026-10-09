@@ -305,6 +305,79 @@ def _build_candidate_graph_context() -> str:
     return _cached_context
 
 
+_cached_feedback_context: str = ""
+_feedback_loaded_at: float = 0.0
+FEEDBACK_CACHE_TTL_SECONDS = 300.0
+
+
+def _load_recent_feedback_context() -> str:
+    """
+    Fetch recent Telegram feedback decisions from DynamoDB and format them into
+    in-context few-shot guidance for Bedrock. Cached across warm starts.
+    """
+    global _cached_feedback_context, _feedback_loaded_at
+    now = time.time()
+    if _cached_feedback_context and (now - _feedback_loaded_at) < FEEDBACK_CACHE_TTL_SECONDS:
+        return _cached_feedback_context
+
+    try:
+        from boto3.dynamodb.conditions import Attr
+        resp = table.scan(
+            FilterExpression=Attr("user_feedback").exists() & Attr("user_feedback_at").exists(),
+            Limit=30,
+        )
+        items = resp.get("Items", [])
+        if not items:
+            _cached_feedback_context = ""
+            _feedback_loaded_at = now
+            return ""
+
+        items.sort(key=lambda x: int(x.get("user_feedback_at") or 0), reverse=True)
+
+        likes = []
+        dislikes = []
+        for it in items:
+            fb = str(it.get("user_feedback") or "").strip().lower()
+            title = str(it.get("title") or "Unknown Role")
+            company = str(it.get("company") or "Unknown Company")
+            reason = str(it.get("user_feedback_reason") or "").strip()
+
+            if fb in ("interested", "applied") and len(likes) < 5:
+                entry = f"- {title} at {company}"
+                if reason:
+                    entry += f" (Note: {reason})"
+                likes.append(entry)
+            elif fb in ("not_interested", "meh") and len(dislikes) < 5:
+                entry = f"- {title} at {company}"
+                if reason:
+                    entry += f" (Reason rejected: '{reason}')"
+                dislikes.append(entry)
+
+        parts = ["<candidate_recent_preferences>"]
+        if likes:
+            parts.append("  <recently_liked_roles>")
+            parts.extend([f"    {l}" for l in likes])
+            parts.append("  </recently_liked_roles>")
+        if dislikes:
+            parts.append("  <recently_rejected_roles_to_penalize>")
+            parts.extend([f"    {d}" for d in dislikes])
+            parts.append("  </recently_rejected_roles_to_penalize>")
+        parts.append("</candidate_recent_preferences>")
+
+        if len(parts) > 2:
+            _cached_feedback_context = "\n".join(parts)
+        else:
+            _cached_feedback_context = ""
+
+        _feedback_loaded_at = now
+        logger.info("FEEDBACK_CONTEXT_BUILT | likes=%d | dislikes=%d", len(likes), len(dislikes))
+        return _cached_feedback_context
+
+    except Exception as e:
+        logger.warning("FEEDBACK_CONTEXT_ERROR | %s", str(e))
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # 5. BEDROCK SCORING — Deterministic via forced tool-calling
 # ---------------------------------------------------------------------------
@@ -325,7 +398,8 @@ SYSTEM_INSTRUCTION = (
     "Strong remote, hybrid, and onsite roles should score well. "
     "Do not hard-penalize a strong AI role that requires relocation or onsite attendance.\n"
     "- RELEVANCE: If the job is purely Frontend (React), Backend (Java/Kotlin), "
-    "or generic Full Stack without heavy AI/LLM/ML focus, the score MUST be below 50.\n\n"
+    "or generic Full Stack without heavy AI/LLM/ML focus, the score MUST be below 50.\n"
+    "- FEEDBACK MEMORY: If <candidate_recent_preferences> is provided, respect the candidate's explicit preferences. Heavily penalize roles that share traits with recently rejected roles (e.g. excessive years of experience, wrong tech stack, unwanted domains).\n\n"
     "Score 0-100. Be extremely strict. Only true, fresh, local AI/ML/LLM roles should score 85+.\n\n"
     "Use the submit_evaluation tool to return your score and a 1-sentence justification."
 )
@@ -385,8 +459,11 @@ def evaluate_job(job: Dict[str, Any], context: str) -> Tuple[int, str, Dict[str,
     work_mode_source = str(job.get('work_mode_source') or '').strip()
     work_mode_evidence = work_mode_source if work_mode_source else 'not stated in source'
 
+    feedback_context = _load_recent_feedback_context()
+    context_prefix = f"{context}\n\n{feedback_context}".strip() if feedback_context else context
+
     prompt_text = (
-        f"{context}\n\n"
+        f"{context_prefix}\n\n"
         f"<job_to_evaluate>\n"
         f"Title: {job.get('title', 'Unknown')}\n"
         f"Company: {job.get('company', 'Unknown')}\n"
