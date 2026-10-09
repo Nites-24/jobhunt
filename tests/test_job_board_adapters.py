@@ -56,7 +56,7 @@ class AdapterTests(unittest.TestCase):
                 "hostedUrl": "https://jobs.lever.co/acme/l-101",
                 "applyUrl": "https://jobs.lever.co/acme/l-101/apply",
                 "createdAt": 1727172000000,
-                "categories": {"location": "Wichita, KS", "commitment": "Full-time"},
+                "categories": {"location": "San Francisco, CA", "commitment": "Full-time"},
                 "workplaceType": "hybrid",
             }])
         if "ashby" in url:

@@ -1,7 +1,24 @@
-"""Reject unusable NEW rows and requeue valid NEW rows for scoring.
+"""
+Unscored Job Reconciler & Ingestion Requeue Engine (reconcile_new_jobs.py)
 
-Default mode is dry-run. Use --apply to update DynamoDB and send valid rows to
-job-filtered-queue.
+Role & Operational Context:
+  Audits all backlog rows in DynamoDB with status == 'NEW', applies deterministic
+  validity checks, transitions invalid rows to 'REJECTED', and requeues valid rows into
+  SQS `job-filtered-queue` for Bedrock Claude evaluation by `job-processor`.
+
+Filtering & Quality Invariants:
+  1. Source Validation: Discards rows from deprecated or unknown source providers.
+  2. Freshness: Flags and rejects jobs posted older than MAX_JOB_AGE_DAYS (default: 1 day).
+  3. AI Signal Verification: Rejects roles lacking core AI/ML keywords (e.g. generic sales, devops).
+  4. URL Grounding: Discards jobs with placeholder or invalid URLs.
+
+Operational Safety:
+  - Default mode is dry-run. Requires `--apply` to update DynamoDB and SQS.
+  - SQS payloads match the expected schema for `job-processor`.
+
+Usage:
+  python tools/ops/reconcile_new_jobs.py          # Dry-run audit of NEW jobs
+  python tools/ops/reconcile_new_jobs.py --apply  # Reject invalid & requeue valid jobs
 """
 
 import argparse
@@ -26,7 +43,7 @@ FILTERED_QUEUE_NAME = "job-filtered-queue"
 MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "1"))
 ALLOWED_SOURCES = {
     source.strip().lower()
-    for source in os.environ.get("LIST_ALLOWED_SOURCES", "hackernews,hn,jsearch,google_cse,cse,adzuna,greenhouse,lever,ashby").split(",")
+    for source in os.environ.get("LIST_ALLOWED_SOURCES", "hackernews,hn,jsearch,google_cse,cse,greenhouse,lever,ashby").split(",")
     if source.strip()
 }
 

@@ -1,4 +1,25 @@
-"""Apply production Lambda environment defaults for the Telegram job pipeline."""
+"""
+Production Lambda Environment Synchronizer (set_production_config.py)
+
+Role & Operational Context:
+  Synchronizes target production environment variables across all active AWS Lambda functions:
+  - `job-ingestor`: Sets HN_MAX_JOB_AGE_DAYS=3.
+  - `job-processor`: Sets SCORE_THRESHOLD=80, MAX_JOB_AGE_DAYS=14, STALE_SCORE_CAP=55,
+    MISSING_DATE_SCORE_CAP=70, REMOTE_SCORE_CAP=80, LOW_AI_SIGNAL_SCORE_CAP=50,
+    MISSING_SOURCE_SCORE_CAP=40.
+  - `job-router`: Sets SCORE_THRESHOLD=80, MAX_JOB_AGE_DAYS=1, ENABLE_PRACTICE_MODE=false,
+    ALLOW_TELEGRAM_EMAIL_SEND=true.
+  - `job-sender`: Sets ALLOW_REAL_EMAIL_SEND=true.
+
+Operational Safety:
+  - Default mode is dry-run (reports planned diffs without modifying AWS).
+  - Explicit `--apply` flag required to update AWS Lambda function configurations.
+  - Uses `function_updated` waiters to ensure serial, orderly deployment.
+
+Usage:
+  python tools/ops/set_production_config.py          # Dry-run inspection
+  python tools/ops/set_production_config.py --apply  # Apply changes to AWS
+"""
 
 import argparse
 import os
@@ -9,8 +30,7 @@ import boto3
 REGION = "us-east-1"
 TARGET_ENV = {
     "job-ingestor": {
-        "ADZUNA_QUERIES": "AI Engineer;;Applied AI Engineer;;LLM Engineer;;RAG Engineer;;Generative AI Engineer;;Agent Engineer;;AI Platform Engineer;;ML Systems Engineer;;Inference Engineer",
-        "ADZUNA_MAX_DAYS_OLD": "7",
+        "HN_MAX_JOB_AGE_DAYS": "3",
     },
     "job-processor": {
         "SCORE_THRESHOLD": "80",

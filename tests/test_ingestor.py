@@ -185,51 +185,6 @@ class TestIngestor:
                 os.environ["GOOGLE_CSE_QUERIES"] = previous
             importlib.reload(mod)
 
-    def test_adzuna_blank_env_uses_targeted_default_queries(self):
-        previous = os.environ.get("ADZUNA_QUERIES")
-        os.environ["ADZUNA_QUERIES"] = ""
-
-        import job_ingestor.lambda_function as mod
-        mod = importlib.reload(mod)
-
-        try:
-            assert mod.ADZUNA_QUERIES == [
-                "AI Engineer",
-                "Applied AI Engineer",
-                "LLM Engineer",
-                "RAG Engineer",
-                "Generative AI Engineer",
-                "Agent Engineer",
-                "AI Platform Engineer",
-                "ML Systems Engineer",
-                "Inference Engineer",
-            ]
-        finally:
-            if previous is None:
-                os.environ.pop("ADZUNA_QUERIES", None)
-            else:
-                os.environ["ADZUNA_QUERIES"] = previous
-            importlib.reload(mod)
-
-    def test_adzuna_normalization_preserves_source_evidence(self):
-        mod, _, _ = self._setup_infra()
-
-        job = mod._normalize_adzuna_job({
-            "id": "adz-1",
-            "title": "LLM Engineer",
-            "company": {"display_name": "Adzuna AI Co"},
-            "location": {"display_name": "San Francisco, CA"},
-            "description": "Work on RAG and agent systems.",
-            "redirect_url": "https://www.adzuna.com/details/adz-1",
-            "created": "2026-05-12T12:00:00Z",
-            "contract_time": "full_time",
-        })
-
-        assert job["source"] == "adzuna"
-        assert job["source_provider"] == "Adzuna Jobs API"
-        assert job["url"] == "https://www.adzuna.com/details/adz-1"
-        assert job["title"] == "LLM Engineer"
-        assert job["work_mode"] == ""
 
     @patch("urllib.request.urlopen")
     def test_empty_when_no_thread_found(self, mock_urlopen):
@@ -247,9 +202,9 @@ class TestIngestor:
     def test_email_extraction_skips_generic_addresses(self):
         mod, _, _ = self._setup_infra()
 
-        desc = "Apply at hr@company.com or noreply@test.com. Real contact: teja@deepmind.com"
+        desc = "Apply at hr@company.com or noreply@test.com. Real contact: alex@deepmind.com"
         email = mod._extract_email_from_description(desc)
-        assert email == "teja@deepmind.com"
+        assert email == "alex@deepmind.com"
 
     def test_hn_parser_extracts_obfuscated_email_and_author_contact(self):
         mod, _, _ = self._setup_infra()
@@ -417,7 +372,7 @@ class TestIngestor:
                 "content": "Build RAG and LLM systems with Python.",
                 "updated_at": "2026-09-24T10:00:00Z",
                 "absolute_url": "https://boards.greenhouse.io/acme/jobs/101",
-                "location": {"name": "Wichita, KS"},
+                "location": {"name": "San Francisco, CA"},
             },
             {
                 "id": 102,

@@ -1,6 +1,26 @@
-"""Create production safety rails: SQS DLQs and CloudWatch alarms.
+"""
+Production Safety Rails & Telemetry Provisioner (setup_production_safety.py)
 
-Default mode is dry-run. Use --apply to mutate AWS.
+Role & Operational Context:
+  Automates the provisioning of production-grade failure safety mechanisms across
+  the JobHunt AWS cloud infrastructure:
+  1. Dead-Letter Queues (DLQs):
+     - Configures RedrivePolicy (`maxReceiveCount: 5`) on `job-raw-queue` and `job-filtered-queue`.
+     - Automatically routes poisoned/unparseable messages to `job-raw-queue-dlq` and `job-filtered-queue-dlq`.
+  2. CloudWatch Alarms:
+     - Configures Lambda `Errors` and `Throttles` alarms across all 5 functions (`job-ingestor`,
+       `job-deduplicator`, `job-processor`, `job-router`, `job-sender`).
+     - Configures SQS high-depth redline alarms (e.g. >100 messages waiting).
+  3. SNS Alert Integration:
+     - Routes alarm triggers to `jobsearch-approvals` SNS topic for candidate alerting.
+
+Safety & Invariants:
+  - Default mode is dry-run. Requires `--apply` to provision resources.
+  - Safe to run repeatedly; idempotently creates or updates alarms and queue attributes.
+
+Usage:
+  python tools/ops/setup_production_safety.py          # Dry-run audit
+  python tools/ops/setup_production_safety.py --apply  # Provision DLQs & CloudWatch alarms
 """
 
 import argparse

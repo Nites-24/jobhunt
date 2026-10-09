@@ -1,3 +1,65 @@
+"""
+Job Ingestor Lambda — Multi-Source Ingestion & Discovery Engine
+
+=============================================================================
+PIPELINE ROLE & ARCHITECTURE
+=============================================================================
+Trigger:    Scheduled CloudWatch Event (cron) OR Telegram 'search jobs' invocation
+Output:     Normalized job records sent in batches to SQS (job-raw-queue)
+Downstream: job-deduplicator consumes job-raw-queue for deduplication & DynamoDB lookup
+
+=============================================================================
+SUPPORTED INGESTION SOURCES
+=============================================================================
+1. Hacker News ("Who is Hiring"):
+   - Searches Algolia HN Search API for the latest active monthly hiring thread.
+   - Parses top-level comments, extracts obfuscated recruiter emails (e.g., 'careers [at] co.ai').
+   - Fetches outbound link snippets for grounding while enforcing SSRF protection.
+   - Enforces a strict 3-day freshness cutoff (HN_MAX_JOB_AGE_DAYS=3).
+
+2. Direct ATS Job Boards:
+   - Greenhouse: Queries public boards for configured slugs (Anthropic, OpenAI, Scale AI, etc.).
+   - Lever: Queries public postings for configured sites (Mistral, Writer, etc.).
+   - Ashby: Queries public job boards for configured slugs (Perplexity, Cursor, Modal, etc.).
+
+3. Google Custom Search Engine (CSE):
+   - Searches for indexed AI Engineer roles across greenhouse.io, lever.co, ashbyhq.com.
+   - Resolves API credentials securely from AWS Secrets Manager.
+
+4. JSearch (RapidAPI):
+   - Aggregates multi-board search results when configured.
+
+=============================================================================
+SECURITY & OPERATIONAL INVARIANTS
+=============================================================================
+- SSRF Hardening: All outbound HTTP requests enforce private IP blocking
+  (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.169.254 IMDS,
+  and 100.64.0.0/10 Carrier-Grade NAT).
+- Redirect Security: SafeRedirectHandler re-evaluates destination IP on every hop (max 3).
+- Memory Safety: Outbound link responses are strictly capped at HN_MAX_LINK_BYTES (24 KB).
+- Bounded Execution: Every HTTP request enforces a strict socket timeout (max 15s).
+
+=============================================================================
+ENVIRONMENT VARIABLES & SECRETS
+=============================================================================
+- RAW_QUEUE_URL:               Target SQS URL (e.g., https://sqs.../job-raw-queue)
+- INGESTION_SOURCES:           Comma-separated active sources (default: hackernews,greenhouse,lever,ashby)
+- HN_MAX_JOB_AGE_DAYS:         Freshness window for HN postings (default: 3)
+- GOOGLE_CSE_SECRET_NAME:      Secrets Manager secret ID for Google CSE credentials
+- JSEARCH_SECRET_NAME:         Secrets Manager secret ID for JSearch API key
+- ATS_TIMEOUT_SECONDS:         Socket timeout for ATS board queries (default: 15)
+- ATS_MAX_JOBS_PER_BOARD:      Maximum jobs ingested per ATS board (default: 100)
+
+=============================================================================
+DEVELOPER & MAINTENANCE GUIDE
+=============================================================================
+- Adding a new ATS company: Add to DEFAULT_GREENHOUSE_BOARDS, DEFAULT_LEVER_SITES, or
+  DEFAULT_ASHBY_BOARDS, or override via GREENHOUSE_BOARDS / LEVER_SITES / ASHBY_BOARDS env vars.
+- Adding a new source: Implement an ingestion function returning normalized dicts with keys:
+  job_id, title, company, location, url, apply_url, description, source, posted_at.
+- Testing: All network requests and SQS calls are mocked locally via moto in tests/test_ingestor.py.
+"""
+
 import json
 import os
 import ipaddress
@@ -21,18 +83,6 @@ DEFAULT_GOOGLE_CSE_QUERY = (
     '(site:greenhouse.io OR site:lever.co OR site:ashbyhq.com OR site:workdayjobs.com OR site:jobs.ashbyhq.com)'
 )
 HN_SOURCE_QUERY = "hn_who_is_hiring"
-DEFAULT_ADZUNA_QUERIES = [
-    "AI Engineer",
-    "Applied AI Engineer",
-    "LLM Engineer",
-    "RAG Engineer",
-    "Generative AI Engineer",
-    "Agent Engineer",
-    "AI Platform Engineer",
-    "ML Systems Engineer",
-    "Inference Engineer",
-]
-
 
 def _load_google_cse_queries() -> list[str]:
     raw = os.environ.get("GOOGLE_CSE_QUERIES", "")
@@ -41,14 +91,33 @@ def _load_google_cse_queries() -> list[str]:
     return [q.strip() for q in raw.split(";;") if q.strip()]
 
 
-def _load_adzuna_queries() -> list[str]:
-    raw = os.environ.get("ADZUNA_QUERIES", "")
-    if not raw.strip():
-        return DEFAULT_ADZUNA_QUERIES.copy()
-    return [q.strip() for q in raw.split(";;") if q.strip()]
+DEFAULT_GREENHOUSE_BOARDS = [
+    {"slug": "anthropic", "company": "Anthropic"},
+    {"slug": "openai", "company": "OpenAI"},
+    {"slug": "gleanwork", "company": "Glean"},
+    {"slug": "scaleai", "company": "Scale AI"},
+    {"slug": "fireworksai", "company": "Fireworks AI"},
+    {"slug": "cohere", "company": "Cohere"},
+]
+
+DEFAULT_LEVER_SITES = [
+    {"slug": "mistral", "company": "Mistral AI"},
+    {"slug": "writer", "company": "Writer"},
+]
+
+DEFAULT_ASHBY_BOARDS = [
+    {"slug": "perplexity", "company": "Perplexity AI"},
+    {"slug": "anysphere", "company": "Cursor"},
+    {"slug": "modal", "company": "Modal Labs"},
+    {"slug": "together", "company": "Together AI"},
+    {"slug": "langchain", "company": "LangChain"},
+    {"slug": "replicate", "company": "Replicate"},
+    {"slug": "cognition", "company": "Cognition AI"},
+    {"slug": "qdrant", "company": "Qdrant"},
+]
 
 
-def _load_board_registry(env_name: str) -> list[dict[str, str]]:
+def _load_board_registry(env_name: str, defaults: list[dict[str, str]] | None = None) -> list[dict[str, str]]:
     """Parse company board registries from JSON or pipe-delimited text.
 
     JSON form: [{"slug": "acme", "company": "Acme"}]
@@ -56,7 +125,7 @@ def _load_board_registry(env_name: str) -> list[dict[str, str]]:
     """
     raw = os.environ.get(env_name, "").strip()
     if not raw:
-        return []
+        return [d.copy() for d in (defaults or [])]
     try:
         values = json.loads(raw) if raw.startswith("[") else raw.split(",")
     except json.JSONDecodeError as exc:
@@ -108,12 +177,7 @@ GOOGLE_CSE_SECRET_NAME = os.environ.get("GOOGLE_CSE_SECRET_NAME", "jobsearch/goo
 GOOGLE_CSE_ENABLED = os.environ.get("GOOGLE_CSE_ENABLED", "true").strip().lower() == "true"
 GOOGLE_CSE_MAX_RESULTS = int(os.environ.get("GOOGLE_CSE_MAX_RESULTS", "10"))
 GOOGLE_CSE_QUERIES = _load_google_cse_queries()
-ADZUNA_SECRET_NAME = os.environ.get("ADZUNA_SECRET_NAME", "adzuna/jobsearch")
-ADZUNA_ENABLED = os.environ.get("ADZUNA_ENABLED", "true").strip().lower() == "true"
-ADZUNA_MAX_RESULTS = int(os.environ.get("ADZUNA_MAX_RESULTS", "20"))
-ADZUNA_QUERIES = _load_adzuna_queries()
-ADZUNA_WHERE = os.environ.get("ADZUNA_WHERE", "").strip()
-ADZUNA_MAX_DAYS_OLD = int(os.environ.get("ADZUNA_MAX_DAYS_OLD", "14"))
+
 HN_MAX_COMMENTS = int(os.environ.get("HN_MAX_COMMENTS", "800"))
 HN_LINK_ENRICHMENT_ENABLED = os.environ.get("HN_LINK_ENRICHMENT_ENABLED", "true").strip().lower() == "true"
 HN_MAX_LINK_ENRICHMENTS = int(os.environ.get("HN_MAX_LINK_ENRICHMENTS", "20"))
@@ -123,11 +187,11 @@ HN_MAX_LINK_BYTES = int(os.environ.get("HN_MAX_LINK_BYTES", "120000"))
 ATS_TIMEOUT_SECONDS = int(os.environ.get("ATS_TIMEOUT_SECONDS", "15"))
 ATS_MAX_JOBS_PER_BOARD = int(os.environ.get("ATS_MAX_JOBS_PER_BOARD", "100"))
 GREENHOUSE_ENABLED = os.environ.get("GREENHOUSE_ENABLED", "true").strip().lower() == "true"
-GREENHOUSE_BOARDS = _load_board_registry("GREENHOUSE_BOARDS")
+GREENHOUSE_BOARDS = _load_board_registry("GREENHOUSE_BOARDS", DEFAULT_GREENHOUSE_BOARDS)
 LEVER_ENABLED = os.environ.get("LEVER_ENABLED", "true").strip().lower() == "true"
-LEVER_SITES = _load_board_registry("LEVER_SITES")
+LEVER_SITES = _load_board_registry("LEVER_SITES", DEFAULT_LEVER_SITES)
 ASHBY_ENABLED = os.environ.get("ASHBY_ENABLED", "true").strip().lower() == "true"
-ASHBY_BOARDS = _load_board_registry("ASHBY_BOARDS")
+ASHBY_BOARDS = _load_board_registry("ASHBY_BOARDS", DEFAULT_ASHBY_BOARDS)
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 URL_REGEX = re.compile(r'https?://[^\s"<>]+')
@@ -176,7 +240,7 @@ def _build_signal_test_job() -> dict:
         "job_id": f"signal_test_{now}",
         "title": "AI Engineer Notification Test",
         "company": "Signal Test AI",
-        "location": "Wichita, Kansas",
+        "location": "San Francisco, CA",
         "description": (
             "Synthetic end-to-end notification test for the live pipeline. "
             "This AI Engineer role requires Python, AWS, LLM evaluation, RAG, "
@@ -1158,102 +1222,7 @@ def fetch_google_cse_jobs() -> list:
     return jobs
 
 
-def _get_adzuna_credentials() -> tuple[str, str]:
-    payload = _get_secret_payload(ADZUNA_SECRET_NAME)
-    app_id = payload.get("app_id") or payload.get("ADZUNA_APP_ID") or payload.get("APP_ID") or ""
-    app_key = payload.get("app_key") or payload.get("ADZUNA_APP_KEY") or payload.get("APP_KEY") or payload.get("api_key") or ""
-    return app_id, app_key
 
-
-def _normalize_adzuna_job(raw: dict) -> dict | None:
-    title = (raw.get("title") or "").strip()
-    company = (raw.get("company") or {}).get("display_name", "").strip()
-    source_url = (raw.get("redirect_url") or "").strip()
-    if not title or not company or not source_url:
-        return None
-
-    location = (raw.get("location") or {}).get("display_name", "") or "Not specified"
-    work_mode = "remote" if "remote" in f"{title} {location} {raw.get('description', '')}".lower() else ""
-    work_mode_source = "location" if work_mode and "remote" in location.lower() else ("description" if work_mode else "")
-    if not work_mode:
-        work_mode, work_mode_source = _extract_work_mode(
-            ("location", location),
-            ("description", raw.get("description") or ""),
-        )
-    salary_min = raw.get("salary_min")
-    salary_max = raw.get("salary_max")
-    salary = ""
-    if salary_min or salary_max:
-        salary = f"{salary_min or '?'} - {salary_max or '?'}"
-
-    return {
-        "job_id": f"adzuna_{raw.get('id') or uuid.uuid5(uuid.NAMESPACE_URL, source_url).hex}",
-        "title": title[:120],
-        "company": company[:120],
-        "location": location[:120],
-        "description": raw.get("description") or "",
-        "url": source_url,
-        "apply_url": source_url,
-        "source": "adzuna",
-        "source_provider": "Adzuna Jobs API",
-        "source_origin": raw.get("adref") or "Adzuna",
-        "salary": salary,
-        "is_remote": "remote" in f"{title} {location} {raw.get('description', '')}".lower(),
-        "work_mode": work_mode,
-        "work_mode_source": work_mode_source,
-        "employment_type": raw.get("contract_time") or "",
-        "posted_at": raw.get("created") or "",
-        "employer_website": "",
-        "recruiter_email": "",
-        "recruiter_name": "",
-    }
-
-
-def fetch_adzuna_jobs() -> list:
-    if not ADZUNA_ENABLED:
-        logger.info("ADZUNA_DISABLED")
-        return []
-
-    app_id, app_key = _get_adzuna_credentials()
-    if not app_id or not app_key:
-        logger.info("ADZUNA_SKIP: missing app_id or app_key")
-        return []
-
-    jobs = []
-    per_query = max(1, min(50, ADZUNA_MAX_RESULTS))
-    for query in ADZUNA_QUERIES:
-        query_params = {
-            "app_id": app_id,
-            "app_key": app_key,
-            "results_per_page": per_query,
-            "what": query,
-            "max_days_old": ADZUNA_MAX_DAYS_OLD,
-            "content-type": "application/json",
-        }
-        if ADZUNA_WHERE:
-            query_params["where"] = ADZUNA_WHERE
-        params = urllib.parse.urlencode(query_params)
-        url = f"https://api.adzuna.com/v1/api/jobs/us/search/1?{params}"
-        try:
-            with urllib.request.urlopen(urllib.request.Request(url), timeout=15) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            accepted_before = len(jobs)
-            for raw in data.get("results", [])[:per_query]:
-                job = _normalize_adzuna_job(raw)
-                if job and re.search(r"\b(ai|ml|llm|rag|machine learning|nlp|agent)\b", f"{job['title']} {job['description']}", re.IGNORECASE):
-                    job["source_search_query"] = query
-                    jobs.append(job)
-            logger.info(
-                "ADZUNA_QUERY | query=%s | raw=%d | accepted=%d | total=%d",
-                query, len(data.get("results", [])), len(jobs) - accepted_before, len(jobs),
-            )
-        except urllib.error.HTTPError as e:
-            logger.warning("ADZUNA_QUERY_ERROR | query=%s | status=%s | error=%s", query, e.code, str(e))
-            _record_source_error("adzuna", f"HTTP {e.code} for query={query}")
-        except Exception as e:
-            logger.warning("ADZUNA_QUERY_ERROR | query=%s | error=%s", query, str(e))
-            _record_source_error("adzuna", f"{type(e).__name__}: {e}")
-    return jobs
 
 
 def _dedupe_batch(jobs: list[dict]) -> list[dict]:
@@ -1304,13 +1273,12 @@ def lambda_handler(event, context):
             "source_errors": [],
         }
     trigger_source = (event.get("source") if isinstance(event, dict) else "") or "direct"
-    logger.info("INGESTOR_START | trigger=%s | Using HN + Greenhouse + Lever + Ashby + Google CSE + Adzuna + JSearch", trigger_source)
+    logger.info("INGESTOR_START | trigger=%s | Using HN + Greenhouse + Lever + Ashby + Google CSE + JSearch", trigger_source)
     hn_jobs = fetch_hacker_news_jobs()
     greenhouse_jobs = fetch_greenhouse_jobs()
     lever_jobs = fetch_lever_jobs()
     ashby_jobs = fetch_ashby_jobs()
     google_cse_jobs = fetch_google_cse_jobs()
-    adzuna_jobs = fetch_adzuna_jobs()
     jsearch_jobs = fetch_jsearch_jobs()
     all_jobs = _dedupe_batch(
         hn_jobs
@@ -1318,7 +1286,6 @@ def lambda_handler(event, context):
         + lever_jobs
         + ashby_jobs
         + google_cse_jobs
-        + adzuna_jobs
         + jsearch_jobs
     )
     logger.info("INGESTOR_YIELD_BY_SOURCE_QUERY | %s", json.dumps(_source_query_summary(all_jobs)))
@@ -1338,16 +1305,15 @@ def lambda_handler(event, context):
                 "lever": len(lever_jobs),
                 "ashby": len(ashby_jobs),
                 "google_cse": len(google_cse_jobs),
-                "adzuna": len(adzuna_jobs),
                 "jsearch": len(jsearch_jobs),
             },
         }
 
     sent_count = _send_to_sqs(all_jobs)
     logger.info(
-        "INGESTOR_COMPLETE | trigger=%s | hn=%d | greenhouse=%d | lever=%d | ashby=%d | google_cse=%d | adzuna=%d | jsearch=%d | unique=%d | queued=%d",
+        "INGESTOR_COMPLETE | trigger=%s | hn=%d | greenhouse=%d | lever=%d | ashby=%d | google_cse=%d | jsearch=%d | unique=%d | queued=%d",
         trigger_source, len(hn_jobs), len(greenhouse_jobs), len(lever_jobs), len(ashby_jobs),
-        len(google_cse_jobs), len(adzuna_jobs), len(jsearch_jobs), len(all_jobs), sent_count,
+        len(google_cse_jobs), len(jsearch_jobs), len(all_jobs), sent_count,
     )
     return {
         "status": "success",
@@ -1361,7 +1327,6 @@ def lambda_handler(event, context):
             "lever": len(lever_jobs),
             "ashby": len(ashby_jobs),
             "google_cse": len(google_cse_jobs),
-            "adzuna": len(adzuna_jobs),
             "jsearch": len(jsearch_jobs),
         },
     }

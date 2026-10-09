@@ -1,4 +1,21 @@
-"""Diagnose live source APIs without printing secret values."""
+"""
+Live Source API Diagnostics (diagnose_live_sources.py)
+
+Role & Operational Context:
+  Tests real search queries against third-party search APIs (Google Custom Search JSON API)
+  using credentials fetched from AWS Secrets Manager (`jobsearch/google_cse`), without printing
+  secret values or tokens to the console.
+
+Key Checks:
+  1. Secret Schema Validation: Confirms presence of expected keys in Secrets Manager.
+  2. Google CSE Connectivity: Executes test searches against `customsearch.googleapis.com`
+     with ATS domain filters (`site:greenhouse.io`, `site:lever.co`, `site:ashbyhq.com`).
+  3. API Quota & Status: Inspects HTTP responses and diagnostic error codes (e.g. 403 API not enabled,
+     429 rate limit exceeded) to pinpoint API degradation before triggering ingestion.
+
+Usage:
+  python tools/ops/diagnose_live_sources.py
+"""
 
 import json
 import os
@@ -11,7 +28,6 @@ import boto3
 
 REGION = "us-east-1"
 GOOGLE_SECRET = "jobsearch/google_cse"
-ADZUNA_SECRET = "adzuna/jobsearch"
 GOOGLE_QUERIES = [
     '("AI Engineer" OR "LLM Engineer" OR "RAG Engineer") ("San Francisco" OR "Bay Area") '
     "(site:greenhouse.io OR site:lever.co OR site:ashbyhq.com OR site:workdayjobs.com OR site:jobs.ashbyhq.com)",
@@ -73,12 +89,10 @@ def main() -> int:
     secrets = session.client("secretsmanager")
 
     google = _secret_payload(secrets, GOOGLE_SECRET)
-    adzuna = _secret_payload(secrets, ADZUNA_SECRET)
 
     print("Secret shapes")
     print("-------------")
     print(f"{GOOGLE_SECRET}: keys={sorted(google.keys())}")
-    print(f"{ADZUNA_SECRET}: keys={sorted(adzuna.keys())}")
     print()
 
     api_key, cx = _google_credentials(google)
