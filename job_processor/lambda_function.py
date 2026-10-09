@@ -356,11 +356,11 @@ def _load_recent_feedback_context() -> str:
         parts = ["<candidate_recent_preferences>"]
         if likes:
             parts.append("  <recently_liked_roles>")
-            parts.extend([f"    {l}" for l in likes])
+            parts.extend([f"    {like_role}" for like_role in likes])
             parts.append("  </recently_liked_roles>")
         if dislikes:
             parts.append("  <recently_rejected_roles_to_penalize>")
-            parts.extend([f"    {d}" for d in dislikes])
+            parts.extend([f"    {dislike_role}" for dislike_role in dislikes])
             parts.append("  </recently_rejected_roles_to_penalize>")
         parts.append("</candidate_recent_preferences>")
 

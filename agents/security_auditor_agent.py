@@ -48,13 +48,17 @@ def get_identity_patterns() -> List[Tuple[str, str]]:
         patterns.append((re.escape(sender_email.strip()), f"Candidate email '{sender_email}'"))
 
     candidate_loc = os.environ.get("CANDIDATE_LOCATION")
-    if candidate_loc and candidate_loc.strip() and candidate_loc.lower() not in ("open to remote", "remote", "any"):
-        patterns.append((re.escape(candidate_loc.strip()), f"Candidate location '{candidate_loc}'"))
+    if candidate_loc and candidate_loc.strip():
+        loc_lower = candidate_loc.strip().lower()
+        # Only flag if it is a specific physical city/state/address, not generic work-mode preferences
+        is_generic = any(term in loc_lower for term in ("remote", "hybrid", "onsite", "any", "open to", "relocate", "all locations", "open-to"))
+        if not is_generic:
+            patterns.append((re.escape(candidate_loc.strip()), f"Candidate location '{candidate_loc}'"))
 
     linkedin = os.environ.get("CANDIDATE_LINKEDIN")
     if linkedin and "linkedin.com/in/" in linkedin and "example" not in linkedin:
         handle = linkedin.rstrip("/").split("/")[-1]
-        if handle and len(handle) > 3:
+        if handle and len(handle) > 3 and handle.lower() not in ("candidate", "your-profile", "username"):
             patterns.append((re.escape(handle), f"Candidate LinkedIn handle '{handle}'"))
 
     return patterns
