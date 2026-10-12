@@ -17,8 +17,9 @@ Primary Functions:
   - `get_canonical_job_url(job)`: Extracts the first valid URL from `url` or `apply_url` fields.
 """
 
-from typing import Any
+import ipaddress
 import urllib.parse
+from typing import Any
 
 BLOCKED_DOMAINS = {
     "localhost",
@@ -36,6 +37,8 @@ BLOCKED_SUFFIXES = (
     ".home",
     ".corp",
 )
+
+CARRIER_GRADE_NAT = ipaddress.ip_network("100.64.0.0/10")
 
 INVALID_LITERALS = {
     "unavailable",
@@ -80,10 +83,29 @@ def is_valid_canonical_url(url: Any) -> bool:
     if not hostname:
         return False
 
-    if hostname in BLOCKED_DOMAINS or hostname.endswith(BLOCKED_SUFFIXES):
+    # Check for IPv6 bracketed address
+    clean_host = hostname.strip("[]")
+
+    # Reject private, link-local, loopback, or reserved IP address literals
+    try:
+        ip = ipaddress.ip_address(clean_host)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+            or ip in CARRIER_GRADE_NAT
+        ):
+            return False
+    except ValueError:
+        pass  # Standard domain name
+
+    if clean_host in BLOCKED_DOMAINS or clean_host.endswith(BLOCKED_SUFFIXES):
         return False
 
-    if "." not in hostname:
+    if "." not in clean_host and ":" not in clean_host:
         return False
 
     return True

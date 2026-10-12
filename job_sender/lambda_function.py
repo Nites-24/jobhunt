@@ -73,6 +73,7 @@ import os
 import logging
 import smtplib
 import time
+import hashlib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
@@ -92,12 +93,13 @@ logger.setLevel(logging.INFO)
 # ---------------------------------------------------------------------------
 # 2. AWS CLIENTS — Global for warm-start reuse
 # ---------------------------------------------------------------------------
+AWS_REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 aws_config = Config(retries={"max_attempts": 3, "mode": "standard"})
 
-s3_client = boto3.client("s3", config=aws_config)
-secrets_client = boto3.client("secretsmanager", config=aws_config)
-bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1", config=aws_config)
-dynamodb = boto3.resource("dynamodb", config=aws_config)
+s3_client = boto3.client("s3", region_name=AWS_REGION, config=aws_config)
+secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION, config=aws_config)
+bedrock_client = boto3.client("bedrock-runtime", region_name=AWS_REGION, config=aws_config)
+dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION, config=aws_config)
 
 # ---------------------------------------------------------------------------
 # 3. CONFIGURATION
@@ -109,6 +111,7 @@ BUCKET = os.environ.get("RESUME_BUCKET", "job-search-pipeline-memory")
 RESUME_KEY = os.environ.get("RESUME_KEY", "data/resume/resume.pdf")
 MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
 ALLOW_REAL_EMAIL_SEND = os.environ.get("ALLOW_REAL_EMAIL_SEND", "false").strip().lower() == "true"
+REQUIRE_DRAFT_APPROVAL = os.environ.get("REQUIRE_DRAFT_APPROVAL", "false").strip().lower() == "true"
 BEDROCK_THROTTLE_RETRIES = int(os.environ.get("BEDROCK_THROTTLE_RETRIES", "2"))
 CANDIDATE_NAME = os.environ.get("CANDIDATE_NAME", "AI Candidate").strip() or "AI Candidate"
 TARGET_ROLE = os.environ.get("TARGET_ROLE", "AI Engineer").strip() or "AI Engineer"
@@ -869,17 +872,27 @@ def lambda_handler(event, context):
     for msg_id, job in jobs_to_process:
         job_id = job.get("job_id", "unknown")
 
-        # Idempotency check — skip if already sent
+        # Idempotency and ambiguous delivery state checks
+        current = {}
         try:
-            current = table.get_item(Key={"job_id": job_id}, ProjectionExpression="#s",
-                                     ExpressionAttributeNames={"#s": "status"}).get("Item", {})
-            if current.get("status") == "SENT":
+            current = table.get_item(Key={"job_id": job_id}).get("Item", {})
+            curr_status = current.get("status")
+            outreach_status = current.get("outreach_status")
+            if curr_status == "SENT" or outreach_status == "SENT":
                 logger.info("IDEMPOTENCY_SKIP | job_id=%s | already SENT", job_id)
                 continue
+            if outreach_status == "DELIVERY_AMBIGUOUS" or curr_status == "MANUAL_RECONCILIATION_REQUIRED":
+                logger.warning("AMBIGUOUS_DELIVERY_SKIP | job_id=%s | requires manual reconciliation", job_id)
+                continue
+            if outreach_status == "SEND_IN_PROGRESS":
+                last_attempt = int(current.get("send_attempt_at") or 0)
+                if time.time() - last_attempt < 900:  # 15 minutes lease
+                    logger.warning("SEND_IN_PROGRESS_COLLISION | job_id=%s | attempt in flight", job_id)
+                    continue
         except Exception:
             pass  # Non-fatal — proceed with send
 
-        # Generate email
+        # Generate email or consume approved draft
         try:
             recipient = (job.get("recruiter_email") or "").strip()
 
@@ -893,7 +906,65 @@ def lambda_handler(event, context):
                 no_recruiter_count += 1
                 continue
 
-            email_data = _generate_email(job)
+            approved_hash = job.get("approved_hash") or (event.get("approved_hash") if isinstance(event, dict) else None)
+            approved_subject = job.get("approved_subject") or (event.get("approved_subject") if isinstance(event, dict) else None)
+            approved_body = job.get("approved_body") or (event.get("approved_body") if isinstance(event, dict) else None)
+
+            if approved_hash or REQUIRE_DRAFT_APPROVAL:
+                if not approved_hash or not approved_body:
+                    logger.warning("MISSING_DRAFT_APPROVAL | job_id=%s", job_id)
+                    _mark_status(job_id, "FAILED", "Sending requires approved draft hash and content")
+                    if msg_id != "direct":
+                        batch_item_failures.append({"itemIdentifier": msg_id})
+                    continue
+
+                expected_hash = hashlib.sha256(
+                    f"{job_id}:{recipient}:{approved_subject}:{approved_body}".encode("utf-8")
+                ).hexdigest()
+                if approved_hash != expected_hash:
+                    logger.warning("DRAFT_HASH_MISMATCH | job_id=%s | expected=%s | got=%s", job_id, expected_hash, approved_hash)
+                    _mark_status(job_id, "FAILED", "Draft approval hash mismatch")
+                    if msg_id != "direct":
+                        batch_item_failures.append({"itemIdentifier": msg_id})
+                    continue
+
+                approval_expires_at = int(current.get("approval_expires_at") or job.get("approval_expires_at") or 0)
+                if approval_expires_at and time.time() > approval_expires_at:
+                    logger.warning("DRAFT_APPROVAL_EXPIRED | job_id=%s", job_id)
+                    _mark_status(job_id, "FAILED", "Draft approval expired (24h limit)")
+                    if msg_id != "direct":
+                        batch_item_failures.append({"itemIdentifier": msg_id})
+                    continue
+
+                # Atomically consume approval
+                now = int(time.time())
+                try:
+                    table.update_item(
+                        Key={"job_id": job_id},
+                        UpdateExpression="SET approval_consumed = :true, approval_consumed_at = :now, outreach_status = :in_progress, send_attempt_at = :now",
+                        ConditionExpression="attribute_exists(job_id) AND draft_hash = :hash AND (attribute_not_exists(approval_consumed) OR approval_consumed = :false)",
+                        ExpressionAttributeValues={
+                            ":true": True,
+                            ":false": False,
+                            ":now": now,
+                            ":in_progress": "SEND_IN_PROGRESS",
+                            ":hash": approved_hash,
+                        },
+                    )
+                except Exception as e:
+                    if "ConditionalCheckFailed" in type(e).__name__ or "ConditionalCheckFailed" in str(e):
+                        logger.warning("APPROVAL_ALREADY_CONSUMED | job_id=%s", job_id)
+                        _mark_status(job_id, "FAILED", "Draft approval already consumed or invalid")
+                        if msg_id != "direct":
+                            batch_item_failures.append({"itemIdentifier": msg_id})
+                        continue
+                    logger.error("APPROVAL_CONSUME_ERROR | job_id=%s | %s", job_id, str(e))
+                    raise
+
+                email_data = {"subject": approved_subject, "body": approved_body}
+            else:
+                email_data = _generate_email(job)
+
             msg = _build_mime_message(
                 sender=SENDER_EMAIL,
                 recipient=recipient,
@@ -919,9 +990,28 @@ def lambda_handler(event, context):
         for job_id, success, error in send_results:
             if success:
                 _mark_status(job_id, "SENT")
+                try:
+                    table.update_item(
+                        Key={"job_id": job_id},
+                        UpdateExpression="SET outreach_status = :os, sent_at = :t",
+                        ExpressionAttributeValues={":os": "SENT", ":t": int(time.time())},
+                    )
+                except Exception:
+                    pass
                 sent_count += 1
             else:
-                _mark_status(job_id, "FAILED", f"SMTP_ERROR: {error}")
+                is_ambiguous = "connection error" in str(error).lower() or "timeout" in str(error).lower()
+                status_code = "MANUAL_RECONCILIATION_REQUIRED" if is_ambiguous else "FAILED"
+                outreach_code = "DELIVERY_AMBIGUOUS" if is_ambiguous else "FAILED"
+                _mark_status(job_id, status_code, f"SMTP_ERROR: {error}")
+                try:
+                    table.update_item(
+                        Key={"job_id": job_id},
+                        UpdateExpression="SET outreach_status = :os",
+                        ExpressionAttributeValues={":os": outreach_code},
+                    )
+                except Exception:
+                    pass
                 failed_count += 1
                 # Find the message_id for this job to add to failures
                 for m_id, job in jobs_to_process:

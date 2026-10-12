@@ -11,10 +11,11 @@
 The **JobHunt** autonomous engine was designed to resolve a fundamental failure mode in modern recruitment automation: the unconstrained blast of low-quality, hallucinated outreach against stale postings.
 
 The system enforces four primary engineering invariants:
-1. **Mathematical Grounding Over Token Burn**: Drop 90%+ of irrelevant, stale, or low-signal leads in deterministic Python (0ms, $0) before invoking model inference.
+The system enforces four primary engineering invariants:
+1. **Mathematical Grounding Over Token Burn**: Drop 90%+ of irrelevant, stale, or low-signal leads in deterministic Python (no model inference calls) before invoking Bedrock.
 2. **Serverless Cross-Encoder Reranking**: Batch-rerank candidate leads using Amazon Bedrock's native cross-encoders before performing deep LLM reasoning.
 3. **Zero-Trust Identity Sovereignty**: Candidate identity, personal contact details, and credentials are strictly decoupled from tracked source code and injected at runtime via 12-factor configuration.
-4. **Dual-Key Airgap Outreach**: The autonomous system *never* dispatches live outreach without dual-key human approval.
+4. **Dual-Key Outreach & Approval Binding**: The autonomous system *never* dispatches live outreach without dual-key configuration flags AND cryptographic, time-bounded approval tied to the exact draft.
 
 ---
 
@@ -35,29 +36,31 @@ flowchart TD
     end
 
     subgraph DEDUP["2. Deduplication & State Layer"]
-        DEDUP_FN["job-deduplicator Lambda<br/>• SHA-256 Title+Company+URL Hash<br/>• Evaluation Profile Versioning<br/>• DynamoDB Conditional Writes"]
-        DDB[("Amazon DynamoDB<br/>Table: Jobsearch<br/>PK: job_id (HASH)<br/>GSI: status-score-index")]
+        DEDUP_FN["job-deduplicator Lambda<br/>• SHA-256 Title+Company+URL Hash<br/>• Evaluation Profile Versioning<br/>• DynamoDB Base Table Conditional Writes"]
+        DDB[("Amazon DynamoDB<br/>Table: Jobsearch<br/>PK: job_id (HASH)<br/>GSI: status-score-index (Eventual)")]
         Q_FILT["SQS: job-filtered-queue<br/>(Visibility: 300s, MaxReceive: 3)"]
         DLQ_FILT["SQS: job-filtered-queue-dlq"]
     end
 
     subgraph EVAL["3. Three-Layer Evaluation Funnel"]
         PROC["job-processor Lambda<br/>• Layer 1: Deterministic Pre-Filters<br/>• Layer 2: Bedrock Cohere Rerank<br/>• Layer 3: Claude 3.5 Forced Tool Calling"]
-        BEDROCK_RERANK["Amazon Bedrock<br/>cohere.rerank-v3-5:0"]
+        BEDROCK_RERANK["Amazon Bedrock<br/>cohere.rerank-v3-5:0 (Query + Docs)"]
         BEDROCK_CLAUDE["Amazon Bedrock<br/>anthropic.claude-3-5-sonnet"]
-        S3_MEM[("Amazon S3<br/>Candidate Knowledge Graph & Resume")]
+        S3_MEM[("Amazon S3<br/>Candidate Context & Resume")]
         SNS["Amazon SNS Topic<br/>jobsearch-approvals"]
     end
 
-    subgraph CONTROL["4. Telegram Control Plane"]
+    subgraph CONTROL["4. Telegram Control Plane & Event Loop"]
         APIGW["API Gateway HTTP API v2<br/>POST /prod/telegram"]
-        ROUTER["job-router Lambda<br/>• Command State Machine<br/>• DynamoDB Atomic Claims<br/>• Feedback Capture Loop"]
+        ROUTER["job-router Lambda<br/>• Command State Machine<br/>• Base Table Atomic Claims<br/>• Feedback Capture Loop"]
         TG_CLIENT(("Candidate Telegram Client"))
+        TG_API["Telegram Bot API<br/>sendMessage / editMessageText"]
     end
 
-    subgraph OUTREACH["5. Dual-Key Outreach Engine"]
+    subgraph OUTREACH["5. Dual-Key Outreach Engine & Approval Binding"]
         SENDER["job-sender Lambda<br/>• Bedrock Single-Project Outreach<br/>• Vector PDF Resume Attachment<br/>• Guarded SMTP Dispatch"]
-        GMAIL["Gmail / Amazon SES SMTP"]
+        APPROVAL_GATE{"Dual-Key Config & Approval Gate<br/>1. Config Flags Enabled<br/>2. SHA-256 Hash Bound to Exact Draft<br/>3. Atomic DynamoDB Approval Consumption"}
+        SMTP["Gmail / Amazon SES SMTP<br/>Ambiguous Drops -> MANUAL_RECONCILIATION"]
     end
 
     CRON & TG_IN --> ING --> Q_RAW
@@ -66,15 +69,19 @@ flowchart TD
     DEDUP_FN --> Q_FILT
     Q_FILT -. Failure .-> DLQ_FILT
     Q_FILT --> PROC
-    PROC <-->|Cross-Encode| BEDROCK_RERANK
-    PROC <-->|Deep Eval| BEDROCK_CLAUDE
-    PROC -.->|Resume & Facts| S3_MEM
+    PROC -.->|Load Candidate Context| S3_MEM
+    PROC <-->|Text Query + Inline Job Docs| BEDROCK_RERANK
+    PROC <-->|Structured Eval with XML Boundary Guard| BEDROCK_CLAUDE
     PROC -->|Update Score & State| DDB
-    PROC -->|High Score >= 80%| SNS --> ROUTER
-    TG_CLIENT <--> APIGW <--> ROUTER <--> DDB
-    ROUTER -->|Trigger Draft/Send| SENDER
+    PROC -->|Fit Score >= 80/100| SNS --> ROUTER
+    TG_CLIENT -->|Incoming Webhook (update_id deduplicated)| APIGW --> ROUTER
+    ROUTER -->|Outgoing Async Bot API Calls| TG_API --> TG_CLIENT
+    ROUTER <-->|Query Base Table & Atomic Claim| DDB
+    ROUTER -->|Trigger Draft/Send with Approval Token| SENDER
     SENDER <--> BEDROCK_CLAUDE
-    SENDER -->|Dual-Key Gate Passed| GMAIL
+    SENDER --> APPROVAL_GATE
+    APPROVAL_GATE -->|Approved Send + Atomic Token Consume| SMTP
+    APPROVAL_GATE -->|Preview Draft Default & Token Issue| TG_API
 ```
 
 ---
@@ -88,7 +95,8 @@ To achieve industry-leading matching precision without incurring the cost of hea
                        │
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ Layer 1: Deterministic Pre-Filtering (0ms, $0)             │
+│ Layer 1: Deterministic Pre-Filtering                        │
+│ (No model inference calls)                                  │
 │ • Freshness: HN <= 3 days, ATS <= 14 days                   │
 │ • Domain & Title: Regex drop non-AI/ML roles                │
 │ • Grounding: Mandatory canonical HTTPS URL & SSRF defense   │
@@ -99,11 +107,11 @@ To achieve industry-leading matching precision without incurring the cost of hea
 ┌─────────────────────────────────────────────────────────────┐
 │ Layer 2: Serverless Cross-Encoder Reranker                  │
 │ • Bedrock native model: cohere.rerank-v3-5:0                │
-│ • Cross-encodes canonical resume against candidate roles    │
-│ • Single forward pass latency: ~150ms                       │
-│ • Prunes batch to top 15% high-conviction opportunities     │
+│ • Cross-encodes canonical context against candidate roles   │
+│ • Operates via direct text query and inline documents       │
+│ • Prunes batch to top high-conviction opportunities         │
 └─────────────────────────────────────────────────────────────┘
-                       │ (Prunes to top 15%)
+                       │ (Sorts and filters leads)
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ Layer 3: Deep Context Grounding                             │
@@ -112,8 +120,9 @@ To achieve industry-leading matching precision without incurring the cost of hea
 │ • In-Context Feedback: Dynamic injection of 5 positive &   │
 │   5 negative user decisions from Telegram DynamoDB history  │
 │ • Structured Output: score, match_reasons, caveats, draft   │
+│ • Guard: XML tag sanitization against prompt injection      │
 └─────────────────────────────────────────────────────────────┘
-                       │ (Only score >= 80% surfaces)
+                       │ (Only fit score >= 80/100 surfaces)
                        ▼
 [ Telegram Review Queue: Guided 'next' -> 'why' -> 'apply' ]
 ```
@@ -265,3 +274,36 @@ tools/ops/run_agents.py
 ```
 
 This ensures that any pull request or deployment is mathematically certified for security and performance before reaching AWS.
+
+---
+
+## 9. Open-Source Readiness & Production Reliability Guarantees
+
+### 9.1 Licensing & Job-Source Scraping Compliance
+* **Project License**: JobHunt is licensed under the MIT License ([LICENSE](LICENSE)).
+* **Dependency & Source Notices**: See [NOTICES.md](NOTICES.md) for full upstream dependency notices and scraping policy terms.
+* **Scraping Compliance**: JobHunt interacts with public APIs (Hacker News Algolia Search API, direct ATS board JSON feeds from Greenhouse, Lever, and Ashby). Postings are fetched strictly for individual job evaluation. Contributors must never redistribute, resell, or bulk-republish scraped descriptions.
+
+### 9.2 Deployment Scope: Single-User Sovereignty vs Multi-Tenant Isolation
+* **Current Scope**: Each JobHunt deployment is architected as a sovereign, single-candidate pipeline. It isolates all candidate facts, resumes, evaluation weights, and feedback within a dedicated AWS account or private prefix.
+* **Multi-Tenant Requirements**: If adapting JobHunt for a shared multi-tenant service, the following architectural controls must be enforced:
+  1. **Partition Key Isolation**: Shard DynamoDB rows by tenant/candidate (`PK = tenant_id#job_id`).
+  2. **Storage Separation**: Enforce per-user S3 prefixes (`data/users/{user_id}/resume.pdf`) with scoped IAM role session policies.
+  3. **Queue & Webhook Routing**: Segregate Telegram chat IDs and enforce strict authorization allowlists per tenant.
+  4. **Feedback & Model Weight Isolation**: Exemplars must be queried strictly per candidate ID.
+
+### 9.3 DynamoDB Indexing: Eventual Consistency & Partition Hotspotting
+* **Eventual Consistency on GSIs**: Queries against `status-score-index` are eventually consistent. Consequently, critical state transitions, approval checks, and claim locks are **strictly executed against the base table via conditional writes** (`UpdateItem` with `ConditionExpression`).
+* **Partition Key Concentration**: In `status-score-index`, partition key is `status` (e.g. `PENDING_APPROVAL`). For personal workloads (<10,000 jobs), DynamoDB handles this effortlessly. For enterprise-scale volume (>100,000 active leads), the partition key should be sharded (e.g., `status#bucket_id`) to distribute write and read throughput across partitions.
+
+### 9.4 CloudWatch Observability & Alarms
+Production deployments should monitor the following alarms:
+* **Queue Latency (`AgeOfOldestMessage > 300s`)**: Triggers an alert if SQS processing lags.
+* **DLQ Visibility (`ApproximateNumberOfMessagesVisible > 0`)**: Alerts immediately if poison-pill messages enter `job-raw-queue-dlq` or `job-filtered-queue-dlq`.
+* **Lambda Errors & Throttles**: Monitors execution errors across all 5 Lambdas.
+* **Bedrock Client Throttling (`ThrottlingException`)**: Alerts when Bedrock API rate limits require exponential backoff.
+
+### 9.5 Third-Party Dependency Availability & Google CSE Deprecation
+* **Google Custom Search JSON API Deprecation**: Google has closed the Custom Search JSON API to new customers, with a published sunset/transition deadline of **January 1, 2027**. JobHunt defaults `GOOGLE_CSE_ENABLED="false"` and operates autonomously without Google CSE by relying on direct ATS adapters and Hacker News.
+* **Model ID & Regional Availability**: Default model IDs (`anthropic.claude-3-5-sonnet-20241022-v2:0` and `cohere.rerank-v3-5:0`) are configurable via environment variables (`BEDROCK_MODEL_ID`, `BEDROCK_RERANK_MODEL_ID`, `AWS_REGION`). Verify availability in the target region (e.g., `us-east-1`, `us-west-2`) before deployment.
+

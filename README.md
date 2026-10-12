@@ -34,20 +34,20 @@ flowchart TD
     subgraph S["Live Ingestion Surfaces"]
         HN["Hacker News ('Who is Hiring')<br/>3-Day Freshness Limit · Obfuscated Email Extraction"]
         ATS["Direct ATS Boards<br/>Greenhouse · Lever · Ashby (SSRF Guarded)"]
-        CSE["Google Custom Search Engine<br/>Targeted ATS Board Discovery"]
+        CSE["Google Custom Search Engine<br/>Optional · Deprecating Jan 1, 2027"]
     end
 
-    subgraph L1["Layer 1: Deterministic Pre-Filtering (0ms, $0)"]
+    subgraph L1["Layer 1: Deterministic Pre-Filtering (No model inference calls)"]
         ING["job-ingestor Lambda<br/>EventBridge Cron or 'search jobs'"]
         RAW_Q["SQS: job-raw-queue<br/>DLQ: job-raw-queue-dlq"]
         DEDUP["job-deduplicator Lambda<br/>SHA-256 Normalization & Evaluation Versioning"]
-        DDB[("Amazon DynamoDB<br/>Partition Key: job_id · GSI: status-score-index")]
+        DDB[("Amazon DynamoDB<br/>Base PK: job_id · GSI: status-score-index (Eventual)")]
     end
 
     subgraph L2["Layer 2: Serverless Cross-Encoder Reranking"]
         FILT_Q["SQS: job-filtered-queue<br/>DLQ: job-filtered-queue-dlq"]
-        RERANK["Bedrock Cohere Rerank<br/>cohere.rerank-v3-5:0 (~150ms)"]
-        S3_MEM[("Amazon S3 Memory<br/>Candidate Knowledge Graph & Resume Context")]
+        RERANK["Bedrock Cohere Rerank<br/>cohere.rerank-v3-5:0 (Query + Inline Docs)"]
+        S3_MEM[("Amazon S3 Memory<br/>Candidate Context & Resume")]
     end
 
     subgraph L3["Layer 3: Deep Context Grounding"]
@@ -57,57 +57,61 @@ flowchart TD
         SNS["Amazon SNS<br/>jobsearch-approvals Topic"]
     end
 
-    subgraph L4["Layer 4: Control Plane & Dynamic Feedback"]
+    subgraph L4["Layer 4: Telegram Control Plane & Event Loop"]
         APIGW["API Gateway HTTP API v2<br/>POST /prod/telegram Webhook"]
         ROUTER["job-router Lambda<br/>State Machine & Atomic DynamoDB Claims"]
-        TG(("Telegram Control Plane<br/>'list' · 'next' · 'why' · 'draft' · 'apply'<br/>'interested' · 'meh' · 'not interested'"))
+        TG_CLIENT(("Candidate Telegram Client"))
+        TG_OUT["Telegram Bot API<br/>sendMessage / editMessageText"]
     end
 
-    subgraph L5["Layer 5: Dual-Key Guarded Outreach"]
+    subgraph L5["Layer 5: Dual-Key Guarded Outreach & Approval Binding"]
         SENDER["job-sender Lambda<br/>Precision Outreach Synthesis (<130 words)"]
-        AIRGAP{"Dual-Key Airgap Gate<br/>ALLOW_TELEGRAM_EMAIL_SEND<br/>ALLOW_REAL_EMAIL_SEND"}
-        SMTP["Gmail / AWS SES SMTP<br/>(Only when both keys = true)"]
+        APPROVAL_GATE{"Dual-Key Config & Approval Gate<br/>1. Config Flags Enabled<br/>2. SHA-256 Hash Bound to Exact Draft<br/>3. Atomic DynamoDB Approval Consumption"}
+        SMTP["Gmail / AWS SES SMTP<br/>Ambiguous Outcomes -> MANUAL_RECONCILIATION"]
     end
 
     HN & ATS & CSE -->|Fetch & Clean| ING -->|Batch Push| RAW_Q
     RAW_Q --> DEDUP <-->|Hash Check & Requeue| DDB
     DEDUP -->|Unique Postings| FILT_Q --> PROC
-    PROC <-->|Top 15% Pruning| RERANK
-    RERANK -.->|Resume Vectors| S3_MEM
-    PROC <-->|Structured Scoring| BEDROCK
-    FEEDBACK_MEM -.->|Inject Past Decisions| BEDROCK
+    PROC -.->|Load Candidate Profile| S3_MEM
+    PROC <-->|Text Query + Inline Job Docs| RERANK
+    PROC <-->|Structured Scoring with XML Boundary Guard| BEDROCK
+    FEEDBACK_MEM -.->|Inject Past Decisions & Separate Salary/Location| BEDROCK
     PROC -->|Update Score & State| DDB
-    PROC -->|Score >= 80%| SNS --> ROUTER
-    TG <-->|Webhook Commands| APIGW <--> ROUTER
-    ROUTER <-->|Query Pending & Atomic Claim| DDB
+    PROC -->|Fit Score >= 80/100| SNS --> ROUTER
+    TG_CLIENT -->|Incoming Webhook (update_id deduplicated)| APIGW --> ROUTER
+    ROUTER -->|Outgoing Async Bot API Calls| TG_OUT --> TG_CLIENT
+    ROUTER <-->|Query Base Table & Atomic Claim| DDB
     ROUTER -->|Feedback Persistence| DDB
-    ROUTER -->|Trigger Outreach Preview/Send| SENDER
+    ROUTER -->|Trigger Outreach Preview/Send with Approval Token| SENDER
     SENDER <-->|Single-Project Pitch| BEDROCK
-    SENDER --> AIRGAP
-    AIRGAP -->|Approved Send| SMTP
-    AIRGAP -->|Preview Draft Default| TG
+    SENDER --> APPROVAL_GATE
+    APPROVAL_GATE -->|Approved Send + Atomic Token Consume| SMTP
+    APPROVAL_GATE -->|Preview Draft Default & Token Issue| TG_OUT
 ```
 
 ---
 
-## ⚡ Key Architectural Innovations
+## ⚡ Key Architectural Innovations & Production Guarantees
 
 ### 1. Three-Layer Quality Funnel & Serverless Reranker
 Rather than burdening expensive LLMs with raw web scrapes, JobHunt applies a staged filtration funnel:
-* **Layer 1: Deterministic Guardrails (0ms, $0)**: Drops non-AI engineering roles, postings older than 3 days (Hacker News) or 14 days (ATS), and links violating SSRF rules.
-* **Layer 2: Serverless Cross-Encoder Reranking**: Utilizes Amazon Bedrock's native `cohere.rerank-v3-5:0` to cross-encode the candidate's canonical resume against incoming job descriptions in a single ~150ms forward pass, pruning to the top 15% high-conviction leads.
-* **Layer 3: Deep Context Grounding**: Evaluates top-ranked leads with Claude 3.5 Sonnet using forced tool-calling (`submit_evaluation`), requiring explicit citations against candidate memory.
+* **Layer 1: Deterministic Guardrails (No model inference calls)**: Drops non-AI engineering roles, postings older than 3 days (Hacker News) or 14 days (ATS), and links violating SSRF rules.
+* **Layer 2: Serverless Cross-Encoder Reranking**: Leverages Amazon Bedrock's native `cohere.rerank-v3-5:0`. The `job-processor` loads candidate profile context from S3, constructs the search query, and submits job description documents inline to the cross-encoder, scoring relevance without self-hosting GPU servers.
+* **Layer 3: Deep Context Grounding**: Evaluates top-ranked leads with Claude 3.5 Sonnet using forced tool-calling (`submit_evaluation`), requiring explicit citations against candidate memory and enforcing XML boundary sanitization against prompt injection. Fits are treated as scores (0-100), not probabilities.
 
 ### 2. Autonomous In-Context Feedback Loop
 The agent learns candidate preferences in real time without unstable self-modifying code:
 * Telegram user feedback (`interested`, `meh <reason>`, `not interested <reason>`) is stored with atomic timestamps in DynamoDB.
-* The 5 most recent positive and 5 most recent negative exemplars are dynamically injected into Bedrock scoring context, adjusting model weights to the candidate's evolving taste.
+* Feedback context distinguishes circumstantial objections (location, salary, commute) from technical skill evaluations so non-technical rejections do not degrade AI engineering matching.
+* The 5 most recent positive and 5 most recent negative exemplars are dynamically injected into Bedrock scoring context, adjusting model guidance to the candidate's evolving taste.
 
-### 3. Dual-Gated Outreach Airgap
-To eliminate accidental or unapproved outbound communication:
-* `ALLOW_TELEGRAM_EMAIL_SEND=true` on `job-router`
-* `ALLOW_REAL_EMAIL_SEND=true` on `job-sender`
-* Unless **both** independent switches are explicitly enabled in AWS runtime configuration, the pipeline strictly produces read-only email previews.
+### 3. Dual-Gated Outreach with Cryptographic Draft Approval
+To eliminate accidental, unapproved, or replay outbound communication:
+* **Configuration Gates**: `ALLOW_TELEGRAM_EMAIL_SEND=true` on `job-router` and `ALLOW_REAL_EMAIL_SEND=true` on `job-sender`.
+* **Per-Email Approval Binding**: Generating a preview draft issues a SHA-256 approval token bound to `(job_id, recipient, subject, body)` with a strict 24-hour expiration. If the recipient or body changes, the token is invalidated.
+* **Atomic Approval Consumption**: Approval is atomically consumed via DynamoDB conditional writes before SMTP dispatch (`approval_consumed = True`), preventing duplicate sends on Telegram webhook retries.
+* **Ambiguous Delivery Reconciliation**: If an email provider connection drops or times out mid-transfer, the job is marked `DELIVERY_AMBIGUOUS` and `MANUAL_RECONCILIATION_REQUIRED`, halting automated retries to avoid spamming recruiters.
 
 ### 4. Zero-Trust Identity Sovereignty
 * 100% decoupled candidate profile: zero personal names, personal locations, personal emails, or private URLs in code, tests, or documentation.

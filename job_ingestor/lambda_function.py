@@ -172,8 +172,9 @@ def _source_query_summary(jobs: list[dict]) -> list[dict]:
         for (source, query), count in sorted(summary.items())
     ]
 
-sqs = boto3.client("sqs", region_name="us-east-1")
-secretsmanager = boto3.client("secretsmanager", region_name="us-east-1")
+AWS_REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+sqs = boto3.client("sqs", region_name=AWS_REGION)
+secretsmanager = boto3.client("secretsmanager", region_name=AWS_REGION)
 QUEUE_URL = os.environ.get("RAW_QUEUE_URL")
 JSEARCH_SECRET_NAME = os.environ.get("JSEARCH_SECRET_NAME", "jobserch/jsearch")
 JSEARCH_ENABLED = os.environ.get("JSEARCH_ENABLED", "true").strip().lower() == "true"
@@ -187,7 +188,9 @@ JSEARCH_QUERIES = [
     if q.strip()
 ]
 GOOGLE_CSE_SECRET_NAME = os.environ.get("GOOGLE_CSE_SECRET_NAME", "jobsearch/google_cse")
-GOOGLE_CSE_ENABLED = os.environ.get("GOOGLE_CSE_ENABLED", "true").strip().lower() == "true"
+# Google Custom Search JSON API is closed to new customers with a Jan 1, 2027 transition deadline.
+# Default to false so new open-source deployments run cleanly on direct ATS boards and HN.
+GOOGLE_CSE_ENABLED = os.environ.get("GOOGLE_CSE_ENABLED", "false").strip().lower() == "true"
 GOOGLE_CSE_MAX_RESULTS = int(os.environ.get("GOOGLE_CSE_MAX_RESULTS", "10"))
 GOOGLE_CSE_QUERIES = _load_google_cse_queries()
 

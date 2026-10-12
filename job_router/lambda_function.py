@@ -88,9 +88,10 @@ logger.setLevel(logging.INFO)
 TELEGRAM_MAX_MESSAGE_CHARS = 4096
 TELEGRAM_SAFE_MESSAGE_CHARS = 3800
 
-secrets_client = boto3.client("secretsmanager", region_name="us-east-1")
-dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
-lambda_client = boto3.client("lambda", region_name="us-east-1")
+AWS_REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
+dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+lambda_client = boto3.client("lambda", region_name=AWS_REGION)
 
 SECRET_NAME = os.environ.get("TELEGRAM_SECRET_NAME", "telegram")
 TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "Jobsearch")
@@ -103,6 +104,7 @@ LIST_FETCH_LIMIT = int(os.environ.get("LIST_FETCH_LIMIT", "100"))
 ENABLE_PRACTICE_MODE = os.environ.get("ENABLE_PRACTICE_MODE", "false").strip().lower() == "true"
 ALLOW_TELEGRAM_EMAIL_SEND = os.environ.get("ALLOW_TELEGRAM_EMAIL_SEND", "false").strip().lower() == "true"
 REQUIRE_TELEGRAM_WEBHOOK_SECRET = os.environ.get("REQUIRE_TELEGRAM_WEBHOOK_SECRET", "false").strip().lower() == "true"
+REQUIRE_DRAFT_APPROVAL = os.environ.get("REQUIRE_DRAFT_APPROVAL", "true").strip().lower() == "true"
 LIST_ALLOWED_SOURCES = {
     source.strip().lower()
     for source in os.environ.get(
@@ -2146,9 +2148,39 @@ def _handle_draft(
             raise ValueError(payload.get("error") or "sender did not return a preview")
 
         email = payload["email"]
+        subject = str(email.get("subject", "")).strip()
         body = str(email.get("body", "")).strip()
-        if len(body) > 2500:
-            body = body[:2500].rstrip() + "\n[truncated]"
+        recipient = (job.get("recruiter_email") or "").strip()
+        now = int(time.time())
+        expiry = now + 86400  # 24h approval validity
+        approval_hash = hashlib.sha256(
+            f"{job['job_id']}:{recipient}:{subject}:{body}".encode("utf-8")
+        ).hexdigest()
+
+        try:
+            table.update_item(
+                Key={"job_id": job["job_id"]},
+                UpdateExpression=(
+                    "SET draft_subject = :s, draft_body = :b, draft_hash = :h, "
+                    "draft_recipient = :r, draft_created_at = :t, approval_expires_at = :exp, "
+                    "approval_consumed = :f"
+                ),
+                ExpressionAttributeValues={
+                    ":s": subject,
+                    ":b": body,
+                    ":h": approval_hash,
+                    ":r": recipient,
+                    ":t": now,
+                    ":exp": expiry,
+                    ":f": False,
+                },
+            )
+        except Exception as exc:
+            logger.warning("FAILED_TO_PERSIST_DRAFT_APPROVAL | job_id=%s | %s", job["job_id"], str(exc))
+
+        display_body = body
+        if len(display_body) > 2500:
+            display_body = display_body[:2500].rstrip() + "\n[truncated]"
         fallback_note = ""
         if payload.get("generated_with_fallback"):
             fallback_note = (
@@ -2159,10 +2191,12 @@ def _handle_draft(
             bot_token,
             chat_id,
             f"Draft for match #{resolved_index}\n\n"
-            f"Subject: {email.get('subject', '')}\n\n"
-            f"{body}{fallback_note}\n\n"
+            f"Subject: {subject}\n\n"
+            f"{display_body}{fallback_note}\n\n"
+            f"Draft approval: {approval_hash[:8]} (valid 24h).\n\n"
             "No email was sent.\n\n"
-            "Next: interested, meh <reason>, apply, skip <reason>, or next.",
+            "Next: interested, meh <reason>, apply, skip <reason>, next, or confirm send "
+            f"{resolved_index}.",
             reply_markup=_build_review_card_keyboard(job.get("job_id")),
         )
     except Exception as e:
@@ -2207,7 +2241,57 @@ def _handle_send(bot_token: str, chat_id: str, index: int = 1, confirmed: bool =
             f"For now, use draft {index} then send manually.",
         )
         return
+
+    current_item = {}
+    try:
+        current_item = table.get_item(Key={"job_id": job["job_id"]}).get("Item", {})
+    except Exception as e:
+        logger.warning("FETCH_JOB_FOR_SEND_ERROR | %s", str(e))
+
+    draft_hash = current_item.get("draft_hash") or job.get("draft_hash")
+    draft_subject = current_item.get("draft_subject") or job.get("draft_subject")
+    draft_body = current_item.get("draft_body") or job.get("draft_body")
+    draft_recipient = current_item.get("draft_recipient") or job.get("draft_recipient")
+    approval_expires_at = int(current_item.get("approval_expires_at") or job.get("approval_expires_at") or 0)
+    approval_consumed = bool(current_item.get("approval_consumed", job.get("approval_consumed", False)))
+    now = int(time.time())
+
+    if REQUIRE_DRAFT_APPROVAL:
+        if not draft_hash or not draft_body:
+            _send_telegram(
+                bot_token,
+                chat_id,
+                f"No draft approved for match #{index}.\n\n"
+                f"Use draft {index} first to review and approve the exact outreach before sending.",
+            )
+            return
+        if approval_consumed:
+            _send_telegram(
+                bot_token,
+                chat_id,
+                f"The approval for match #{index} was already consumed.\n\n"
+                f"Use draft {index} to review and approve a fresh draft.",
+            )
+            return
+        if approval_expires_at and now > approval_expires_at:
+            _send_telegram(
+                bot_token,
+                chat_id,
+                f"Draft approval for match #{index} has expired (24h limit).\n\n"
+                f"Use draft {index} to generate and approve a fresh draft.",
+            )
+            return
+        if draft_recipient and draft_recipient != recruiter:
+            _send_telegram(
+                bot_token,
+                chat_id,
+                f"Recipient email ({recruiter}) changed since draft was approved ({draft_recipient}).\n\n"
+                f"Use draft {index} to generate a fresh draft.",
+            )
+            return
+
     if not confirmed:
+        hash_note = f"\nDraft approval: {draft_hash[:8]}" if draft_hash else ""
         _send_telegram(
             bot_token,
             chat_id,
@@ -2215,17 +2299,26 @@ def _handle_send(bot_token: str, chat_id: str, index: int = 1, confirmed: bool =
             f"Role: {job.get('title', 'Unknown')}\n"
             f"Company: {job.get('company', 'Unknown')}\n"
             f"To: {recruiter}\n"
-            f"Source link: {source_url}\n\n"
+            f"Source link: {source_url}{hash_note}\n\n"
             f"Type exactly: confirm send {index}\n\n"
             "No email was sent.",
         )
         return
 
     try:
+        send_payload = {
+            "send_email": True,
+            "send_confirmed": True,
+            "job": job,
+            "approved_hash": draft_hash,
+            "approved_subject": draft_subject,
+            "approved_body": draft_body,
+            "approval_expires_at": approval_expires_at,
+        }
         response = lambda_client.invoke(
             FunctionName=SENDER_LAMBDA,
             InvocationType="RequestResponse",
-            Payload=_safe_json_dumps({"send_email": True, "send_confirmed": True, "job": job}),
+            Payload=_safe_json_dumps(send_payload),
         )
         payload = _read_lambda_payload(response)
         status = payload.get("status", "")
@@ -2663,6 +2756,30 @@ def _validate_webhook_secret(event: dict, expected_secret: str) -> bool:
     return hmac.compare_digest(provided_token, expected_secret)
 
 
+def _claim_update_id(update_id: int | str | None) -> bool:
+    """Atomically claim a Telegram update_id to prevent duplicate command execution."""
+    if not update_id:
+        return True
+    now = int(time.time())
+    try:
+        table.put_item(
+            Item={
+                "job_id": f"upd:{update_id}",
+                "entity_type": "telegram_update",
+                "created_at": now,
+                "ttl": now + 86400,
+            },
+            ConditionExpression="attribute_not_exists(job_id)",
+        )
+        return True
+    except Exception as e:
+        if "ConditionalCheckFailed" in type(e).__name__ or "ConditionalCheckFailed" in str(e):
+            logger.info("DUPLICATE_TELEGRAM_UPDATE_IGNORED | update_id=%s", update_id)
+            return False
+        logger.warning("UPDATE_CLAIM_ERROR: %s", str(e))
+        return True
+
+
 def lambda_handler(event, context):
     """
     Entry point for both SNS notifications and Telegram webhook commands.
@@ -2795,6 +2912,10 @@ def lambda_handler(event, context):
                 if not isinstance(message, dict):
                     logger.warning("MALFORMED_WEBHOOK: message is not a JSON object")
                     return {"statusCode": 400, "body": "Bad Request: message must be a JSON object"}
+
+                update_id = body.get("update_id")
+                if update_id and not _claim_update_id(update_id):
+                    return {"statusCode": 200, "body": "Duplicate update ignored"}
 
                 raw_text = message.get("text")
                 user_text = str(raw_text).strip() if raw_text is not None else ""

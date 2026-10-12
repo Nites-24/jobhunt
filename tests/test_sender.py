@@ -553,3 +553,151 @@ class TestSender:
         item = table.get_item(Key={"job_id": SAMPLE_JOB["job_id"]})["Item"]
         assert item["status"] == "FAILED"
         assert "SMTP_ERROR" in item.get("failure_reason", "")
+
+    @patch("job_sender.lambda_function._send_via_smtp")
+    @patch("job_sender.lambda_function.bedrock_client")
+    def test_draft_approval_enforcement(self, mock_bedrock, mock_smtp):
+        """When draft approval is required, unapproved, mismatched, or expired drafts are rejected."""
+        import hashlib
+        import time
+        mod, table = self._setup_infra()
+        mod.ALLOW_REAL_EMAIL_SEND = True
+        mod.REQUIRE_DRAFT_APPROVAL = True
+
+        recipient = SAMPLE_JOB["recruiter_email"]
+        subject = "AI Engineer at Anthropic"
+        body = "Hi Sarah,\n\nTest body.\n\nBest,\nAlex Hunter"
+        valid_hash = hashlib.sha256(
+            f"{SAMPLE_JOB['job_id']}:{recipient}:{subject}:{body}".encode("utf-8")
+        ).hexdigest()
+
+        # 1. Unapproved send fails
+        result = mod.lambda_handler(SAMPLE_JOB, MockContext())
+        mock_smtp.assert_not_called()
+        item = table.get_item(Key={"job_id": SAMPLE_JOB["job_id"]})["Item"]
+        assert item["status"] == "FAILED"
+        assert "requires approved draft" in item["failure_reason"]
+
+        # 2. Mismatched hash fails
+        bad_event = {
+            **SAMPLE_JOB,
+            "approved_hash": "bad-hash",
+            "approved_subject": subject,
+            "approved_body": body,
+        }
+        result = mod.lambda_handler(bad_event, MockContext())
+        mock_smtp.assert_not_called()
+        item = table.get_item(Key={"job_id": SAMPLE_JOB["job_id"]})["Item"]
+        assert item["status"] == "FAILED"
+        assert "mismatch" in item["failure_reason"]
+
+        # 3. Expired approval fails
+        table.update_item(
+            Key={"job_id": SAMPLE_JOB["job_id"]},
+            UpdateExpression="SET draft_hash = :h, approval_expires_at = :exp",
+            ExpressionAttributeValues={":h": valid_hash, ":exp": int(time.time()) - 3600},
+        )
+        expired_event = {
+            **SAMPLE_JOB,
+            "approved_hash": valid_hash,
+            "approved_subject": subject,
+            "approved_body": body,
+            "approval_expires_at": int(time.time()) - 3600,
+        }
+        result = mod.lambda_handler(expired_event, MockContext())
+        mock_smtp.assert_not_called()
+        item = table.get_item(Key={"job_id": SAMPLE_JOB["job_id"]})["Item"]
+        assert item["status"] == "FAILED"
+        assert "expired" in item["failure_reason"]
+
+    @patch("job_sender.lambda_function._send_via_smtp")
+    @patch("job_sender.lambda_function.bedrock_client")
+    def test_atomic_approval_consumption_prevents_duplicate_send(self, mock_bedrock, mock_smtp):
+        """Approval must be consumed atomically, preventing replay / duplicate sends."""
+        import hashlib
+        import time
+        mod, table = self._setup_infra()
+        mod.ALLOW_REAL_EMAIL_SEND = True
+        mod.REQUIRE_DRAFT_APPROVAL = True
+
+        recipient = SAMPLE_JOB["recruiter_email"]
+        subject = "AI Engineer at Anthropic"
+        body = "Hi Sarah,\n\nTest body.\n\nBest,\nAlex Hunter"
+        valid_hash = hashlib.sha256(
+            f"{SAMPLE_JOB['job_id']}:{recipient}:{subject}:{body}".encode("utf-8")
+        ).hexdigest()
+
+        table.update_item(
+            Key={"job_id": SAMPLE_JOB["job_id"]},
+            UpdateExpression="SET draft_hash = :h, approval_expires_at = :exp",
+            ExpressionAttributeValues={":h": valid_hash, ":exp": int(time.time()) + 86400},
+        )
+        mock_smtp.return_value = [(SAMPLE_JOB["job_id"], True, None)]
+
+        valid_event = {
+            **SAMPLE_JOB,
+            "approved_hash": valid_hash,
+            "approved_subject": subject,
+            "approved_body": body,
+            "approval_expires_at": int(time.time()) + 86400,
+        }
+
+        # First send succeeds and atomically consumes approval
+        res1 = mod.lambda_handler(valid_event, MockContext())
+        assert res1["sent"] == 1
+        assert mock_smtp.call_count == 1
+
+        item = table.get_item(Key={"job_id": SAMPLE_JOB["job_id"]})["Item"]
+        assert item["approval_consumed"] is True
+        assert item["outreach_status"] == "SENT"
+
+        # Attempting second send should be blocked (either idempotency check or conditional check failure)
+        mock_smtp.reset_mock()
+        res2 = mod.lambda_handler(valid_event, MockContext())
+        assert mock_smtp.call_count == 0
+
+    @patch("job_sender.lambda_function._send_via_smtp")
+    @patch("job_sender.lambda_function.bedrock_client")
+    def test_ambiguous_smtp_failure_marks_manual_reconciliation_and_skips_resend(self, mock_bedrock, mock_smtp):
+        """Ambiguous SMTP connection failure transitions to MANUAL_RECONCILIATION_REQUIRED and prevents resend."""
+        import hashlib
+        import time
+        mod, table = self._setup_infra()
+        mod.ALLOW_REAL_EMAIL_SEND = True
+        mod.REQUIRE_DRAFT_APPROVAL = True
+
+        recipient = SAMPLE_JOB["recruiter_email"]
+        subject = "AI Engineer at Anthropic"
+        body = "Hi Sarah,\n\nTest body.\n\nBest,\nAlex Hunter"
+        valid_hash = hashlib.sha256(
+            f"{SAMPLE_JOB['job_id']}:{recipient}:{subject}:{body}".encode("utf-8")
+        ).hexdigest()
+
+        table.update_item(
+            Key={"job_id": SAMPLE_JOB["job_id"]},
+            UpdateExpression="SET draft_hash = :h, approval_expires_at = :exp",
+            ExpressionAttributeValues={":h": valid_hash, ":exp": int(time.time()) + 86400},
+        )
+        mock_smtp.return_value = [(SAMPLE_JOB["job_id"], False, "Connection error: socket timeout")]
+
+        event = {
+            **SAMPLE_JOB,
+            "approved_hash": valid_hash,
+            "approved_subject": subject,
+            "approved_body": body,
+            "approval_expires_at": int(time.time()) + 86400,
+        }
+
+        # First attempt experiences ambiguous failure
+        res = mod.lambda_handler(event, MockContext())
+        assert res["failed"] == 1
+
+        item = table.get_item(Key={"job_id": SAMPLE_JOB["job_id"]})["Item"]
+        assert item["status"] == "MANUAL_RECONCILIATION_REQUIRED"
+        assert item["outreach_status"] == "DELIVERY_AMBIGUOUS"
+
+        # Subsequent attempt must skip instead of resending
+        mock_smtp.reset_mock()
+        res2 = mod.lambda_handler(event, MockContext())
+        mock_smtp.assert_not_called()
+

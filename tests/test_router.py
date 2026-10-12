@@ -18,6 +18,8 @@ import json
 import io
 import ast
 import textwrap
+import hashlib
+import time
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import pytest
@@ -733,6 +735,21 @@ class TestRouter:
         mod.ALLOW_TELEGRAM_EMAIL_SEND = True
         mock_tg.return_value = True
         self._insert_pending_jobs(table, 1, with_email=True)
+        draft_subject = "AI Engineer at company1"
+        draft_body = "Hi Recruiter,\n\nI saw your AI role..."
+        recipient = "recruiter1@company1.com"
+        draft_hash = hashlib.sha256(f"pending-001:{recipient}:{draft_subject}:{draft_body}".encode()).hexdigest()
+        table.update_item(
+            Key={"job_id": "pending-001"},
+            UpdateExpression="SET draft_hash = :h, draft_subject = :s, draft_body = :b, draft_recipient = :r, approval_expires_at = :exp",
+            ExpressionAttributeValues={
+                ":h": draft_hash,
+                ":s": draft_subject,
+                ":b": draft_body,
+                ":r": recipient,
+                ":exp": int(time.time()) + 86400,
+            },
+        )
 
         event = _make_telegram_event("send 1")
         mod.lambda_handler(event, MockContext())
@@ -748,11 +765,26 @@ class TestRouter:
     @patch("job_router.lambda_function._send_telegram")
     @patch("job_router.lambda_function.lambda_client")
     def test_confirm_send_invokes_sender(self, mock_lambda, mock_tg):
-        """'confirm send N' should invoke sender with an explicit confirmed payload."""
+        """'confirm send N' should invoke sender with an explicit confirmed payload and approval hash."""
         mod, table = self._setup_infra()
         mod.ALLOW_TELEGRAM_EMAIL_SEND = True
         mock_tg.return_value = True
         self._insert_pending_jobs(table, 1, with_email=True)
+        draft_subject = "AI Engineer at company1"
+        draft_body = "Hi Recruiter,\n\nI saw your AI role..."
+        recipient = "recruiter1@company1.com"
+        draft_hash = hashlib.sha256(f"pending-001:{recipient}:{draft_subject}:{draft_body}".encode()).hexdigest()
+        table.update_item(
+            Key={"job_id": "pending-001"},
+            UpdateExpression="SET draft_hash = :h, draft_subject = :s, draft_body = :b, draft_recipient = :r, approval_expires_at = :exp",
+            ExpressionAttributeValues={
+                ":h": draft_hash,
+                ":s": draft_subject,
+                ":b": draft_body,
+                ":r": recipient,
+                ":exp": int(time.time()) + 86400,
+            },
+        )
         mock_lambda.invoke.return_value = {
             "Payload": io.BytesIO(json.dumps({"status": "sent", "sent": 1}).encode("utf-8"))
         }
@@ -765,6 +797,7 @@ class TestRouter:
         assert payload["send_email"] is True
         assert payload["send_confirmed"] is True
         assert payload["job"]["job_id"] == "pending-001"
+        assert payload["approved_hash"] == draft_hash
         msg = mock_tg.call_args[0][2]
         assert "Email sent" in msg
         assert "To: recruiter1@company1.com" in msg
@@ -2487,4 +2520,237 @@ def test_one_day_freshness_rule_filters_stale_jobs_from_review_queue(monkeypatch
     assert mod._is_reviewable_job(fresh_job) is True
     assert mod._is_reviewable_job(stale_job) is False
     assert "older than the 1-day freshness rule" in mod._hidden_pending_reason(stale_job)
+
+
+def _create_router_test_table(dynamo):
+    table = dynamo.create_table(
+        TableName="Jobsearch",
+        KeySchema=[{"AttributeName": "job_id", "KeyType": "HASH"}],
+        AttributeDefinitions=[
+            {"AttributeName": "job_id", "AttributeType": "S"},
+            {"AttributeName": "status", "AttributeType": "S"},
+        ],
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "status-index",
+                "KeySchema": [{"AttributeName": "status", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    table.meta.client.get_waiter("table_exists").wait(TableName="Jobsearch")
+    return table
+
+
+@mock_aws
+def test_send_blocked_without_prior_draft_approval():
+    """Sending outreach must be blocked if no draft has been approved for the job."""
+    from unittest.mock import patch, MagicMock
+    import job_router.lambda_function as mod
+
+    dynamo = boto3.resource("dynamodb", region_name="us-east-1")
+    table = _create_router_test_table(dynamo)
+    mod.table = table
+    mod.ALLOW_TELEGRAM_EMAIL_SEND = True
+    mod.REQUIRE_DRAFT_APPROVAL = True
+
+    table.put_item(
+        Item={
+            "job_id": "pending-001",
+            "title": "AI Engineer",
+            "company": "Company1",
+            "source": "greenhouse",
+            "recruiter_email": "recruiter@company1.com",
+            "url": "https://boards.greenhouse.io/company1/jobs/1",
+            "status": "PENDING_APPROVAL",
+            "match_score": 90,
+            "posted_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+    with patch("job_router.lambda_function._send_telegram") as mock_tg, \
+         patch("job_router.lambda_function._get_secrets") as mock_sec, \
+         patch("job_router.lambda_function.lambda_client") as mock_lambda:
+        mock_sec.return_value = {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "99999"}
+        mock_tg.return_value = True
+        event = _make_telegram_event("confirm send 1")
+        mod.lambda_handler(event, MockContext())
+
+        mock_lambda.invoke.assert_not_called()
+        msg = mock_tg.call_args[0][2]
+        assert "No draft approved for match #1" in msg
+
+
+@mock_aws
+def test_send_blocked_when_draft_approval_expired():
+    """Sending outreach must be blocked if the draft approval has expired (>24h)."""
+    from unittest.mock import patch
+    import job_router.lambda_function as mod
+
+    dynamo = boto3.resource("dynamodb", region_name="us-east-1")
+    table = _create_router_test_table(dynamo)
+    mod.table = table
+    mod.ALLOW_TELEGRAM_EMAIL_SEND = True
+    mod.REQUIRE_DRAFT_APPROVAL = True
+
+    table.put_item(
+        Item={
+            "job_id": "pending-001",
+            "title": "AI Engineer",
+            "company": "Company1",
+            "source": "greenhouse",
+            "recruiter_email": "recruiter@company1.com",
+            "url": "https://boards.greenhouse.io/company1/jobs/1",
+            "status": "PENDING_APPROVAL",
+            "match_score": 90,
+            "posted_at": datetime.now(timezone.utc).isoformat(),
+            "draft_hash": "dummyhash123",
+            "draft_subject": "AI Engineer role",
+            "draft_body": "Hi Recruiter,\n\nI saw your AI role...",
+            "draft_recipient": "recruiter@company1.com",
+            "approval_expires_at": int(time.time()) - 3600,  # Expired 1 hour ago
+        }
+    )
+
+    with patch("job_router.lambda_function._send_telegram") as mock_tg, \
+         patch("job_router.lambda_function._get_secrets") as mock_sec, \
+         patch("job_router.lambda_function.lambda_client") as mock_lambda:
+        mock_sec.return_value = {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "99999"}
+        mock_tg.return_value = True
+        event = _make_telegram_event("confirm send 1")
+        mod.lambda_handler(event, MockContext())
+
+        mock_lambda.invoke.assert_not_called()
+        msg = mock_tg.call_args[0][2]
+        assert "Draft approval for match #1 has expired" in msg
+
+
+@mock_aws
+def test_send_blocked_when_draft_approval_already_consumed():
+    """Sending outreach must be blocked if the draft approval was already consumed."""
+    from unittest.mock import patch
+    import job_router.lambda_function as mod
+
+    dynamo = boto3.resource("dynamodb", region_name="us-east-1")
+    table = _create_router_test_table(dynamo)
+    mod.table = table
+    mod.ALLOW_TELEGRAM_EMAIL_SEND = True
+    mod.REQUIRE_DRAFT_APPROVAL = True
+
+    table.put_item(
+        Item={
+            "job_id": "pending-001",
+            "title": "AI Engineer",
+            "company": "Company1",
+            "source": "greenhouse",
+            "recruiter_email": "recruiter@company1.com",
+            "url": "https://boards.greenhouse.io/company1/jobs/1",
+            "status": "PENDING_APPROVAL",
+            "match_score": 90,
+            "posted_at": datetime.now(timezone.utc).isoformat(),
+            "draft_hash": "consumedhash123",
+            "draft_subject": "AI Engineer role",
+            "draft_body": "Hi Recruiter,\n\nI saw your AI role...",
+            "draft_recipient": "recruiter@company1.com",
+            "approval_expires_at": int(time.time()) + 86400,
+            "approval_consumed": True,
+        }
+    )
+
+    with patch("job_router.lambda_function._send_telegram") as mock_tg, \
+         patch("job_router.lambda_function._get_secrets") as mock_sec, \
+         patch("job_router.lambda_function.lambda_client") as mock_lambda:
+        mock_sec.return_value = {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "99999"}
+        mock_tg.return_value = True
+        event = _make_telegram_event("confirm send 1")
+        mod.lambda_handler(event, MockContext())
+
+        mock_lambda.invoke.assert_not_called()
+        msg = mock_tg.call_args[0][2]
+        assert "The approval for match #1 was already consumed" in msg
+
+
+@mock_aws
+def test_changed_recipient_invalidates_draft_approval():
+    """Sending outreach must be blocked if recruiter email changed after draft was approved."""
+    from unittest.mock import patch
+    import job_router.lambda_function as mod
+
+    dynamo = boto3.resource("dynamodb", region_name="us-east-1")
+    table = _create_router_test_table(dynamo)
+    mod.table = table
+    mod.ALLOW_TELEGRAM_EMAIL_SEND = True
+    mod.REQUIRE_DRAFT_APPROVAL = True
+
+    table.put_item(
+        Item={
+            "job_id": "pending-001",
+            "title": "AI Engineer",
+            "company": "Company1",
+            "source": "greenhouse",
+            "recruiter_email": "new_recruiter@company1.com",  # Changed!
+            "url": "https://boards.greenhouse.io/company1/jobs/1",
+            "status": "PENDING_APPROVAL",
+            "match_score": 90,
+            "posted_at": datetime.now(timezone.utc).isoformat(),
+            "draft_hash": "validhash123",
+            "draft_subject": "AI Engineer role",
+            "draft_body": "Hi Recruiter,\n\nI saw your AI role...",
+            "draft_recipient": "old_recruiter@company1.com",  # Original approval recipient
+            "approval_expires_at": int(time.time()) + 86400,
+            "approval_consumed": False,
+        }
+    )
+
+    with patch("job_router.lambda_function._send_telegram") as mock_tg, \
+         patch("job_router.lambda_function._get_secrets") as mock_sec, \
+         patch("job_router.lambda_function.lambda_client") as mock_lambda:
+        mock_sec.return_value = {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "99999"}
+        mock_tg.return_value = True
+        event = _make_telegram_event("confirm send 1")
+        mod.lambda_handler(event, MockContext())
+
+        mock_lambda.invoke.assert_not_called()
+        msg = mock_tg.call_args[0][2]
+        assert "Recipient email (new_recruiter@company1.com) changed since draft was approved" in msg
+
+
+@mock_aws
+def test_router_deduplicates_telegram_update_id():
+    """Duplicate Telegram webhook deliveries for the same update_id must be ignored idempotently."""
+    from unittest.mock import patch
+    import job_router.lambda_function as mod
+
+    dynamo = boto3.resource("dynamodb", region_name="us-east-1")
+    table = _create_router_test_table(dynamo)
+    mod.table = table
+
+    event_payload = {
+        "update_id": 987654321,
+        "message": {
+            "text": "status",
+            "chat": {"id": 99999},
+            "from": {"first_name": "Alex"},
+        },
+    }
+    event = {"body": json.dumps(event_payload)}
+
+    with patch("job_router.lambda_function._send_telegram") as mock_tg, \
+         patch("job_router.lambda_function._get_secrets") as mock_sec:
+        mock_sec.return_value = {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "99999"}
+        mock_tg.return_value = True
+
+        # First delivery — processed
+        resp1 = mod.lambda_handler(event, MockContext())
+        assert resp1["statusCode"] == 200
+        assert mock_tg.call_count == 1
+
+        # Second delivery (duplicate update_id) — dropped
+        resp2 = mod.lambda_handler(event, MockContext())
+        assert resp2["statusCode"] == 200
+        assert resp2["body"] == "Duplicate update ignored"
+        assert mock_tg.call_count == 1  # Not called again
+
+
 
