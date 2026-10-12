@@ -3,138 +3,63 @@
 ## Production AI Job Intelligence Platform — Event-Driven AWS + Bedrock + HITL Architecture
 
 ```mermaid
-%%{init: {
-  "theme": "base",
-  "themeVariables": {
-    "fontFamily": "Inter, Arial, sans-serif",
-    "fontSize": "14px",
-    "lineColor": "#64748B",
-    "primaryTextColor": "#0F172A"
-  },
-  "flowchart": {
-    "curve": "basis",
-    "nodeSpacing": 32,
-    "rankSpacing": 48
-  }
-}}%%
-
-flowchart TB
-
-    %% =========================
-    %% INGESTION
-    %% =========================
-    subgraph S["01 · LIVE INGESTION"]
-        direction LR
-        HN["Hacker News<br/><small>Who is Hiring · Freshness Rules</small>"]
-        ATS["ATS Boards<br/><small>Greenhouse · Lever · Ashby</small>"]
-        CSE["Google CSE<br/><small>Targeted Job Discovery</small>"]
+graph TD
+    subgraph "Data Sources"
+        HN["Hacker News API"]
+        ATS["ATS Boards (Greenhouse, Lever, Ashby)"]
+        GCSE["Google CSE API"]
+        JS["JSearch API"]
     end
 
-    %% =========================
-    %% LAYER 1
-    %% =========================
-    subgraph L1["02 · INGEST + DEDUPLICATE"]
-        direction LR
-        ING["job-ingestor<br/><small>AWS Lambda</small>"]
-        RAW_Q["job-raw-queue<br/><small>SQS + DLQ</small>"]
-        DEDUP["job-deduplicator<br/><small>SHA-256 · Versioning</small>"]
-        DDB[("DynamoDB<br/><small>Job State + Scores</small>")]
+    subgraph "Layer 1: Ingestion"
+        ING["job-ingestor Lambda"]
+        HN --> ING
+        ATS --> ING
+        GCSE --> ING
+        JS --> ING
+        ING --> SQS_RAW["SQS: job-raw-queue"]
+        SQS_RAW_DLQ["DLQ: job-raw-queue-dlq"]
+        SQS_RAW -.-> SQS_RAW_DLQ
     end
 
-    %% =========================
-    %% LAYER 2
-    %% =========================
-    subgraph L2["03 · FILTER + RERANK"]
-        direction LR
-        FILT_Q["job-filtered-queue<br/><small>SQS + DLQ</small>"]
-        PROC["job-processor<br/><small>Deterministic Guardrails</small>"]
-        RERANK["Cohere Rerank<br/><small>Bedrock · Top Candidate Pruning</small>"]
-        S3_MEM[("S3 Candidate Profile<br/><small>Resume + Evidence Context</small>")]
+    subgraph "Layer 2: Deduplication"
+        SQS_RAW --> DEDUP["job-deduplicator Lambda"]
+        DEDUP --> DB["DynamoDB: Jobsearch"]
+        DEDUP --> SQS_FILT["SQS: job-filtered-queue"]
+        SQS_FILT_DLQ["DLQ: job-filtered-queue-dlq"]
+        SQS_FILT -.-> SQS_FILT_DLQ
     end
 
-    %% =========================
-    %% LAYER 3
-    %% =========================
-    subgraph L3["04 · LLM EVALUATION"]
-        direction LR
-        BEDROCK["Claude 3.5 Sonnet<br/><small>Bedrock Structured Evaluation</small>"]
-        FEEDBACK["Decision Memory<br/><small>Positive + Negative Examples</small>"]
-        SNS["Approval Topic<br/><small>Amazon SNS</small>"]
+    subgraph "Layer 3: Scoring"
+        SQS_FILT --> PROC["job-processor Lambda"]
+        PROC --> BEDROCK["AWS Bedrock: Claude"]
+        PROC --> HUNTER["Hunter.io API"]
+        PROC --> DB
+        PROC --> SNS["SNS: jobsearch-approvals"]
     end
 
-    %% =========================
-    %% LAYER 4
-    %% =========================
-    subgraph L4["05 · HUMAN-IN-THE-LOOP CONTROL"]
-        direction LR
-        APIGW["API Gateway<br/><small>Telegram Webhook</small>"]
-        ROUTER["job-router<br/><small>State Machine · Atomic Claims</small>"]
-        TG(("Telegram<br/><small>Review · Why · Draft · Apply · Feedback</small>"))
+    subgraph "Layer 4: Control Plane"
+        USER["User"] <--> TG["Telegram"]
+        TG <--> APIGW["API Gateway"]
+        APIGW <--> ROUTER["job-router Lambda"]
+        SNS --> ROUTER
+        ROUTER --> DB
+        ROUTER --> ING
     end
 
-    %% =========================
-    %% LAYER 5
-    %% =========================
-    subgraph L5["06 · GUARDED OUTREACH"]
-        direction LR
-        SENDER["job-sender<br/><small>Outreach Generation</small>"]
-        AIRGAP{"Dual Approval Gate<br/><small>Both Flags Required</small>"}
-        SMTP["Email Delivery<br/><small>Gmail / Amazon SES</small>"]
+    subgraph "Layer 5: Outreach"
+        ROUTER --> SENDER["job-sender Lambda"]
+        SENDER --> BEDROCK
+        SENDER --> DB
+        SENDER -.-> GMAIL["Gmail SMTP"]
     end
 
-    %% =========================
-    %% MAIN FLOW
-    %% =========================
-    HN --> ING
-    ATS --> ING
-    CSE --> ING
+    subgraph "Monitoring"
+        CW["CloudWatch Alarms"]
+        ING & DEDUP & PROC & ROUTER & SENDER --> CW
+    end
 
-    ING --> RAW_Q
-    RAW_Q --> DEDUP
-    DEDUP --> FILT_Q
-    DEDUP <--> DDB
-
-    FILT_Q --> PROC
-    PROC <--> RERANK
-    S3_MEM -. candidate context .-> RERANK
-
-    PROC <--> BEDROCK
-    FEEDBACK -. prior decisions .-> BEDROCK
-    PROC --> DDB
-    PROC -->|High Fit| SNS
-
-    SNS --> ROUTER
-    TG <--> APIGW
-    APIGW <--> ROUTER
-    ROUTER <--> DDB
-
-    ROUTER -->|Approved| SENDER
-    SENDER <--> BEDROCK
-    SENDER --> AIRGAP
-
-    AIRGAP -->|Both approved| SMTP
-    AIRGAP -. preview only .-> TG
-
-    %% =========================
-    %% COMPONENT STYLES
-    %% =========================
-    classDef source fill:#F8FAFC,stroke:#64748B,stroke-width:1.5px,color:#0F172A;
-    classDef compute fill:#FFF7ED,stroke:#F97316,stroke-width:1.7px,color:#7C2D12;
-    classDef queue fill:#EFF6FF,stroke:#3B82F6,stroke-width:1.7px,color:#1E3A8A;
-    classDef data fill:#ECFDF5,stroke:#10B981,stroke-width:1.7px,color:#064E3B;
-    classDef ai fill:#F5F3FF,stroke:#8B5CF6,stroke-width:1.8px,color:#4C1D95;
-    classDef control fill:#ECFEFF,stroke:#0891B2,stroke-width:1.8px,color:#164E63;
-    classDef safety fill:#FEF2F2,stroke:#EF4444,stroke-width:2px,color:#7F1D1D;
-    classDef external fill:#F8FAFC,stroke:#475569,stroke-width:1.5px,color:#0F172A;
-
-    class HN,ATS,CSE source;
-    class ING,DEDUP,PROC,ROUTER,SENDER compute;
-    class RAW_Q,FILT_Q,SNS queue;
-    class DDB,S3_MEM,FEEDBACK data;
-    class RERANK,BEDROCK ai;
-    class APIGW,TG control;
-    class AIRGAP safety;
-    class SMTP external;
+    style GMAIL stroke-dasharray: 5 5
 ```
 
 ## Message Flow

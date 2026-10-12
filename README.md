@@ -30,138 +30,62 @@ Modern job search tools are broken: scrapers dump thousands of unverified listin
 ## 📐 Production AI Job Intelligence Platform — Event-Driven AWS + Bedrock + HITL Architecture
 
 ```mermaid
-%%{init: {
-  "theme": "base",
-  "themeVariables": {
-    "fontFamily": "Inter, Arial, sans-serif",
-    "fontSize": "14px",
-    "lineColor": "#64748B",
-    "primaryTextColor": "#0F172A"
-  },
-  "flowchart": {
-    "curve": "basis",
-    "nodeSpacing": 32,
-    "rankSpacing": 48
-  }
-}}%%
-
-flowchart TB
-
-    %% =========================
-    %% INGESTION
-    %% =========================
-    subgraph S["01 · LIVE INGESTION"]
-        direction LR
-        HN["Hacker News<br/><small>Who is Hiring · Freshness Rules</small>"]
-        ATS["ATS Boards<br/><small>Greenhouse · Lever · Ashby</small>"]
-        CSE["Google CSE<br/><small>Targeted Job Discovery</small>"]
+flowchart TD
+    subgraph S["Live Ingestion Surfaces"]
+        HN["Hacker News ('Who is Hiring')<br/>3-Day Freshness Limit · Obfuscated Email Extraction"]
+        ATS["Direct ATS Boards<br/>Greenhouse · Lever · Ashby (SSRF Guarded)"]
+        CSE["Google Custom Search Engine<br/>Targeted ATS Board Discovery"]
     end
 
-    %% =========================
-    %% LAYER 1
-    %% =========================
-    subgraph L1["02 · INGEST + DEDUPLICATE"]
-        direction LR
-        ING["job-ingestor<br/><small>AWS Lambda</small>"]
-        RAW_Q["job-raw-queue<br/><small>SQS + DLQ</small>"]
-        DEDUP["job-deduplicator<br/><small>SHA-256 · Versioning</small>"]
-        DDB[("DynamoDB<br/><small>Job State + Scores</small>")]
+    subgraph L1["Layer 1: Deterministic Pre-Filtering (0ms, $0)"]
+        ING["job-ingestor Lambda<br/>EventBridge Cron or 'search jobs'"]
+        RAW_Q["SQS: job-raw-queue<br/>DLQ: job-raw-queue-dlq"]
+        DEDUP["job-deduplicator Lambda<br/>SHA-256 Normalization & Evaluation Versioning"]
+        DDB[("Amazon DynamoDB<br/>Partition Key: job_id · GSI: status-score-index")]
     end
 
-    %% =========================
-    %% LAYER 2
-    %% =========================
-    subgraph L2["03 · FILTER + RERANK"]
-        direction LR
-        FILT_Q["job-filtered-queue<br/><small>SQS + DLQ</small>"]
-        PROC["job-processor<br/><small>Deterministic Guardrails</small>"]
-        RERANK["Cohere Rerank<br/><small>Bedrock · Top Candidate Pruning</small>"]
-        S3_MEM[("S3 Candidate Profile<br/><small>Resume + Evidence Context</small>")]
+    subgraph L2["Layer 2: Serverless Cross-Encoder Reranking"]
+        FILT_Q["SQS: job-filtered-queue<br/>DLQ: job-filtered-queue-dlq"]
+        RERANK["Bedrock Cohere Rerank<br/>cohere.rerank-v3-5:0 (~150ms)"]
+        S3_MEM[("Amazon S3 Memory<br/>Candidate Knowledge Graph & Resume Context")]
     end
 
-    %% =========================
-    %% LAYER 3
-    %% =========================
-    subgraph L3["04 · LLM EVALUATION"]
-        direction LR
-        BEDROCK["Claude 3.5 Sonnet<br/><small>Bedrock Structured Evaluation</small>"]
-        FEEDBACK["Decision Memory<br/><small>Positive + Negative Examples</small>"]
-        SNS["Approval Topic<br/><small>Amazon SNS</small>"]
+    subgraph L3["Layer 3: Deep Context Grounding"]
+        PROC["job-processor Lambda<br/>Deterministic Guardrails (Caps: Stale=55, NoURL=40)"]
+        BEDROCK["Amazon Bedrock<br/>Claude 3.5 Sonnet (submit_evaluation Tool)"]
+        FEEDBACK_MEM["Dynamic In-Context Memory<br/>Top-5 Positive & Negative Telegram Exemplars"]
+        SNS["Amazon SNS<br/>jobsearch-approvals Topic"]
     end
 
-    %% =========================
-    %% LAYER 4
-    %% =========================
-    subgraph L4["05 · HUMAN-IN-THE-LOOP CONTROL"]
-        direction LR
-        APIGW["API Gateway<br/><small>Telegram Webhook</small>"]
-        ROUTER["job-router<br/><small>State Machine · Atomic Claims</small>"]
-        TG(("Telegram<br/><small>Review · Why · Draft · Apply · Feedback</small>"))
+    subgraph L4["Layer 4: Control Plane & Dynamic Feedback"]
+        APIGW["API Gateway HTTP API v2<br/>POST /prod/telegram Webhook"]
+        ROUTER["job-router Lambda<br/>State Machine & Atomic DynamoDB Claims"]
+        TG(("Telegram Control Plane<br/>'list' · 'next' · 'why' · 'draft' · 'apply'<br/>'interested' · 'meh' · 'not interested'"))
     end
 
-    %% =========================
-    %% LAYER 5
-    %% =========================
-    subgraph L5["06 · GUARDED OUTREACH"]
-        direction LR
-        SENDER["job-sender<br/><small>Outreach Generation</small>"]
-        AIRGAP{"Dual Approval Gate<br/><small>Both Flags Required</small>"}
-        SMTP["Email Delivery<br/><small>Gmail / Amazon SES</small>"]
+    subgraph L5["Layer 5: Dual-Key Guarded Outreach"]
+        SENDER["job-sender Lambda<br/>Precision Outreach Synthesis (<130 words)"]
+        AIRGAP{"Dual-Key Airgap Gate<br/>ALLOW_TELEGRAM_EMAIL_SEND<br/>ALLOW_REAL_EMAIL_SEND"}
+        SMTP["Gmail / AWS SES SMTP<br/>(Only when both keys = true)"]
     end
 
-    %% =========================
-    %% MAIN FLOW
-    %% =========================
-    HN --> ING
-    ATS --> ING
-    CSE --> ING
-
-    ING --> RAW_Q
-    RAW_Q --> DEDUP
-    DEDUP --> FILT_Q
-    DEDUP <--> DDB
-
-    FILT_Q --> PROC
-    PROC <--> RERANK
-    S3_MEM -. candidate context .-> RERANK
-
-    PROC <--> BEDROCK
-    FEEDBACK -. prior decisions .-> BEDROCK
-    PROC --> DDB
-    PROC -->|High Fit| SNS
-
-    SNS --> ROUTER
-    TG <--> APIGW
-    APIGW <--> ROUTER
-    ROUTER <--> DDB
-
-    ROUTER -->|Approved| SENDER
-    SENDER <--> BEDROCK
+    HN & ATS & CSE -->|Fetch & Clean| ING -->|Batch Push| RAW_Q
+    RAW_Q --> DEDUP <-->|Hash Check & Requeue| DDB
+    DEDUP -->|Unique Postings| FILT_Q --> PROC
+    PROC <-->|Top 15% Pruning| RERANK
+    RERANK -.->|Resume Vectors| S3_MEM
+    PROC <-->|Structured Scoring| BEDROCK
+    FEEDBACK_MEM -.->|Inject Past Decisions| BEDROCK
+    PROC -->|Update Score & State| DDB
+    PROC -->|Score >= 80%| SNS --> ROUTER
+    TG <-->|Webhook Commands| APIGW <--> ROUTER
+    ROUTER <-->|Query Pending & Atomic Claim| DDB
+    ROUTER -->|Feedback Persistence| DDB
+    ROUTER -->|Trigger Outreach Preview/Send| SENDER
+    SENDER <-->|Single-Project Pitch| BEDROCK
     SENDER --> AIRGAP
-
-    AIRGAP -->|Both approved| SMTP
-    AIRGAP -. preview only .-> TG
-
-    %% =========================
-    %% COMPONENT STYLES
-    %% =========================
-    classDef source fill:#F8FAFC,stroke:#64748B,stroke-width:1.5px,color:#0F172A;
-    classDef compute fill:#FFF7ED,stroke:#F97316,stroke-width:1.7px,color:#7C2D12;
-    classDef queue fill:#EFF6FF,stroke:#3B82F6,stroke-width:1.7px,color:#1E3A8A;
-    classDef data fill:#ECFDF5,stroke:#10B981,stroke-width:1.7px,color:#064E3B;
-    classDef ai fill:#F5F3FF,stroke:#8B5CF6,stroke-width:1.8px,color:#4C1D95;
-    classDef control fill:#ECFEFF,stroke:#0891B2,stroke-width:1.8px,color:#164E63;
-    classDef safety fill:#FEF2F2,stroke:#EF4444,stroke-width:2px,color:#7F1D1D;
-    classDef external fill:#F8FAFC,stroke:#475569,stroke-width:1.5px,color:#0F172A;
-
-    class HN,ATS,CSE source;
-    class ING,DEDUP,PROC,ROUTER,SENDER compute;
-    class RAW_Q,FILT_Q,SNS queue;
-    class DDB,S3_MEM,FEEDBACK data;
-    class RERANK,BEDROCK ai;
-    class APIGW,TG control;
-    class AIRGAP safety;
-    class SMTP external;
+    AIRGAP -->|Approved Send| SMTP
+    AIRGAP -->|Preview Draft Default| TG
 ```
 
 ---
