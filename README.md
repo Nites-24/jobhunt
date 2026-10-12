@@ -31,63 +31,71 @@ Modern job search tools are broken: scrapers dump thousands of unverified listin
 
 ```mermaid
 flowchart TD
-    subgraph S["Live Ingestion Surfaces"]
-        HN["Hacker News ('Who is Hiring')<br/>3-Day Freshness Limit · Obfuscated Email Extraction"]
-        ATS["Direct ATS Boards<br/>Greenhouse · Lever · Ashby (SSRF Guarded)"]
-        CSE["Google Custom Search Engine<br/>Optional · Deprecating Jan 1, 2027"]
+    subgraph S["01 · Live Ingestion Surfaces"]
+        HN["Hacker News Who is Hiring<br/>3-Day Freshness Limit · Obfuscated Email Extraction"]
+        ATS["Direct ATS Boards<br/>Greenhouse · Lever · Ashby · SSRF Guarded"]
+        CSE["Google Custom Search Engine<br/>Optional · Deprecating Jan 1 2027"]
     end
 
-    subgraph L1["Layer 1: Deterministic Pre-Filtering (No model inference calls)"]
-        ING["job-ingestor Lambda<br/>EventBridge Cron or 'search jobs'"]
+    subgraph L1["02 · Layer 1: Deterministic Pre-Filtering · No model inference calls"]
+        ING["job-ingestor Lambda<br/>EventBridge Cron or search jobs"]
         RAW_Q["SQS: job-raw-queue<br/>DLQ: job-raw-queue-dlq"]
-        DEDUP["job-deduplicator Lambda<br/>SHA-256 Normalization & Evaluation Versioning"]
-        DDB[("Amazon DynamoDB<br/>Base PK: job_id · GSI: status-score-index (Eventual)")]
+        DEDUP["job-deduplicator Lambda<br/>SHA-256 Normalization and Evaluation Versioning"]
+        DDB[("Amazon DynamoDB<br/>Base PK: job_id · GSI: status-score-index Eventual")]
     end
 
-    subgraph L2["Layer 2: Serverless Cross-Encoder Reranking"]
+    subgraph L2["03 · Layer 2: Serverless Cross-Encoder Reranking"]
         FILT_Q["SQS: job-filtered-queue<br/>DLQ: job-filtered-queue-dlq"]
-        RERANK["Bedrock Cohere Rerank<br/>cohere.rerank-v3-5:0 (Query + Inline Docs)"]
-        S3_MEM[("Amazon S3 Memory<br/>Candidate Context & Resume")]
+        RERANK["Bedrock Cohere Rerank<br/>cohere.rerank-v3-5:0 · Query + Inline Docs"]
+        S3_MEM[("Amazon S3 Memory<br/>Candidate Context and Resume")]
     end
 
-    subgraph L3["Layer 3: Deep Context Grounding"]
-        PROC["job-processor Lambda<br/>Deterministic Guardrails (Caps: Stale=55, NoURL=40)"]
-        BEDROCK["Amazon Bedrock<br/>Claude 3.5 Sonnet (submit_evaluation Tool)"]
-        FEEDBACK_MEM["Dynamic In-Context Memory<br/>Top-5 Positive & Negative Telegram Exemplars"]
+    subgraph L3["04 · Layer 3: Deep Context Grounding"]
+        PROC["job-processor Lambda<br/>Deterministic Guardrails · Caps: Stale=55, NoURL=40"]
+        BEDROCK["Amazon Bedrock<br/>Claude 3.5 Sonnet · submit_evaluation Tool"]
+        FEEDBACK_MEM["Dynamic In-Context Memory<br/>Top-5 Positive and Negative Telegram Exemplars"]
         SNS["Amazon SNS<br/>jobsearch-approvals Topic"]
     end
 
-    subgraph L4["Layer 4: Telegram Control Plane & Event Loop"]
+    subgraph L4["05 · Layer 4: Telegram Control Plane and Event Loop"]
         APIGW["API Gateway HTTP API v2<br/>POST /prod/telegram Webhook"]
-        ROUTER["job-router Lambda<br/>State Machine & Atomic DynamoDB Claims"]
-        TG_CLIENT(("Candidate Telegram Client"))
+        ROUTER["job-router Lambda<br/>State Machine and Atomic DynamoDB Claims"]
+        TG_CLIENT["Candidate Telegram Client"]
         TG_OUT["Telegram Bot API<br/>sendMessage / editMessageText"]
     end
 
-    subgraph L5["Layer 5: Dual-Key Guarded Outreach & Approval Binding"]
-        SENDER["job-sender Lambda<br/>Precision Outreach Synthesis (<130 words)"]
-        APPROVAL_GATE{"Dual-Key Config & Approval Gate<br/>1. Config Flags Enabled<br/>2. SHA-256 Hash Bound to Exact Draft<br/>3. Atomic DynamoDB Approval Consumption"}
-        SMTP["Gmail / AWS SES SMTP<br/>Ambiguous Outcomes -> MANUAL_RECONCILIATION"]
+    subgraph L5["06 · Layer 5: Dual-Key Guarded Outreach and Approval Binding"]
+        SENDER["job-sender Lambda<br/>Precision Outreach Synthesis · Under 130 words"]
+        APPROVAL_GATE{"Dual-Key Config and Approval Gate<br/>1. Config Flags Enabled<br/>2. SHA-256 Hash Bound to Exact Draft<br/>3. Atomic DynamoDB Approval Consumption"}
+        SMTP["Gmail / AWS SES SMTP<br/>Ambiguous Outcomes to MANUAL_RECONCILIATION"]
     end
 
-    HN & ATS & CSE -->|Fetch & Clean| ING -->|Batch Push| RAW_Q
-    RAW_Q --> DEDUP <-->|Hash Check & Requeue| DDB
-    DEDUP -->|Unique Postings| FILT_Q --> PROC
+    HN -->|Fetch and Clean| ING
+    ATS -->|Fetch and Clean| ING
+    CSE -->|Fetch and Clean| ING
+    ING -->|Batch Push| RAW_Q
+    RAW_Q --> DEDUP
+    DEDUP <-->|Hash Check and Requeue| DDB
+    DEDUP -->|Unique Postings| FILT_Q
+    FILT_Q --> PROC
     PROC -.->|Load Candidate Profile| S3_MEM
-    PROC <-->|Text Query + Inline Job Docs| RERANK
+    PROC <-->|Text Query and Inline Docs| RERANK
     PROC <-->|Structured Scoring with XML Boundary Guard| BEDROCK
-    FEEDBACK_MEM -.->|Inject Past Decisions & Separate Salary/Location| BEDROCK
-    PROC -->|Update Score & State| DDB
-    PROC -->|Fit Score >= 80/100| SNS --> ROUTER
-    TG_CLIENT -->|Incoming Webhook (update_id deduplicated)| APIGW --> ROUTER
-    ROUTER -->|Outgoing Async Bot API Calls| TG_OUT --> TG_CLIENT
-    ROUTER <-->|Query Base Table & Atomic Claim| DDB
+    FEEDBACK_MEM -.->|Inject Past Decisions| BEDROCK
+    PROC -->|Update Score and State| DDB
+    PROC -->|Fit Score 80+ / 100| SNS
+    SNS --> ROUTER
+    TG_CLIENT -->|Incoming Webhook · Deduped update_id| APIGW
+    APIGW --> ROUTER
+    ROUTER -->|Outgoing Async Bot API Calls| TG_OUT
+    TG_OUT --> TG_CLIENT
+    ROUTER <-->|Query Base Table and Atomic Claim| DDB
     ROUTER -->|Feedback Persistence| DDB
     ROUTER -->|Trigger Outreach Preview/Send with Approval Token| SENDER
     SENDER <-->|Single-Project Pitch| BEDROCK
     SENDER --> APPROVAL_GATE
-    APPROVAL_GATE -->|Approved Send + Atomic Token Consume| SMTP
-    APPROVAL_GATE -->|Preview Draft Default & Token Issue| TG_OUT
+    APPROVAL_GATE -->|Approved Send and Atomic Token Consume| SMTP
+    APPROVAL_GATE -->|Preview Draft Default and Token Issue| TG_OUT
 ```
 
 ---

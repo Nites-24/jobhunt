@@ -27,61 +27,67 @@ The pipeline is implemented as an event-driven, decoupled microservices mesh on 
 
 ```mermaid
 flowchart TD
-    subgraph INGESTION["1. Ingestion Layer"]
-        CRON["Amazon EventBridge<br/>Cron (Every 4 Hours)"]
-        TG_IN["Telegram Webhook<br/>'search jobs'"]
+    subgraph INGESTION["01 · Ingestion Layer"]
+        CRON["Amazon EventBridge<br/>Cron · Every 4 Hours"]
+        TG_IN["Telegram Webhook<br/>search jobs"]
         ING["job-ingestor Lambda<br/>• Hacker News Comment Parser<br/>• Greenhouse / Lever / Ashby Adapters<br/>• SSRF Guarded Fetcher"]
-        Q_RAW["SQS: job-raw-queue<br/>(Visibility: 300s, MaxReceive: 3)"]
+        Q_RAW["SQS: job-raw-queue<br/>Visibility: 300s, MaxReceive: 3"]
         DLQ_RAW["SQS: job-raw-queue-dlq"]
     end
 
-    subgraph DEDUP["2. Deduplication & State Layer"]
+    subgraph DEDUP["02 · Deduplication & State Layer"]
         DEDUP_FN["job-deduplicator Lambda<br/>• SHA-256 Title+Company+URL Hash<br/>• Evaluation Profile Versioning<br/>• DynamoDB Base Table Conditional Writes"]
-        DDB[("Amazon DynamoDB<br/>Table: Jobsearch<br/>PK: job_id (HASH)<br/>GSI: status-score-index (Eventual)")]
-        Q_FILT["SQS: job-filtered-queue<br/>(Visibility: 300s, MaxReceive: 3)"]
+        DDB[("Amazon DynamoDB<br/>Table: Jobsearch<br/>PK: job_id · GSI: status-score-index Eventual")]
+        Q_FILT["SQS: job-filtered-queue<br/>Visibility: 300s, MaxReceive: 3"]
         DLQ_FILT["SQS: job-filtered-queue-dlq"]
     end
 
-    subgraph EVAL["3. Three-Layer Evaluation Funnel"]
+    subgraph EVAL["03 · Three-Layer Evaluation Funnel"]
         PROC["job-processor Lambda<br/>• Layer 1: Deterministic Pre-Filters<br/>• Layer 2: Bedrock Cohere Rerank<br/>• Layer 3: Claude 3.5 Forced Tool Calling"]
-        BEDROCK_RERANK["Amazon Bedrock<br/>cohere.rerank-v3-5:0 (Query + Docs)"]
+        BEDROCK_RERANK["Amazon Bedrock<br/>cohere.rerank-v3-5:0 · Query + Docs"]
         BEDROCK_CLAUDE["Amazon Bedrock<br/>anthropic.claude-3-5-sonnet"]
-        S3_MEM[("Amazon S3<br/>Candidate Context & Resume")]
+        S3_MEM[("Amazon S3<br/>Candidate Context and Resume")]
         SNS["Amazon SNS Topic<br/>jobsearch-approvals"]
     end
 
-    subgraph CONTROL["4. Telegram Control Plane & Event Loop"]
+    subgraph CONTROL["04 · Telegram Control Plane & Event Loop"]
         APIGW["API Gateway HTTP API v2<br/>POST /prod/telegram"]
         ROUTER["job-router Lambda<br/>• Command State Machine<br/>• Base Table Atomic Claims<br/>• Feedback Capture Loop"]
-        TG_CLIENT(("Candidate Telegram Client"))
+        TG_CLIENT["Candidate Telegram Client"]
         TG_API["Telegram Bot API<br/>sendMessage / editMessageText"]
     end
 
-    subgraph OUTREACH["5. Dual-Key Outreach Engine & Approval Binding"]
+    subgraph OUTREACH["05 · Dual-Key Outreach Engine & Approval Binding"]
         SENDER["job-sender Lambda<br/>• Bedrock Single-Project Outreach<br/>• Vector PDF Resume Attachment<br/>• Guarded SMTP Dispatch"]
-        APPROVAL_GATE{"Dual-Key Config & Approval Gate<br/>1. Config Flags Enabled<br/>2. SHA-256 Hash Bound to Exact Draft<br/>3. Atomic DynamoDB Approval Consumption"}
-        SMTP["Gmail / Amazon SES SMTP<br/>Ambiguous Drops -> MANUAL_RECONCILIATION"]
+        APPROVAL_GATE{"Dual-Key Config and Approval Gate<br/>1. Config Flags Enabled<br/>2. SHA-256 Hash Bound to Exact Draft<br/>3. Atomic DynamoDB Approval Consumption"}
+        SMTP["Gmail / Amazon SES SMTP<br/>Ambiguous Drops to MANUAL_RECONCILIATION"]
     end
 
-    CRON & TG_IN --> ING --> Q_RAW
+    CRON --> ING
+    TG_IN --> ING
+    ING --> Q_RAW
     Q_RAW -. Failure .-> DLQ_RAW
-    Q_RAW --> DEDUP_FN <--> DDB
+    Q_RAW --> DEDUP_FN
+    DEDUP_FN <--> DDB
     DEDUP_FN --> Q_FILT
     Q_FILT -. Failure .-> DLQ_FILT
     Q_FILT --> PROC
     PROC -.->|Load Candidate Context| S3_MEM
-    PROC <-->|Text Query + Inline Job Docs| BEDROCK_RERANK
+    PROC <-->|Text Query and Inline Docs| BEDROCK_RERANK
     PROC <-->|Structured Eval with XML Boundary Guard| BEDROCK_CLAUDE
-    PROC -->|Update Score & State| DDB
-    PROC -->|Fit Score >= 80/100| SNS --> ROUTER
-    TG_CLIENT -->|Incoming Webhook (update_id deduplicated)| APIGW --> ROUTER
-    ROUTER -->|Outgoing Async Bot API Calls| TG_API --> TG_CLIENT
-    ROUTER <-->|Query Base Table & Atomic Claim| DDB
+    PROC -->|Update Score and State| DDB
+    PROC -->|Fit Score 80+ / 100| SNS
+    SNS --> ROUTER
+    TG_CLIENT -->|Incoming Webhook · Deduped update_id| APIGW
+    APIGW --> ROUTER
+    ROUTER -->|Outgoing Async Bot API Calls| TG_API
+    TG_API --> TG_CLIENT
+    ROUTER <-->|Query Base Table and Atomic Claim| DDB
     ROUTER -->|Trigger Draft/Send with Approval Token| SENDER
     SENDER <--> BEDROCK_CLAUDE
     SENDER --> APPROVAL_GATE
-    APPROVAL_GATE -->|Approved Send + Atomic Token Consume| SMTP
-    APPROVAL_GATE -->|Preview Draft Default & Token Issue| TG_API
+    APPROVAL_GATE -->|Approved Send and Atomic Token Consume| SMTP
+    APPROVAL_GATE -->|Preview Draft Default and Token Issue| TG_API
 ```
 
 ---
