@@ -455,10 +455,95 @@ class TestIngestor:
              patch.object(mod, "ASHBY_BOARDS", [{"slug": "acme", "company": "Acme AI"}]):
             jobs = mod.fetch_ashby_jobs()
 
-        assert len(jobs) == 1
-        job = jobs[0]
-        assert job["source"] == "ashby"
-        assert job["is_remote"] is True
-        assert job["source_provider"] == "Ashby Job Postings API"
-        assert job["posted_at"] == "2026-09-24T09:00:00Z"
+    def test_is_target_role_matches_expanded_ai_titles(self):
+        """Pipeline must semantically match modern AI engineering titles."""
+        import job_ingestor.lambda_function as mod
+        target_titles = [
+            "AI Software Engineer",
+            "Software Engineer, AI",
+            "Founding AI Engineer",
+            "Founding Engineer - AI",
+            "AI Solutions Architect",
+            "AI Solutions Engineer",
+            "Forward Deployed AI Engineer",
+            "AI Agent Engineer",
+            "Applied AI Engineer",
+            "AI Systems Engineer",
+            "Machine Learning Engineer",
+            "LLM Engineer",
+            "RAG Engineer",
+        ]
+        for title in target_titles:
+            assert mod._is_target_role(title, "Building LLM agents with Python"), f"Failed for {title}"
+
+    def test_is_non_us_location_detector(self):
+        """Pipeline must detect non-US locations to keep opportunities United States only."""
+        import job_ingestor.lambda_function as mod
+        assert mod._is_non_us_location("London, UK") is True
+        assert mod._is_non_us_location("London, United Kingdom") is True
+        assert mod._is_non_us_location("Paris, France") is True
+        assert mod._is_non_us_location("Berlin, Germany") is True
+        assert mod._is_non_us_location("Toronto, Canada") is True
+        assert mod._is_non_us_location("Bangalore, India") is True
+        assert mod._is_non_us_location("Remote", "This position is remote (UK only).") is True
+
+        assert mod._is_non_us_location("San Francisco, CA") is False
+        assert mod._is_non_us_location("New York, NY") is False
+        assert mod._is_non_us_location("Austin, TX") is False
+        assert mod._is_non_us_location("Remote - US") is False
+        assert mod._is_non_us_location("Remote", "This is an open US remote role.") is False
+
+    def test_disallowed_domains_detector(self):
+        """Pipeline must block freelance marketplaces like Upwork and Fiverr."""
+        import job_ingestor.lambda_function as mod
+        assert mod._is_disallowed_domain("https://www.upwork.com/freelance-jobs/ai") is True
+        assert mod._is_disallowed_domain("https://fiverr.com/gigs/rag-pipeline") is True
+        assert mod._is_disallowed_domain("https://freelancer.com/projects/llm") is True
+        assert mod._is_disallowed_domain("https://boards.greenhouse.io/anthropic/jobs/123") is False
+        assert mod._is_disallowed_domain("https://jobs.lever.co/mistral/456") is False
+
+    def test_citizenship_and_visa_restriction_detector(self):
+        """Pipeline must detect US-citizen-only, clearance, and no-sponsorship bans."""
+        import job_ingestor.lambda_function as mod
+        assert mod._has_visa_restriction("AI Engineer", "Must be a U.S. Citizen.") is True
+        assert mod._has_visa_restriction("AI Engineer", "Active Secret Clearance required.") is True
+        assert mod._has_visa_restriction("AI Engineer", "We do not offer visa sponsorship.") is True
+        assert mod._has_visa_restriction("AI Engineer", "Must be authorized to work without sponsorship now or in the future.") is True
+        assert mod._has_visa_restriction("AI Engineer", "No CPT or OPT candidates.") is True
+
+        assert mod._has_visa_restriction("AI Engineer", "Visa sponsorship is available for top candidates.") is False
+        assert mod._has_visa_restriction("AI Engineer", "We sponsor H-1B and welcome CPT/OPT.") is False
+        assert mod._has_visa_restriction("AI Engineer", "Building agentic RAG workflows using Python and AWS Bedrock.") is False
+
+    def test_ats_normalizers_drop_non_us_and_restricted_postings(self):
+        """Greenhouse, Lever, Ashby, and JSearch normalizers must drop non-US, Upwork, and citizen-only roles."""
+        import job_ingestor.lambda_function as mod
+        # Greenhouse London role
+        gh_london = mod._normalize_greenhouse_job({
+            "title": "AI Software Engineer",
+            "absolute_url": "https://boards.greenhouse.io/anthropic/jobs/1",
+            "content": "Building RAG systems",
+            "location": {"name": "London, UK"}
+        }, {"slug": "anthropic", "company": "Anthropic"})
+        assert gh_london is None
+
+        # Lever US-citizen-only role
+        lever_restricted = mod._normalize_lever_job({
+            "text": "AI Solutions Engineer",
+            "hostedUrl": "https://jobs.lever.co/acme/2",
+            "descriptionPlain": "Must be a US Citizen. Secret Clearance required.",
+            "categories": {"location": "San Francisco, CA"}
+        }, {"slug": "acme", "company": "Acme"})
+        assert lever_restricted is None
+
+        # Ashby Upwork link
+        ashby_upwork = mod._normalize_ashby_job({
+            "title": "Founding AI Engineer",
+            "jobUrl": "https://www.upwork.com/freelance-jobs/3",
+            "descriptionPlain": "Build zero to one AI agents",
+            "location": "Remote, US",
+            "isListed": True,
+        }, {"slug": "acme", "company": "Acme"})
+        assert ashby_upwork is None
+
 

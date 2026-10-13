@@ -79,8 +79,8 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 DEFAULT_GOOGLE_CSE_QUERY = (
-    '("AI Engineer" OR "LLM Engineer" OR "RAG Engineer" OR "Machine Learning Engineer") '
-    '(site:greenhouse.io OR site:lever.co OR site:ashbyhq.com OR site:workdayjobs.com OR site:jobs.ashbyhq.com)'
+    '("AI Engineer" OR "AI Software Engineer" OR "Founding AI Engineer" OR "AI Solutions Architect" OR "Forward Deployed AI Engineer" OR "AI Agent Engineer" OR "LLM Engineer" OR "RAG Engineer" OR "Machine Learning Engineer") '
+    '(site:greenhouse.io OR site:lever.co OR site:ashbyhq.com OR site:workdayjobs.com OR site:jobs.ashbyhq.com OR site:kforce.com OR site:randstadusa.com OR site:michaelpage.com OR site:mykelly.com OR site:teksystems.com OR site:insightglobal.com)'
 )
 HN_SOURCE_QUERY = "hn_who_is_hiring"
 
@@ -183,7 +183,12 @@ JSEARCH_QUERIES = [
     q.strip()
     for q in os.environ.get(
         "JSEARCH_QUERIES",
-        "AI Engineer,LLM Engineer,RAG Engineer,Machine Learning Engineer",
+        (
+            "AI Engineer,AI Software Engineer,Founding AI Engineer,Applied AI Engineer,"
+            "LLM Engineer,RAG Engineer,AI Agent Engineer,AI Solutions Engineer,"
+            "AI Solutions Architect,Forward Deployed AI Engineer,Machine Learning Engineer,"
+            "AI Systems Engineer,AI Engineer contract,Machine Learning Engineer contract"
+        ),
     ).split(",")
     if q.strip()
 ]
@@ -212,13 +217,14 @@ ASHBY_BOARDS = _load_board_registry("ASHBY_BOARDS", DEFAULT_ASHBY_BOARDS)
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 URL_REGEX = re.compile(r'https?://[^\s"<>]+')
 ROLE_PATTERN = re.compile(
-    r"\b((senior|staff|principal|lead|founding)\s+)?"
-    r"(ai|ml|llm|rag|nlp|machine learning|data|research)\s+"
-    r"(engineer|scientist|researcher|architect|developer)\b",
+    r"\b((senior|staff|principal|lead|founding|applied|forward deployed)\s+)?"
+    r"(ai|ml|llm|rag|nlp|machine learning|data|research|agentic|generative ai|genai)\s+"
+    r"(engineer|scientist|researcher|architect|developer|solutions engineer|systems engineer)\b|"
+    r"\b(software engineer|solutions architect|founding engineer|systems engineer)\s*[,-]?\s*(ai|ml|llm|agentic)\b",
     re.IGNORECASE,
 )
 ROLE_WORD_PATTERN = re.compile(
-    r"\b(engineer|scientist|researcher|architect|developer|applied scientist)\b",
+    r"\b(engineer|scientist|researcher|architect|developer|applied scientist|solutions architect|solutions engineer)\b",
     re.IGNORECASE,
 )
 LOCATION_PATTERN = re.compile(
@@ -232,6 +238,105 @@ NON_ROLE_SEGMENTS = re.compile(
     r"\b(yc\s*[swf]?\d{2}|seed|series\s+[abc]|venture|funded|salary|visa|h1b)\b",
     re.IGNORECASE,
 )
+
+DISALLOWED_JOB_DOMAINS = {
+    "upwork.com",
+    "fiverr.com",
+    "freelancer.com",
+    "toptal.com",
+    "guru.com",
+    "peopleperhour.com",
+}
+
+NON_US_LOCATION_PATTERN = re.compile(
+    r"\b("
+    # UK & Ireland
+    r"london|united kingdom|\buk\b|england|scotland|wales|ireland|dublin|manchester|birmingham|edinburgh|glasgow|bristol|cambridge|oxford|"
+    # Europe
+    r"europe|emea|germany|berlin|munich|frankfurt|hamburg|france|paris|netherlands|amsterdam|rotterdam|"
+    r"switzerland|zurich|geneva|sweden|stockholm|norway|oslo|denmark|copenhagen|finland|helsinki|"
+    r"spain|madrid|barcelona|italy|rome|milan|poland|warsaw|krakow|austria|vienna|belgium|brussels|"
+    r"portugal|lisbon|czech|prague|estonia|tallinn|romania|bucharest|"
+    # Canada & Americas (non-US)
+    r"canada|toronto|vancouver|montreal|ottawa|calgary|edmonton|ontario|quebec|british columbia|alberta|"
+    r"mexico|brazil|sao paulo|argentina|buenos aires|colombia|chile|latam|"
+    # Asia-Pacific & Middle East
+    r"india|bangalore|bengaluru|hyderabad|pune|mumbai|delhi|gurgaon|noida|chennai|"
+    r"singapore|australia|sydney|melbourne|brisbane|new zealand|auckland|"
+    r"japan|tokyo|china|beijing|shanghai|hong kong|taiwan|taipei|korea|seoul|"
+    r"israel|tel aviv|uae|dubai|abu dhabi|apac"
+    r")\b",
+    re.IGNORECASE,
+)
+
+US_LOCATION_MARKERS = re.compile(
+    r"\b("
+    r"united states|usa|\bus\b|u\.s\.|u\.s\.a\.|"
+    r"alabama|alaska|arizona|arkansas|california|colorado|connecticut|delaware|florida|georgia|"
+    r"hawaii|idaho|illinois|indiana|iowa|kansas|kentucky|louisiana|maine|maryland|massachusetts|"
+    r"michigan|minnesota|mississippi|missouri|montana|nebraska|nevada|new hampshire|new jersey|"
+    r"new mexico|new york|north carolina|north dakota|ohio|oklahoma|oregon|pennsylvania|rhode island|"
+    r"south carolina|south dakota|tennessee|texas|utah|vermont|virginia|washington|west virginia|wisconsin|wyoming|"
+    r"san francisco|sf|bay area|silicon valley|los angeles|la|san diego|san jose|sunnyvale|mountain view|"
+    r"palo alto|seattle|austin|nyc|new york city|boston|chicago|denver|dallas|houston|atlanta"
+    r")\b",
+    re.IGNORECASE,
+)
+
+CITIZENSHIP_OR_NO_SPONSORSHIP_PATTERN = re.compile(
+    r"\b("
+    # US Citizenship only / Green card only
+    r"u\.?s\.?\s*citizens?(?:hip)?\s*(?:only|required|is required)|"
+    r"must be a(?:n)?\s+u\.?s\.?\s*citizen|"
+    r"must be a(?:n)?\s+u\.?s\.?\s*person|"
+    r"u\.?s\.?\s*citizens?\s*(?:or|and)\s*(?:permanent\s*residents?|green\s*card)|"
+    r"green\s*card\s*or\s*u\.?s\.?\s*citizen|"
+    r"itar\b[^\.\n]*(?:citizen|u\.?s\.?\s*person|permanent\s*resident)|"
+    # Security Clearance
+    r"(?:active\s+)?(?:secret|top\s+secret|ts/?sci|dod)\s+(?:security\s+)?clearance\b|"
+    r"security\s+clearance\s+(?:is\s+)?(?:required|mandatory|needed)\b|"
+    # No visa sponsorship / cannot sponsor
+    r"(?:no|not\s*able\s*to|cannot|can\s*not|will\s*not|unable\s*to|do\s+not|does\s+not)\s+"
+    r"(?:offer\s+|provide\s+|support\s+|have\s+)?(?:visa\s+)?(?:sponsorship|sponsor\b)|"
+    r"sponsorship\s*(?:is\s*)?(?:not|unavailable|never)\s*(?:available|offered|provided)|"
+    r"without\s+(?:the\s+need\s+for\s+|employer\s+|visa\s+)?sponsorship|"
+    r"without\s+sponsorship\s+now\s+or\s+in\s+the\s+future|"
+    r"no\s*(?:cpt|opt|stem\s*opt)\b|"
+    r"not\s*(?:accepting|eligible\s*for)\s*(?:cpt|opt)\b"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_disallowed_domain(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = (parsed.hostname or "").lower()
+        return any(host == d or host.endswith("." + d) for d in DISALLOWED_JOB_DOMAINS)
+    except Exception:
+        return False
+
+
+def _is_non_us_location(location: str, description: str = "") -> bool:
+    loc = (location or "").strip().lower()
+    non_us_match = NON_US_LOCATION_PATTERN.search(loc)
+    us_match = US_LOCATION_MARKERS.search(loc)
+    if non_us_match and not us_match:
+        return True
+    if "remote" in loc or not loc:
+        desc_restriction = re.search(r"\b(remote\s*(?:\([^)]+\)|in\s+[a-zA-Z]+|-\s*[a-zA-Z]+))", description[:500], re.IGNORECASE)
+        if desc_restriction:
+            match_txt = desc_restriction.group(0)
+            if NON_US_LOCATION_PATTERN.search(match_txt) and not US_LOCATION_MARKERS.search(match_txt):
+                return True
+    return False
+
+
+def _has_visa_restriction(title: str, description: str = "") -> bool:
+    text = f"{title} {description}"
+    return bool(CITIZENSHIP_OR_NO_SPONSORSHIP_PATTERN.search(text))
 
 _cached_jsearch_key = None
 _cached_secret_payloads: dict[str, dict] = {}
@@ -664,6 +769,14 @@ def _parse_hn_comment(comment: dict) -> dict | None:
         location = _clean_location_segment(location, company)
 
     urls = _extract_urls(raw_text)
+    if any(_is_disallowed_domain(u) for u in urls):
+        urls = [u for u in urls if not _is_disallowed_domain(u)]
+
+    if _has_visa_restriction(title, clean_text):
+        return None
+    if _is_non_us_location(location, clean_text):
+        return None
+
     kid_id = comment.get("id")
     source_url = f"https://news.ycombinator.com/item?id={kid_id}"
     author = str(comment.get("by") or "").strip()
@@ -809,9 +922,13 @@ def _normalize_greenhouse_job(raw: dict, board: dict[str, str]) -> dict | None:
     title = str(raw.get("title") or "").strip()
     source_url = str(raw.get("absolute_url") or "").strip()
     description = str(raw.get("content") or "").strip()
-    if not title or not source_url or not _is_target_role(title, description):
+    if not title or not source_url or _is_disallowed_domain(source_url) or not _is_target_role(title, description):
+        return None
+    if _has_visa_restriction(title, description):
         return None
     location = str((raw.get("location") or {}).get("name") or "Not specified").strip()
+    if _is_non_us_location(location, description):
+        return None
     work_mode, work_mode_source = _extract_work_mode(
         ("location", location), ("description", description)
     )
@@ -881,10 +998,14 @@ def _normalize_lever_job(raw: dict, site: dict[str, str]) -> dict | None:
     title = str(raw.get("text") or "").strip()
     source_url = str(raw.get("hostedUrl") or raw.get("applyUrl") or "").strip()
     description = str(raw.get("descriptionPlain") or raw.get("description") or "").strip()
-    if not title or not source_url or not _is_target_role(title, description):
+    if not title or not source_url or _is_disallowed_domain(source_url) or not _is_target_role(title, description):
+        return None
+    if _has_visa_restriction(title, description):
         return None
     categories = raw.get("categories") or {}
     location = str(categories.get("location") or ", ".join(categories.get("allLocations") or []) or "Not specified")
+    if _is_non_us_location(location, description):
+        return None
     work_mode = str(raw.get("workplaceType") or "").strip().lower()
     if work_mode in {"on-site", "onsite"}:
         work_mode = "onsite"
@@ -968,9 +1089,13 @@ def _normalize_ashby_job(raw: dict, board: dict[str, str]) -> dict | None:
     title = str(raw.get("title") or "").strip()
     source_url = str(raw.get("jobUrl") or raw.get("applyUrl") or "").strip()
     description = str(raw.get("descriptionPlain") or "").strip()
-    if raw.get("isListed") is False or not title or not source_url or not _is_target_role(title, description):
+    if raw.get("isListed") is False or not title or not source_url or _is_disallowed_domain(source_url) or not _is_target_role(title, description):
+        return None
+    if _has_visa_restriction(title, description):
         return None
     location = str(raw.get("location") or "Not specified").strip()
+    if _is_non_us_location(location, description):
+        return None
     work_mode = str(raw.get("workplaceType") or "").strip().lower()
     if work_mode in {"on-site", "onsite"}:
         work_mode = "onsite"
@@ -1061,13 +1186,22 @@ def _normalize_jsearch_job(raw: dict, query: str) -> dict | None:
     title = (raw.get("job_title") or "").strip()
     company = (raw.get("employer_name") or "").strip()
     apply_link = (raw.get("job_apply_link") or raw.get("job_google_link") or "").strip()
-    if not title or not company or not apply_link:
+    if not title or not company or not apply_link or _is_disallowed_domain(apply_link):
+        return None
+
+    country = (raw.get("job_country") or "").strip()
+    if country and country.upper() not in {"US", "USA"}:
+        return None
+
+    description = str(raw.get("job_description") or "")
+    if _has_visa_restriction(title, description):
         return None
 
     city = (raw.get("job_city") or "").strip()
     state = (raw.get("job_state") or "").strip()
-    country = (raw.get("job_country") or "").strip()
     location = ", ".join([part for part in (city, state or country) if part]) or ("Remote" if raw.get("job_is_remote") else "Not specified")
+    if _is_non_us_location(location, description):
+        return None
     work_mode = "remote" if raw.get("job_is_remote") else ""
     work_mode_source = "job_is_remote" if work_mode else ""
     if not work_mode:

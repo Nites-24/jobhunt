@@ -24,7 +24,12 @@ ingestor_env = ingestor_conf.get("Environment", {}).get("Variables", {})
 new_ingestor_env = {k: v for k, v in ingestor_env.items() if not k.startswith("ADZUNA_")}
 new_ingestor_env["GOOGLE_CSE_ENABLED"] = "false"
 new_ingestor_env["INGESTION_SOURCES"] = "hackernews,greenhouse,lever,ashby,jsearch"
-new_ingestor_env["JSEARCH_QUERIES"] = "AI Engineer,LLM Engineer,RAG Engineer,Machine Learning Engineer"
+new_ingestor_env["JSEARCH_QUERIES"] = (
+    "AI Engineer,AI Software Engineer,Founding AI Engineer,Applied AI Engineer,"
+    "LLM Engineer,RAG Engineer,AI Agent Engineer,AI Solutions Engineer,"
+    "AI Solutions Architect,Forward Deployed AI Engineer,Machine Learning Engineer,"
+    "AI Systems Engineer,AI Engineer contract,Machine Learning Engineer contract"
+)
 
 client.update_function_configuration(
     FunctionName="job-ingestor",

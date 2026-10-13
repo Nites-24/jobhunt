@@ -244,8 +244,8 @@ class TestProcessor:
         missing_source = {
             **SAMPLE_JOB,
             "job_id": "missing-source-low-threshold",
-            "location": "Remote, Brazil",
-            "is_remote": True,
+            "location": "San Francisco, CA",
+            "is_remote": False,
             "url": "",
             "apply_url": "",
             "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -261,6 +261,71 @@ class TestProcessor:
         assert "missing verifiable source link" in item["match_reason"]
         mock_bedrock.converse.assert_not_called()
         mod.SCORE_THRESHOLD = 80
+
+    @patch("job_processor.lambda_function.bedrock")
+    def test_non_us_location_rejected_before_llm(self, mock_bedrock):
+        """Jobs in London, UK, Europe, or other non-US locations must be rejected."""
+        mod, table, s3, sns = self._setup_infra()
+        for loc in ["London, UK", "Toronto, Canada", "Berlin, Germany", "Bangalore, India"]:
+            job = {
+                **SAMPLE_JOB,
+                "job_id": f"non-us-{loc.split(',')[0].lower()}",
+                "location": loc,
+                "url": "https://boards.greenhouse.io/anthropic/jobs/123",
+                "apply_url": "https://boards.greenhouse.io/anthropic/jobs/123",
+                "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+            table.put_item(Item={"job_id": job["job_id"], "status": "NEW"})
+            result = mod.lambda_handler(make_sqs_event([job]), MockContext())
+            assert result["batchItemFailures"] == []
+            item = table.get_item(Key={"job_id": job["job_id"]})["Item"]
+            assert item["status"] == "REJECTED"
+            assert int(item["match_score"]) == 0
+            assert "non-US or international location" in item["match_reason"]
+        mock_bedrock.converse.assert_not_called()
+
+    @patch("job_processor.lambda_function.bedrock")
+    def test_disallowed_freelance_domain_rejected_before_llm(self, mock_bedrock):
+        """Upwork, Fiverr, and other contract mill links must be rejected immediately."""
+        mod, table, s3, sns = self._setup_infra()
+        upwork_job = {
+            **SAMPLE_JOB,
+            "job_id": "upwork-job-1",
+            "location": "Remote",
+            "url": "https://www.upwork.com/freelance-jobs/ai-engineer",
+            "apply_url": "https://www.upwork.com/freelance-jobs/ai-engineer",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        table.put_item(Item={"job_id": "upwork-job-1", "status": "NEW"})
+        result = mod.lambda_handler(make_sqs_event([upwork_job]), MockContext())
+        assert result["batchItemFailures"] == []
+        item = table.get_item(Key={"job_id": "upwork-job-1"})["Item"]
+        assert item["status"] == "REJECTED"
+        assert int(item["match_score"]) == 0
+        assert "disallowed freelance/gig domain" in item["match_reason"]
+        mock_bedrock.converse.assert_not_called()
+
+    @patch("job_processor.lambda_function.bedrock")
+    def test_citizenship_and_no_sponsorship_rejected_before_llm(self, mock_bedrock):
+        """Roles requiring US Citizenship, Clearance, or stating no visa sponsorship must be rejected."""
+        mod, table, s3, sns = self._setup_infra()
+        restricted_job = {
+            **SAMPLE_JOB,
+            "job_id": "restricted-visa-job-1",
+            "location": "Austin, TX",
+            "description": "AI Engineer needed for defense systems. Must be a U.S. Citizen. Active Secret Clearance required.",
+            "url": "https://boards.greenhouse.io/anthropic/jobs/123",
+            "apply_url": "https://boards.greenhouse.io/anthropic/jobs/123",
+            "posted_at": (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        table.put_item(Item={"job_id": "restricted-visa-job-1", "status": "NEW"})
+        result = mod.lambda_handler(make_sqs_event([restricted_job]), MockContext())
+        assert result["batchItemFailures"] == []
+        item = table.get_item(Key={"job_id": "restricted-visa-job-1"})["Item"]
+        assert item["status"] == "REJECTED"
+        assert int(item["match_score"]) == 0
+        assert "requires US citizenship, clearance, or forbids visa sponsorship / CPT" in item["match_reason"]
+        mock_bedrock.converse.assert_not_called()
 
     @patch("job_processor.lambda_function.bedrock")
     def test_missing_source_link_is_rejected_before_llm(self, mock_bedrock):
