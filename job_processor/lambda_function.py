@@ -504,6 +504,7 @@ SYSTEM_INSTRUCTION = (
     "If the job EXPLICITLY requires US Citizenship, Green Card only, Security Clearance / ITAR, or states 'no visa sponsorship / cannot sponsor / no CPT', "
     "the score MUST be 0 and the job MUST be rejected.\n"
     "- CONTRACT & FULL-TIME: The candidate is open to both full-time permanent roles and professional contract / contract-to-hire / W2 staffing placements (e.g. via Kforce, Randstad, Michael Page, TekSystems, etc.). Both full-time and professional contract roles should score well.\n"
+    "- REALISTIC INTERVIEW CONVERSION & COMPANY DIVERSITY: Do NOT penalize or downvote companies for not being famous mega-cap tech brands (like OpenAI or Anthropic). Mid-market enterprises, growing Series A-D startups, healthcare/fintech AI teams, and staffing agency client placements often offer significantly higher interview conversion rates for an applied AI engineer with real production RAG, fine-tuning, and inference experience. Treat practical, applied AI opportunities at mid-tier companies as top-tier matches whenever technical skill overlap is high.\n"
     "- NO GIG / FREELANCE PLATFORMS: Postings originating from or redirecting to freelance contract mills (Upwork, Fiverr, Freelancer) MUST be rejected.\n"
     "- RELEVANCE: If the job is purely Frontend (React), Backend (Java/Kotlin), "
     "or generic Full Stack without heavy AI/LLM/ML focus, the score MUST be below 50.\n"

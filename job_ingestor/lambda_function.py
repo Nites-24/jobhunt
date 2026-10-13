@@ -106,6 +106,16 @@ DEFAULT_GREENHOUSE_BOARDS = [
     {"slug": "groq", "company": "Groq"},
     {"slug": "huggingface", "company": "Hugging Face"},
     {"slug": "harvey", "company": "Harvey AI"},
+    {"slug": "tempus", "company": "Tempus AI"},
+    {"slug": "plaid", "company": "Plaid"},
+    {"slug": "affirm", "company": "Affirm"},
+    {"slug": "samsara", "company": "Samsara"},
+    {"slug": "toast", "company": "Toast"},
+    {"slug": "moveworks", "company": "Moveworks"},
+    {"slug": "abnormalsecurity", "company": "Abnormal Security"},
+    {"slug": "snorklai", "company": "Snorkel AI"},
+    {"slug": "hyperscience", "company": "Hyperscience"},
+    {"slug": "instacart", "company": "Instacart"},
 ]
 
 DEFAULT_LEVER_SITES = [
