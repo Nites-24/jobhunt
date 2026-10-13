@@ -1076,8 +1076,16 @@ def _normalize_jsearch_job(raw: dict, query: str) -> dict | None:
             ("employment_type", raw.get("job_employment_type") or ""),
         )
 
+    raw_jid = str(raw.get("job_id") or "").strip()
+    if ":" in raw_jid:
+        # JSearch appends an ephemeral request signature after ':'
+        raw_jid = raw_jid.split(":", 1)[0].strip()
+    if not raw_jid:
+        raw_jid = uuid.uuid5(uuid.NAMESPACE_URL, apply_link).hex
+    stable_job_id = f"jsearch_{raw_jid}" if not raw_jid.startswith("jsearch_") else raw_jid
+
     return {
-        "job_id": raw.get("job_id") or f"jsearch_{uuid.uuid4().hex}",
+        "job_id": stable_job_id,
         "title": title[:120],
         "company": company[:120],
         "location": location[:120],

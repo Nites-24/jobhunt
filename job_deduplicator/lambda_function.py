@@ -47,6 +47,7 @@ import boto3
 import hashlib
 import logging
 import os
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -145,11 +146,41 @@ def _summarize_source_query_outcomes(results: list[dict]) -> list[dict]:
     return [summary[key] for key in sorted(summary)]
 
 
+def _normalize_url_for_hash(url: str) -> str:
+    """Strip tracking query parameters and trailing slashes for deterministic hashing."""
+    if not url or not isinstance(url, str):
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+        if not parsed.scheme or not parsed.netloc:
+            return url.strip().lower().rstrip("/")
+        tracking_prefixes = (
+            "utm_", "ref", "trk", "tracking", "position", "pagenum",
+            "source", "refid", "trackingid", "gh_src"
+        )
+        q_pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=False)
+        filtered_q = [
+            (k, v) for k, v in q_pairs
+            if not any(k.lower().startswith(p) for p in tracking_prefixes)
+        ]
+        new_query = urllib.parse.urlencode(sorted(filtered_q))
+        path = parsed.path.rstrip("/")
+        return urllib.parse.urlunparse(
+            (parsed.scheme.lower(), parsed.netloc.lower(), path, "", new_query, "")
+        )
+    except Exception:
+        return url.strip().lower().rstrip("/")
+
+
 def _compute_job_hash(job: dict) -> str:
     """Generate a deterministic hash for deduplication based on core job identity."""
-    raw = "|".join(
-        str(job.get(field, "")).strip().lower() for field in HASH_FIELDS
-    )
+    values = []
+    for field in HASH_FIELDS:
+        val = str(job.get(field, "")).strip().lower()
+        if field in ("url", "apply_url"):
+            val = _normalize_url_for_hash(val)
+        values.append(val)
+    raw = "|".join(values)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
@@ -252,9 +283,11 @@ def _process_record(record: dict) -> dict:
         # Don't retry malformed messages — they'll never succeed
         return {"status": "invalid", "messageId": message_id}
 
-    # Use the job's own ID if it has one, otherwise compute hash
-    original_id = raw_job.get("job_id", "")
-    job_id = _compute_job_hash(raw_job) if not original_id else original_id
+    # Use the job's own ID if it has one (stripped of ephemeral request signatures), otherwise compute hash
+    original_id = str(raw_job.get("job_id", "")).strip()
+    if ":" in original_id:
+        original_id = original_id.split(":", 1)[0].strip()
+    job_id = original_id if original_id else _compute_job_hash(raw_job)
 
     # Check for duplicate. If it exists but is still unscored, re-forward it.
     existing_job = _get_existing_job(job_id)

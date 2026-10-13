@@ -251,3 +251,97 @@ class TestDeduplicator:
             {"source": "google_cse", "query": "LLM Engineer", "new": 1, "requeued": 0, "duplicate": 0, "failed": 0},
             {"source": "jsearch", "query": "-", "new": 1, "requeued": 0, "duplicate": 0, "failed": 0},
         ]
+
+    def test_jsearch_ephemeral_signature_deduplication(self):
+        """Jobs with identical base ID but different ephemeral request signatures must deduplicate."""
+        mod, table, sqs, queue_url = self._setup_infra()
+
+        job_run1 = {
+            **SAMPLE_JOB,
+            "job_id": "SUVzVk03RU1RQVRfenlKSUFBQUFBQT09:EswBCowBQUppVDR0Smc1WDh0aUtlREVXLVhMbVJGWXkxBUXpCcGI0SHZDUGdr",
+            "title": "AI Software Engineer",
+            "company": "Zof AI",
+            "url": "https://zof.ai/careers/san-francisco/ai-software-engineer",
+        }
+        job_run2 = {
+            **SAMPLE_JOB,
+            "job_id": "SUVzVk03RU1RQVRfenlKSUFBQUFBQT09:EswBCowBQUppVDR0Uek5tVkhSTFVsYzVTa055Ukd0V00wWXpWR3h4V1ZOeVZX",
+            "title": "AI Software Engineer",
+            "company": "Zof AI",
+            "url": "https://zof.ai/careers/san-francisco/ai-software-engineer",
+        }
+
+        # Run 1: new job inserted
+        r1 = mod.lambda_handler(make_sqs_event([job_run1]), MockContext())
+        assert r1["batchItemFailures"] == []
+        assert table.scan()["Count"] == 1
+
+        # Simulate scoring the job so status is PENDING_APPROVAL
+        table.update_item(
+            Key={"job_id": "SUVzVk03RU1RQVRfenlKSUFBQUFBQT09"},
+            UpdateExpression="SET #s = :s, evaluated_at = :e, evaluation_profile_version = :v",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":s": "PENDING_APPROVAL",
+                ":e": 1791838917,
+                ":v": mod.CURRENT_EVAL_PROFILE_VERSION,
+            },
+        )
+        sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
+
+        # Run 2: same job fetched 1 hour later with new ephemeral token
+        r2 = mod.lambda_handler(make_sqs_event([job_run2]), MockContext())
+        assert r2["batchItemFailures"] == []
+        assert table.scan()["Count"] == 1  # No duplicate row inserted!
+
+        # Should NOT forward to filtered queue
+        msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
+        assert len(msgs.get("Messages", [])) == 0
+
+    def test_url_tracking_params_normalized_deduplication(self):
+        """Jobs with differing tracking query params should produce identical hashes."""
+        mod, table, sqs, queue_url = self._setup_infra()
+
+        job_link1 = {
+            "title": "AI Engineer - Core",
+            "company": "Hilbert",
+            "url": "https://www.linkedin.com/jobs/view/ai-engineer-core-4448457333/?refId=abcdef&trackingId=12345",
+            "apply_url": "https://www.linkedin.com/jobs/view/ai-engineer-core-4448457333/?refId=abcdef&trackingId=12345",
+            "source": "jsearch",
+        }
+        job_link2 = {
+            "title": "AI Engineer - Core",
+            "company": "Hilbert",
+            "url": "https://www.linkedin.com/jobs/view/ai-engineer-core-4448457333/?utm_source=feed&ref=jobhunt",
+            "apply_url": "https://www.linkedin.com/jobs/view/ai-engineer-core-4448457333/?utm_source=feed&ref=jobhunt",
+            "source": "jsearch",
+        }
+
+        hash1 = mod._compute_job_hash(job_link1)
+        hash2 = mod._compute_job_hash(job_link2)
+        assert hash1 == hash2
+
+        # Ingestion test
+        r1 = mod.lambda_handler(make_sqs_event([job_link1]), MockContext())
+        assert r1["batchItemFailures"] == []
+        assert table.scan()["Count"] == 1
+
+        # Simulate scoring
+        table.update_item(
+            Key={"job_id": hash1},
+            UpdateExpression="SET #s = :s, evaluated_at = :e, evaluation_profile_version = :v",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":s": "PENDING_APPROVAL",
+                ":e": 1791838917,
+                ":v": mod.CURRENT_EVAL_PROFILE_VERSION,
+            },
+        )
+        sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
+
+        # Run 2: link with different tracking params
+        r2 = mod.lambda_handler(make_sqs_event([job_link2]), MockContext())
+        assert r2["batchItemFailures"] == []
+        assert table.scan()["Count"] == 1
+        msgs = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=10)
+        assert len(msgs.get("Messages", [])) == 0
