@@ -109,7 +109,7 @@ SECRET_ID = os.environ.get("SECRETS_NAME", "jobserch_gmail")
 TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "Jobsearch")
 BUCKET = os.environ.get("RESUME_BUCKET", "job-search-pipeline-memory")
 RESUME_KEY = os.environ.get("RESUME_KEY", "data/resume/resume.pdf")
-MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 ALLOW_REAL_EMAIL_SEND = os.environ.get("ALLOW_REAL_EMAIL_SEND", "false").strip().lower() == "true"
 REQUIRE_DRAFT_APPROVAL = os.environ.get("REQUIRE_DRAFT_APPROVAL", "false").strip().lower() == "true"
 BEDROCK_THROTTLE_RETRIES = int(os.environ.get("BEDROCK_THROTTLE_RETRIES", "2"))

@@ -89,7 +89,7 @@ s3 = boto3.client("s3", region_name=AWS_REGION, config=aws_config)
 # ---------------------------------------------------------------------------
 # 3. CONFIGURATION — All from environment variables with sane defaults
 # ---------------------------------------------------------------------------
-MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 RERANKER_MODEL_ID = os.environ.get("BEDROCK_RERANKER_MODEL_ID", "cohere.rerank-v3-5:0")
 ENABLE_BEDROCK_RERANKER = os.environ.get("ENABLE_BEDROCK_RERANKER", "false").strip().lower() == "true"
 TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "Jobsearch")
@@ -234,6 +234,8 @@ def _is_non_us_location(location: str, description: str = "") -> bool:
 
 
 def _has_visa_restriction(title: str, description: str = "") -> bool:
+    if os.environ.get("FILTER_CITIZENSHIP_RESTRICTIONS", "false").strip().lower() not in ("true", "1", "yes"):
+        return False
     text = f"{title} {description}"
     return bool(CITIZENSHIP_OR_NO_SPONSORSHIP_PATTERN.search(text))
 
@@ -547,8 +549,8 @@ SYSTEM_INSTRUCTION = (
     "reduce the final score by 30 points. We prioritize FRESH leads.\n"
     "- LOCATION (UNITED STATES ONLY): The candidate is based in the US and looking for US opportunities ONLY (remote within the US, hybrid, or onsite anywhere in the US). "
     "Any opportunity located in London, the UK, Europe, Canada, India, or outside the United States MUST be scored 0 and rejected.\n"
-    "- WORK AUTHORIZATION & VISA: The candidate requires visa sponsorship / CPT. "
-    "If the job EXPLICITLY requires US Citizenship, Green Card only, Security Clearance / ITAR, or states 'no visa sponsorship / cannot sponsor / no CPT', "
+    "- WORK AUTHORIZATION: If the posting explicitly requires citizenship, "
+    "clearance, or prohibits candidate work authorization requirements specified in configuration, "
     "the score MUST be 0 and the job MUST be rejected.\n"
     "- CONTRACT & FULL-TIME: The candidate is open to both full-time permanent roles and professional contract / contract-to-hire / W2 staffing placements (e.g. via Kforce, Randstad, Michael Page, TekSystems, etc.). Both full-time and professional contract roles should score well.\n"
     "- REALISTIC INTERVIEW CONVERSION & COMPANY DIVERSITY: Do NOT penalize or downvote companies for not being famous mega-cap tech brands (like OpenAI or Anthropic). Mid-market enterprises, growing Series A-D startups, healthcare/fintech AI teams, and staffing agency client placements often offer significantly higher interview conversion rates for an applied AI engineer with real production RAG, fine-tuning, and inference experience. Treat practical, applied AI opportunities at mid-tier companies as top-tier matches whenever technical skill overlap is high.\n"
@@ -885,7 +887,7 @@ def _apply_deterministic_guardrails(
 
     title = str(job.get("title") or "")
     if _has_visa_restriction(title, description):
-        caps.append((0, "requires US citizenship, clearance, or forbids visa sponsorship / CPT"))
+        caps.append((0, "requires US citizenship, clearance, or restricts sponsorship"))
 
     if not caps:
         return score, reason
@@ -947,7 +949,7 @@ def _pre_llm_rejection(job: Dict[str, Any]) -> Optional[Tuple[int, str]]:
 
     title = str(job.get("title") or "")
     if _has_visa_restriction(title, description):
-        rejection_caps.append((0, "requires US citizenship, clearance, or forbids visa sponsorship / CPT"))
+        rejection_caps.append((0, "requires US citizenship, clearance, or restricts sponsorship"))
 
     if not rejection_caps:
         return None

@@ -60,6 +60,7 @@ def set_env_vars(monkeypatch):
         "FILTERED_QUEUE_URL": "https://sqs.us-east-1.amazonaws.com/123456789012/job-filtered-queue",
         # Processor
         "BEDROCK_MODEL_ID": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "FILTER_CITIZENSHIP_RESTRICTIONS": "true",
         "SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:123456789012:jobsearch-approvals",
         "S3_BUCKET_NAME": "job-search-pipeline-memory",
         "RESUME_KEY": "data/resume/resume.txt",

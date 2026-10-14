@@ -91,8 +91,6 @@ DEFAULT_GRAPH = {
     ],
     "preferences": [
         "United States only (US remote, hybrid, or onsite)",
-        "requires visa sponsorship / CPT friendly",
-        "no US citizenship or security clearance requirements",
         "open to full-time or contract roles (W2 contract or contract-to-hire)",
         "open to remote, hybrid, or onsite",
         "open to relocate",
@@ -154,8 +152,7 @@ PROJECT_PATTERNS = [
 
 PREFERENCE_PATTERNS = [
     ("United States only (US remote, hybrid, or onsite)", r"united states|usa|\bus\b"),
-    ("requires visa sponsorship / CPT friendly", r"visa|sponsorship|cpt|opt"),
-    ("no US citizenship or security clearance requirements", r"no clearance|no us citizen"),
+    ("open to visa sponsorship", r"visa|sponsorship"),
     ("open to full-time or contract roles (W2 contract or contract-to-hire)", r"contract|w2|c2c|contract-to-hire|full-time|permanent"),
     ("open to remote, hybrid, or onsite", r"remote|onsite|on-site|hybrid"),
     ("open to relocate", r"relocat"),

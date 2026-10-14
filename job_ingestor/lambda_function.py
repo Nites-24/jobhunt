@@ -345,6 +345,8 @@ def _is_non_us_location(location: str, description: str = "") -> bool:
 
 
 def _has_visa_restriction(title: str, description: str = "") -> bool:
+    if os.environ.get("FILTER_CITIZENSHIP_RESTRICTIONS", "false").strip().lower() not in ("true", "1", "yes"):
+        return False
     text = f"{title} {description}"
     return bool(CITIZENSHIP_OR_NO_SPONSORSHIP_PATTERN.search(text))
 

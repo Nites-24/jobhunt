@@ -325,7 +325,7 @@ class TestProcessor:
         item = table.get_item(Key={"job_id": "restricted-visa-job-1"})["Item"]
         assert item["status"] == "REJECTED"
         assert int(item["match_score"]) == 0
-        assert "requires US citizenship, clearance, or forbids visa sponsorship / CPT" in item["match_reason"]
+        assert "requires US citizenship, clearance, or restricts sponsorship" in item["match_reason"]
         mock_bedrock.converse.assert_not_called()
 
     @patch("job_processor.lambda_function.bedrock")

@@ -21,9 +21,9 @@ Modern job search tools are broken: scrapers dump thousands of unverified listin
 **JobHunt** inverts this paradigm. Rather than maximizing volume, it enforces an uncompromising quality filter:
 * **Fewer jobs**: 90%+ of noisy, stale, or generic postings are dropped deterministically before any LLM is invoked.
 * **Mathematically grounded**: Leads are cross-encoded using native **Amazon Bedrock Cohere Rerank** against verified candidate memory.
-* **Zero hallucinations**: Scored with **Claude 3.5 Sonnet** via forced tool-calling with traceable citations.
+* **Zero hallucinations**: Scored with **Claude 3.5 Sonnet / Claude Sonnet 4.5 / Claude 3 Haiku** via forced tool-calling with traceable citations.
 * **Dual-key human-in-the-loop**: Outreach requires two explicit authorization gates; the agent *never* emails autonomously.
-* **100% Zero-Trust & Identity-Agnostic**: Zero candidate PII or credentials in git; fully parameterized 12-factor runtime injection.
+* **100% Zero-Trust & Identity-Agnostic**: Zero candidate PII, visa details, or credentials in git; fully parameterized 12-factor runtime injection.
 
 ---
 
@@ -303,6 +303,49 @@ python tools/ops/eval_scoring.py
   Source Link Caps: 100% Passing
   Domain Fit Caps:  100% Passing
 ======================================================================
+```
+
+---
+
+## 🧠 Tiered Model Architecture & Cost Control
+
+JobHunt is 100% 12-factor configurable via the `BEDROCK_MODEL_ID` environment variable. Open-source developers can choose their cost-to-performance tier:
+
+| Tier | Model ID | Primary Use Case | Estimated Cost / 1M Input |
+| :--- | :--- | :--- | :--- |
+| **Tier 1 (Budget / Free Credits)** | `anthropic.claude-3-haiku-20240307-v1:0`<br/>`amazon.nova-lite-v1:0` | Rapid development, testing, student budgets, free tier | **$0.06 – $0.25** (~$0.50/mo) |
+| **Tier 2 (Balanced Reasoning)** | `anthropic.claude-3-5-haiku-20241022-v1:0` | Production standard, fast tool-calling, high precision | **$0.80** (~$2.50/mo) |
+| **Tier 3 (High-Conviction Frontier)** | `us.anthropic.claude-sonnet-4-5-20250929-v1:0` | Complex multi-source synthesis, nuanced evaluation | **$3.00** (~$8.00/mo) |
+
+The code defaults to low-cost **Tier 1 (`claude-3-haiku`)** out-of-the-box, ensuring community contributors never encounter surprise billing.
+
+---
+
+## 🛡️ 12-Factor Work Authorization & Location Filtering
+
+To protect candidate privacy and support diverse global developers, work authorization requirements are completely decoupled from source code:
+* **`FILTER_CITIZENSHIP_RESTRICTIONS` (`true` / `false`)**: When enabled, the deterministic pre-filter and scoring guardrails drop roles requiring citizenship, security clearances, or prohibiting sponsorship before model inference.
+* **`CANDIDATE_LOCATION`**: Configurable target geography (e.g. `open to remote, hybrid, or onsite`).
+* **Zero PII**: No visa types, personal locations, or candidate credentials ever enter git-tracked source code or commit logs.
+
+---
+
+## 🔄 Safe Remote Delivery & GitHub Synchronization Protocol
+
+Whenever code, configuration, or documentation changes are made, run the automated verification protocol before pushing to GitHub:
+
+```powershell
+# 1. Zero-Trust Security & Identity Auditor (0 leaks, 0 loops)
+python tools/ops/run_agents.py --security
+
+# 2. Automated Regression & Unit Test Suite (100% offline, $0 AWS spend)
+python -m pytest tests/ -q
+
+# 3. Multi-Agent System Health Verification
+python tools/ops/run_agents.py
+
+# 4. Atomic Git Push (Commit and push changes cleanly)
+git push origin main
 ```
 
 ---
