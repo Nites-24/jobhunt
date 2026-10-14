@@ -31,9 +31,11 @@ REGION = "us-east-1"
 TARGET_ENV = {
     "job-ingestor": {
         "HN_MAX_JOB_AGE_DAYS": "3",
+        "FILTER_CITIZENSHIP_RESTRICTIONS": "true",
     },
     "job-processor": {
         "BEDROCK_MODEL_ID": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "FILTER_CITIZENSHIP_RESTRICTIONS": "true",
         "SCORE_THRESHOLD": "80",
         "MAX_JOB_AGE_DAYS": "2",
         "STALE_SCORE_CAP": "55",
