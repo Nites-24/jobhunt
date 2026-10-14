@@ -1,6 +1,6 @@
 # Autonomous Job Search Pipeline: Sprint Report
-
-**To:** Project Lead / CEO
+ 
+**Audience:** Core Maintainers & Open-Source Contributors
 **From:** Lead AI Engineering Agent
 **Date:** May 12, 2026
 **Subject:** Pipeline Hardening & ATS Sourcing Architecture

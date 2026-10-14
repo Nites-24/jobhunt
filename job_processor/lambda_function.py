@@ -89,7 +89,7 @@ s3 = boto3.client("s3", region_name=AWS_REGION, config=aws_config)
 # ---------------------------------------------------------------------------
 # 3. CONFIGURATION — All from environment variables with sane defaults
 # ---------------------------------------------------------------------------
-MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-haiku-4-5-20251001-v1:0")
+MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 RERANKER_MODEL_ID = os.environ.get("BEDROCK_RERANKER_MODEL_ID", "cohere.rerank-v3-5:0")
 ENABLE_BEDROCK_RERANKER = os.environ.get("ENABLE_BEDROCK_RERANKER", "false").strip().lower() == "true"
 TABLE_NAME = os.environ.get("DYNAMODB_TABLE", "Jobsearch")
@@ -99,8 +99,18 @@ RESUME_KEY = os.environ.get("RESUME_KEY", "data/resume/resume.txt")
 SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "80"))
 DEFAULT_EVAL_PROFILE_VERSION = f"2026-05-13-th{SCORE_THRESHOLD}"
 JOB_EVAL_PROFILE_VERSION = os.environ.get("JOB_EVAL_PROFILE_VERSION", DEFAULT_EVAL_PROFILE_VERSION)
-MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "14"))
+MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "2"))
 HN_MAX_JOB_AGE_DAYS = int(os.environ.get("HN_MAX_JOB_AGE_DAYS", "3"))
+DEFAULT_SOURCE_FRESHNESS_DAYS = {
+    "linkedin": 2,
+    "randstad": 2,
+    "generic": 2,
+    "hackernews": 3,
+    "hn": 3,
+    "greenhouse": 3,
+    "lever": 3,
+    "ashby": 3,
+}
 STALE_SCORE_CAP = int(os.environ.get("STALE_SCORE_CAP", "55"))
 MISSING_DATE_SCORE_CAP = int(os.environ.get("MISSING_DATE_SCORE_CAP", "70"))
 LOW_AI_SIGNAL_SCORE_CAP = int(os.environ.get("LOW_AI_SIGNAL_SCORE_CAP", "50"))
@@ -413,8 +423,11 @@ FEEDBACK_CACHE_TTL_SECONDS = 300.0
 
 def _load_recent_feedback_context() -> str:
     """
-    Fetch recent Telegram feedback decisions from DynamoDB and format them into
-    in-context few-shot guidance for Bedrock. Cached across warm starts.
+    Fetch candidate preferences and episodic examples from DynamoDB.
+    Combines:
+      - Layer B: Persistent Structured Preference Profile (job_id="pref:candidate_profile")
+      - Layer C: Recent Episodic Negative/Positive Exemplars (max 3-5)
+    Cached across warm starts with TTL.
     """
     global _cached_feedback_context, _feedback_loaded_at
     now = time.time()
@@ -423,46 +436,80 @@ def _load_recent_feedback_context() -> str:
 
     try:
         from boto3.dynamodb.conditions import Attr
-        resp = table.scan(
-            FilterExpression=Attr("user_feedback").exists() & Attr("user_feedback_at").exists(),
-            Limit=30,
-        )
-        items = resp.get("Items", [])
-        if not items:
-            _cached_feedback_context = ""
-            _feedback_loaded_at = now
-            return ""
-
-        items.sort(key=lambda x: int(x.get("user_feedback_at") or 0), reverse=True)
-
-        likes = []
-        dislikes = []
-        for it in items:
-            fb = str(it.get("user_feedback") or "").strip().lower()
-            title = str(it.get("title") or "Unknown Role")
-            company = str(it.get("company") or "Unknown Company")
-            reason = str(it.get("user_feedback_reason") or "").strip()
-
-            if fb in ("interested", "applied") and len(likes) < 5:
-                entry = f"- {title} at {company}"
-                if reason:
-                    entry += f" (Note: {reason})"
-                likes.append(entry)
-            elif fb in ("not_interested", "meh") and len(dislikes) < 5:
-                entry = f"- {title} at {company}"
-                if reason:
-                    entry += f" (Reason rejected: '{reason}')"
-                dislikes.append(entry)
-
         parts = ["<candidate_recent_preferences>"]
-        if likes:
-            parts.append("  <recently_liked_roles>")
-            parts.extend([f"    {like_role}" for like_role in likes])
-            parts.append("  </recently_liked_roles>")
-        if dislikes:
-            parts.append("  <recently_rejected_roles_to_penalize>")
-            parts.extend([f"    {dislike_role}" for dislike_role in dislikes])
-            parts.append("  </recently_rejected_roles_to_penalize>")
+
+        # Layer B: Structured Preference Profile (fast single get_item)
+        try:
+            profile_item = table.get_item(Key={"job_id": "pref:candidate_profile"}).get("Item")
+            if profile_item and profile_item.get("preferences"):
+                rules = []
+                for feat, data in profile_item["preferences"].items():
+                    if isinstance(data, dict):
+                        weight = float(data.get("weight", 0.0))
+                        conf = float(data.get("confidence", 0.0))
+                        desc = str(data.get("description") or feat).replace("</", "[TAG]")
+                        if conf >= 0.5:
+                            direction = "Avoid / Penalize" if weight < 0 else "Prefer / Boost"
+                            rules.append(f"    - {direction}: {desc} (confidence: {conf:.2f}, weight: {weight:.2f})")
+                if rules:
+                    parts.append("  <structured_preference_rules>")
+                    parts.extend(rules)
+                    parts.append("  </structured_preference_rules>")
+        except Exception as e:
+            logger.debug("STRUCTURED_PROFILE_READ_SKIP | %s", str(e))
+
+        # Layer C: Recent Episodic Exemplars (bounded pagination, AST safe)
+        items = []
+        scan_kwargs = {
+            "FilterExpression": Attr("user_feedback").exists() & Attr("user_feedback_at").exists(),
+            "Limit": 50,
+        }
+        pages_evaluated = 0
+        while pages_evaluated < 5 and len(items) < 30:
+            resp = table.scan(**scan_kwargs)
+            items.extend(resp.get("Items", []))
+            pages_evaluated += 1
+            if "LastEvaluatedKey" not in resp:
+                break
+            scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+
+        if items:
+            items.sort(key=lambda x: int(x.get("user_feedback_at") or 0), reverse=True)
+            likes = []
+            dislikes = []
+            for it in items:
+                fb = str(it.get("user_feedback") or "").strip().lower()
+                title = str(it.get("title") or "Unknown Role").replace("</", "[TAG]")
+                company = str(it.get("company") or "Unknown Company").replace("</", "[TAG]")
+                reason = str(it.get("user_feedback_reason") or "").strip().replace("</", "[TAG]")[:200]
+                reason_code = str(it.get("reason_code") or "").strip().upper()
+
+                # Section 8: NONE / Skip Without Reason must NOT train preferences
+                if reason_code == "NONE" or reason.lower() in {
+                    "skipped from review button", "none", "skip without reason", "no reason provided"
+                }:
+                    continue
+
+                if fb in ("interested", "applied") and len(likes) < 5:
+                    entry = f"- {title} at {company}"
+                    if reason:
+                        entry += f" (Note: {reason})"
+                    likes.append(entry)
+                elif fb in ("not_interested", "not_applied", "meh") and len(dislikes) < 5:
+                    entry = f"- {title} at {company}"
+                    if reason:
+                        entry += f" (Reason rejected: '{reason}')"
+                    dislikes.append(entry)
+
+            if likes:
+                parts.append("  <recently_liked_roles>")
+                parts.extend([f"    {like_role}" for like_role in likes])
+                parts.append("  </recently_liked_roles>")
+            if dislikes:
+                parts.append("  <recently_rejected_roles_to_penalize>")
+                parts.extend([f"    {dislike_role}" for dislike_role in dislikes])
+                parts.append("  </recently_rejected_roles_to_penalize>")
+
         parts.append("</candidate_recent_preferences>")
 
         if len(parts) > 2:
@@ -471,7 +518,7 @@ def _load_recent_feedback_context() -> str:
             _cached_feedback_context = ""
 
         _feedback_loaded_at = now
-        logger.info("FEEDBACK_CONTEXT_BUILT | likes=%d | dislikes=%d", len(likes), len(dislikes))
+        logger.info("FEEDBACK_CONTEXT_BUILT | length=%d", len(_cached_feedback_context))
         return _cached_feedback_context
 
     except Exception as e:
@@ -508,7 +555,7 @@ SYSTEM_INSTRUCTION = (
     "- NO GIG / FREELANCE PLATFORMS: Postings originating from or redirecting to freelance contract mills (Upwork, Fiverr, Freelancer) MUST be rejected.\n"
     "- RELEVANCE: If the job is purely Frontend (React), Backend (Java/Kotlin), "
     "or generic Full Stack without heavy AI/LLM/ML focus, the score MUST be below 50.\n"
-    "- FEEDBACK MEMORY: If <candidate_recent_preferences> is provided, respect the candidate's explicit preferences. Heavily penalize roles that share traits with recently rejected roles (e.g. excessive years of experience, wrong tech stack, unwanted domains).\n\n"
+    "- FEEDBACK MEMORY: If <candidate_recent_preferences> is provided, respect the candidate's structured preferences and negative exemplars. Heavily penalize roles that share traits with rejected roles (e.g. excessive years of experience, non-AI tech stack, unwanted domains, mandatory onsite). Never learn false correlations: do not penalize a company or title unless the explicit rejection reason applies to it.\n\n"
     "Score 0-100. Be extremely strict. Only true, fresh, local AI/ML/LLM roles should score 85+.\n\n"
     "Use the submit_evaluation tool to return your score and a 1-sentence justification."
 )
@@ -764,6 +811,8 @@ def _job_age_days(job: Dict[str, Any], now: Optional[datetime] = None) -> Option
 
 def _source_max_age_days(job: Dict[str, Any]) -> int:
     source = str(job.get("source", "")).strip().lower()
+    if source in DEFAULT_SOURCE_FRESHNESS_DAYS:
+        return DEFAULT_SOURCE_FRESHNESS_DAYS[source]
     if source in {"hackernews", "hn"}:
         return HN_MAX_JOB_AGE_DAYS
     return MAX_JOB_AGE_DAYS
@@ -990,13 +1039,22 @@ def _send_match_notification(job: Dict[str, Any], score: int, reason: str) -> No
         f"Reply 'status' to audit source links, or 'list' to review matches."
     )
 
-    job_id = job.get("job_id")
+    job_id = str(job.get("job_id") or "")
+    if job_id:
+        msg += f"\n\nRef: {job_id}"
+
+    publish_kwargs = {
+        "TopicArn": SNS_TOPIC_ARN,
+        "Subject": f"Match {score}%: {job.get('title', 'Role')}",
+        "Message": msg,
+    }
+    if job_id:
+        publish_kwargs["MessageAttributes"] = {
+            "job_id": {"DataType": "String", "StringValue": job_id}
+        }
+
     try:
-        sns.publish(
-            TopicArn=SNS_TOPIC_ARN,
-            Subject=f"Match {score}%: {job.get('title', 'Role')}",
-            Message=msg,
-        )
+        sns.publish(**publish_kwargs)
         logger.info("SNS_SENT | job_id=%s | score=%d", job_id, score)
         if job_id:
             try:

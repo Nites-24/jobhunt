@@ -13,6 +13,7 @@ Tests:
 import json
 import os
 from datetime import datetime, timezone, timedelta
+import time
 import pytest
 import boto3
 from moto import mock_aws
@@ -688,4 +689,70 @@ class TestProcessor:
             assert item["status"] == "PENDING_APPROVAL"
             assert item["notification_status"] == "FAILED"
             assert "SNS unavailable" in item["notification_error"]
+
+    def test_guardrail_caps_stale_job_at_2_days(self):
+        """Job older than MAX_JOB_AGE_DAYS (2 days) is deterministically capped at STALE_SCORE_CAP (55)."""
+        mod, table, s3, sns = self._setup_infra()
+        stale_date = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+        stale_job = {
+            **SAMPLE_JOB,
+            "job_id": "stale-job-001",
+            "posted_at": stale_date,
+            "source": "linkedin",
+        }
+        score, reason = mod._apply_deterministic_guardrails(stale_job, score=95, reason="Great match")
+        assert score <= mod.STALE_SCORE_CAP
+        assert "posted 3 days ago" in reason or "stale" in reason.lower()
+
+    def test_load_feedback_paginates_dynamodb_scan(self):
+        """_load_recent_feedback_context performs bounded pagination across multiple items."""
+        mod, table, s3, sns = self._setup_infra()
+        mod._cached_feedback_context = ""
+        mod._feedback_loaded_at = 0
+
+        now = int(time.time())
+        table.put_item(Item={
+            "job_id": "fb-item-1",
+            "title": "AI Engineer",
+            "company": "Company A",
+            "user_feedback": "interested",
+            "user_feedback_reason": "High quality RAG stack",
+            "user_feedback_at": now - 100,
+        })
+        table.put_item(Item={
+            "job_id": "fb-item-2",
+            "title": "Senior AI Architect",
+            "company": "Company B",
+            "user_feedback": "not_interested",
+            "user_feedback_reason": "Saturated (300+ applicants)",
+            "user_feedback_at": now - 50,
+        })
+
+        ctx = mod._load_recent_feedback_context()
+        assert "<candidate_recent_preferences>" in ctx
+        assert "Company A" in ctx
+        assert "Company B" in ctx
+        assert "Saturated (300+ applicants)" in ctx
+
+    def test_load_feedback_includes_not_applied(self):
+        """_load_recent_feedback_context includes 'not_applied' outcomes in negative exemplars."""
+        mod, table, s3, sns = self._setup_infra()
+        mod._cached_feedback_context = ""
+        mod._feedback_loaded_at = 0
+
+        now = int(time.time())
+        table.put_item(Item={
+            "job_id": "fb-item-not-applied",
+            "title": "ML Engineer",
+            "company": "Staffing Agency X",
+            "user_feedback": "not_applied",
+            "user_feedback_reason": "Stale posting (>2 days old)",
+            "user_feedback_at": now - 10,
+        })
+
+        ctx = mod._load_recent_feedback_context()
+        assert "<recently_rejected_roles_to_penalize>" in ctx
+        assert "Staffing Agency X" in ctx
+        assert "Stale posting (>2 days old)" in ctx
+
 

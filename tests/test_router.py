@@ -2115,7 +2115,7 @@ class TestRouterRegressionEdgeCases:
         assert inline_kb[0][0]["callback_data"] == f"cmd:why:{token}"
         assert inline_kb[0][1]["callback_data"] == f"cmd:draft:{token}"
         assert inline_kb[0][2]["callback_data"] == f"cmd:apply:{token}"
-        assert inline_kb[0][3]["callback_data"] == f"cmd:skip:{token}"
+        assert inline_kb[0][3]["callback_data"] == f"cmd:skip_prompt:{token}"
 
         # 2. Test Why (explain) card
         event_why = _make_telegram_event("why")
@@ -2751,6 +2751,143 @@ def test_router_deduplicates_telegram_update_id():
         assert resp2["statusCode"] == 200
         assert resp2["body"] == "Duplicate update ignored"
         assert mock_tg.call_count == 1  # Not called again
+
+
+@mock_aws
+def test_skip_prompt_and_reasons_flow():
+    """Tapping 👎 Not Interested must present 6 compact reason buttons, and tapping a reason records feedback and advances."""
+    from unittest.mock import patch
+    import job_router.lambda_function as mod
+
+    dynamo = boto3.resource("dynamodb", region_name="us-east-1")
+    table = _create_router_test_table(dynamo)
+    mod.table = table
+
+    # Insert a job
+    job = dict(SAMPLE_JOB)
+    job["job_id"] = "flow-job-1"
+    job["status"] = "PENDING_APPROVAL"
+    job["score"] = 85
+    table.put_item(Item=job)
+
+    # Next job to advance to
+    job2 = dict(SAMPLE_JOB)
+    job2["job_id"] = "flow-job-2"
+    job2["status"] = "PENDING_APPROVAL"
+    job2["score"] = 82
+    table.put_item(Item=job2)
+
+    token = mod._get_or_create_action_token("flow-job-1")
+
+    # 1. User clicks 'cmd:skip_prompt:<token>'
+    callback_prompt = {
+        "callback_query": {
+            "id": "cb_prompt_1",
+            "data": f"cmd:skip_prompt:{token}",
+            "from": {"id": 99999, "first_name": "Alex"},
+            "message": {"message_id": 100, "chat": {"id": 99999}, "text": "Job details"},
+        }
+    }
+
+    with patch("job_router.lambda_function._send_telegram") as mock_tg, \
+         patch("job_router.lambda_function._edit_telegram_message") as mock_edit, \
+         patch("job_router.lambda_function._answer_callback_query") as mock_ack, \
+         patch("job_router.lambda_function._get_secrets") as mock_sec:
+        mock_sec.return_value = {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "99999"}
+        mock_tg.return_value = True
+        mock_edit.return_value = True
+        mock_ack.return_value = True
+
+        res = mod.lambda_handler({"body": json.dumps(callback_prompt)}, MockContext())
+        assert res["statusCode"] == 200
+        # Edit was called to show rejection options
+        assert mock_edit.call_count == 1
+        edit_args, edit_kwargs = mock_edit.call_args
+        edit_text = edit_args[3] if len(edit_args) > 3 else edit_kwargs.get("text", "")
+        assert "why are you passing" in edit_text.lower() or "reason" in edit_text.lower()
+        buttons = edit_kwargs["reply_markup"]["inline_keyboard"]
+        flat_callbacks = [b["callback_data"] for row in buttons for b in row]
+        assert any(c.startswith("sr:sat:") for c in flat_callbacks)
+        assert any(c.startswith("sr:stale:") for c in flat_callbacks)
+        assert any(c.startswith("sr:yoe:") for c in flat_callbacks)
+        assert any(c.startswith("sr:none:") for c in flat_callbacks)
+
+        # 2. User selects 'sr:sat:<token>'
+        callback_reason = {
+            "callback_query": {
+                "id": "cb_reason_1",
+                "data": f"sr:sat:{token}",
+                "from": {"id": 99999, "first_name": "Alex"},
+                "message": {"message_id": 100, "chat": {"id": 99999}, "text": "Select rejection reason:"},
+            }
+        }
+        res2 = mod.lambda_handler({"body": json.dumps(callback_reason)}, MockContext())
+        assert res2["statusCode"] == 200
+
+        # Verify job is updated in DynamoDB
+        item = table.get_item(Key={"job_id": "flow-job-1"}).get("Item")
+        assert item["status"] == "NOT_INTERESTED"
+        assert item["user_interest"] == "not_interested"
+        assert item["user_feedback_category"] == "SATURATION"
+        assert item["user_feedback_reason"] == "Saturated (300+ applicants)"
+
+        # Verify pref:candidate_profile updated
+        profile_item = table.get_item(Key={"job_id": "pref:candidate_profile"}).get("Item")
+        assert profile_item is not None
+        assert "cat_saturation" in profile_item.get("preferences", {})
+        assert profile_item["preferences"]["cat_saturation"]["weight"] < 0
+
+        # Verify next job was shown
+        assert mock_tg.call_count >= 1
+
+
+@mock_aws
+def test_quote_reply_with_rejection_reason_updates_quoted_job():
+    """Replying to a review card with 'Not applied, 300+ applicants' must parse the quoted job and record feedback."""
+    from unittest.mock import patch
+    import job_router.lambda_function as mod
+
+    dynamo = boto3.resource("dynamodb", region_name="us-east-1")
+    table = _create_router_test_table(dynamo)
+    mod.table = table
+
+    job = dict(SAMPLE_JOB)
+    job["job_id"] = "quoted-job-99"
+    job["status"] = "PENDING_APPROVAL"
+    job["title"] = "AI Platform Engineer"
+    table.put_item(Item=job)
+
+    token = mod._get_or_create_action_token("quoted-job-99")
+
+    quote_msg = {
+        "message_id": 501,
+        "chat": {"id": 99999},
+        "from": {"first_name": "Alex"},
+        "text": "not applied 300+ applicants",
+        "reply_to_message": {
+            "message_id": 500,
+            "text": "AI Platform Engineer at Acme Corp\nRef: quoted-job-99",
+            "reply_markup": {
+                "inline_keyboard": [
+                    [{"text": "✅ Apply", "callback_data": f"cmd:apply:{token}"}]
+                ]
+            }
+        }
+    }
+
+    with patch("job_router.lambda_function._send_telegram") as mock_tg, \
+         patch("job_router.lambda_function._get_secrets") as mock_sec:
+        mock_sec.return_value = {"TELEGRAM_BOT_TOKEN": "tok", "TELEGRAM_CHAT_ID": "99999"}
+        mock_tg.return_value = True
+
+        res = mod.lambda_handler({"body": json.dumps({"message": quote_msg})}, MockContext())
+        assert res["statusCode"] == 200
+
+        item = table.get_item(Key={"job_id": "quoted-job-99"}).get("Item")
+        assert item["application_outcome"] == "not_applied"
+        assert item["user_feedback_category"] == "SATURATION"
+        assert "300+ applicants" in item["user_feedback_reason"]
+
 
 
 

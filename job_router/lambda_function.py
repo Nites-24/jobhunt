@@ -125,6 +125,15 @@ _JOB_ID_TO_TOKEN_CACHE: dict[str, str] = {}
 _ACTIVE_CALLBACK_CLAIM: ContextVar[tuple[str, str] | None] = ContextVar("active_callback_claim", default=None)
 _CALLBACK_DELIVERY_FAILED: ContextVar[bool] = ContextVar("callback_delivery_failed", default=False)
 
+REASON_CODE_MAP: dict[str, tuple[str, str]] = {
+    "sat": ("SATURATION", "Saturated (300+ applicants)"),
+    "stale": ("STALE", "Stale posting (>2 days old)"),
+    "yoe": ("YOE", "Seniority or YOE mismatch"),
+    "stack": ("TECH_STACK", "Wrong tech stack / non-AI"),
+    "loc": ("LOCATION", "Location / onsite required"),
+    "none": ("NONE", "Skipped without specific reason"),
+}
+
 
 def _get_or_create_action_token(job_id: str | None) -> str:
     """Generate a compact 12-char hex token for a job_id and persist mapping in DynamoDB."""
@@ -224,22 +233,29 @@ def _claim_callback(callback_query_id: str, chat_id: str, action_data: str, cont
             return "invalid", None
 
     parts = action_data.split(":")
-    action = parts[1].strip().lower() if len(parts) > 1 and parts[0] == "cmd" else ""
-    raw_target = parts[2].strip() if len(parts) > 2 else ""
+    if action_data.startswith("sr:"):
+        action = "skip_r"
+        raw_target = parts[2].strip() if len(parts) > 2 else ""
+    elif len(parts) > 1 and parts[0] == "cmd" and parts[1] == "skip_r":
+        action = "skip_r"
+        raw_target = parts[3].strip() if len(parts) > 3 else (parts[2].strip() if len(parts) > 2 else "")
+    else:
+        action = parts[1].strip().lower() if len(parts) > 1 and parts[0] == "cmd" else ""
+        raw_target = parts[2].strip() if len(parts) > 2 else ""
     target = previous.get("target_job_id") if previous else None
     initial_review_unset = previous.get("initial_review_unset", False) if previous else False
-    if previous and not target and action in {"apply", "skip"}:
+    if previous and not target and action in {"apply", "skip", "skip_r", "skip_prompt"}:
         # Legacy FAILED callbacks without identity must not select a new active job.
         return "invalid", None
-    if not target and raw_target and action in {"apply", "skip", "why", "draft", "next"}:
+    if not target and raw_target and action in {"apply", "skip", "skip_r", "skip_prompt", "why", "draft", "next"}:
         target = _resolve_action_token(raw_target)
-    if not target and action in {"apply", "skip", "next"}:
+    if not target and action in {"apply", "skip", "skip_r", "skip_prompt", "next"}:
         target = _get_active_review_job_id(chat_id)
         if not target:
             initial_review_unset = action == "next"
             jobs = _get_pending_jobs(limit=1)
             target = jobs[0]["job_id"] if jobs else None
-        if not target and action in {"apply", "skip"}:
+        if not target and action in {"apply", "skip", "skip_r", "skip_prompt"}:
             return "invalid", None
 
     owner = uuid.uuid4().hex
@@ -1165,7 +1181,12 @@ def _record_delivery_status(job_id: str, success: bool, error: str = "") -> None
         logger.warning("FAILED_TO_RECORD_DELIVERY_STATUS | job_id=%s | %s", job_id, str(e))
 
 
-def _record_application_outcome(job_id: str, outcome: str, reason: str = "") -> str:
+def _record_application_outcome(
+    job_id: str,
+    outcome: str,
+    reason: str = "",
+    category: str | None = None,
+) -> str:
     """Persist the user's real-world application decision for future evals."""
     now = int(time.time())
     status = "APPLIED" if outcome == "applied" else "NOT_APPLIED"
@@ -1184,6 +1205,9 @@ def _record_application_outcome(job_id: str, outcome: str, reason: str = "") -> 
     if reason:
         update_expr += ", user_feedback_reason = :reason"
         expr_vals[":reason"] = reason[:500]
+    if category:
+        update_expr += ", user_feedback_category = :category, user_feedback_code = :category"
+        expr_vals[":category"] = category
 
     table.update_item(
         Key={"job_id": job_id},
@@ -1194,7 +1218,13 @@ def _record_application_outcome(job_id: str, outcome: str, reason: str = "") -> 
     return status
 
 
-def _record_review_feedback(job_id: str, sentiment: str, reason: str = "") -> str | None:
+def _record_review_feedback(
+    job_id: str,
+    sentiment: str,
+    reason: str = "",
+    category: str | None = None,
+    allow_any_status: bool = False,
+) -> str | None:
     """Persist the user's review preference while preserving apply outcome semantics."""
     now = int(time.time())
     new_status = "NOT_INTERESTED" if sentiment == "not_interested" else "PENDING_APPROVAL"
@@ -1207,11 +1237,18 @@ def _record_review_feedback(job_id: str, sentiment: str, reason: str = "") -> st
         ":t": now,
         ":sentiment": sentiment,
         ":source": "telegram",
-        ":expected": "PENDING_APPROVAL",
     }
     if reason:
         update_expr += ", user_feedback_reason = :reason"
         expr_vals[":reason"] = reason[:500]
+    if category:
+        update_expr += ", user_feedback_category = :category, user_feedback_code = :category"
+        expr_vals[":category"] = category
+
+    condition = "attribute_exists(job_id)"
+    if not allow_any_status:
+        condition += " AND #s = :expected"
+        expr_vals[":expected"] = "PENDING_APPROVAL"
 
     try:
         table.update_item(
@@ -1219,7 +1256,7 @@ def _record_review_feedback(job_id: str, sentiment: str, reason: str = "") -> st
             UpdateExpression=update_expr,
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues=expr_vals,
-            ConditionExpression="attribute_exists(job_id) AND #s = :expected",
+            ConditionExpression=condition,
         )
         return new_status
     except Exception as e:
@@ -1384,13 +1421,193 @@ def _build_review_card_keyboard(job_id: str | None = None) -> dict:
                 {"text": "Why", "callback_data": f"cmd:why{suffix}"},
                 {"text": "Draft", "callback_data": f"cmd:draft{suffix}"},
                 {"text": "✓ Apply", "callback_data": f"cmd:apply{suffix}"},
-                {"text": "Skip", "callback_data": f"cmd:skip{suffix}"},
+                {"text": "👎 Not Interested", "callback_data": f"cmd:skip_prompt{suffix}"},
             ],
             [
                 {"text": "→ Next Match", "callback_data": f"cmd:next{suffix}"},
             ],
         ],
     }
+
+
+def _build_skip_reasons_keyboard(job_id: str | None = None) -> dict:
+    """Inline keyboard with 1-tap rejection reason buttons bounded by compact token."""
+    token = _get_or_create_action_token(job_id) if job_id else ""
+    suffix = f":{token}" if token else ""
+    return {
+        "inline_keyboard": [
+            [{"text": "👥 Saturated (300+ applicants)", "callback_data": f"sr:sat{suffix}"}],
+            [{"text": "⏳ Stale Posting (>2 days old)", "callback_data": f"sr:stale{suffix}"}],
+            [{"text": "📉 Seniority / YOE Mismatch", "callback_data": f"sr:yoe{suffix}"}],
+            [{"text": "🚫 Wrong Tech Stack / Non-AI", "callback_data": f"sr:stack{suffix}"}],
+            [{"text": "🏢 Location / Onsite Required", "callback_data": f"sr:loc{suffix}"}],
+            [{"text": "⏭ Skip Without Reason", "callback_data": f"sr:none{suffix}"}],
+        ]
+    }
+
+
+def _normalize_feedback_reason(reason: str) -> tuple[str, str]:
+    """
+    Classify a free-text or quote feedback reason into a controlled category
+    and sanitized text, preventing prompt injection and false correlations.
+    """
+    if not reason or not reason.strip():
+        return "NONE", "Skipped without specific reason"
+
+    # Strip XML tags and cap at 300 characters to prevent prompt injection escapes
+    cleaned = re.sub(r"<[^>]+>", "", reason).strip()[:300]
+    low = cleaned.lower()
+
+    if any(k in low for k in ("applicant", "applied", "300+", "100+", "200+", "saturat", "crowd", "too many")):
+        return "SATURATION", f"Saturated / too many applicants ({cleaned})"
+
+    if any(k in low for k in ("stale", "old", "posted", "days ago", "6d", "5d", "4d", "3d", "week ago", "expired")):
+        return "STALE", f"Posting too old / stale ({cleaned})"
+
+    if any(k in low for k in ("senior", "staff", "lead", "principal", "yoe", "years of exp", "junior", "too senior", "entry")):
+        return "YOE", f"Seniority / YOE mismatch ({cleaned})"
+
+    if any(k in low for k in ("stack", "react", "frontend", "php", "java", "non-ai", "not ai", "legacy", "sales", "it support", "c#", ".net")):
+        return "TECH_STACK", f"Wrong tech stack / non-AI role ({cleaned})"
+
+    if any(k in low for k in ("onsite", "on-site", "location", "relocat", "hybrid", "in-person", "office")):
+        return "LOCATION", f"Location / mandatory onsite ({cleaned})"
+
+    return "OTHER", cleaned
+
+
+def _record_append_only_feedback_event(
+    target_job_id: str,
+    job: dict,
+    category: str,
+    reason: str,
+) -> None:
+    """Append-only immutable record of user feedback for offline evals and audit."""
+    if category == "NONE":
+        return
+    try:
+        now = int(time.time())
+        event_id = f"fb:{now}:{uuid.uuid4().hex[:8]}"
+        item = {
+            "job_id": event_id,
+            "entity_type": "feedback_event",
+            "target_job_id": target_job_id,
+            "category": category,
+            "reason": reason,
+            "company": job.get("company", "Unknown"),
+            "title": job.get("title", "Unknown"),
+            "source": job.get("source", "unknown"),
+            "created_at": now,
+            "ttl": now + 90 * 86400,
+        }
+        table.put_item(Item=item)
+        logger.info("APPEND_ONLY_FEEDBACK_EVENT_RECORDED | event_id=%s category=%s", event_id, category)
+    except Exception as e:
+        logger.warning("APPEND_ONLY_FEEDBACK_EVENT_ERROR | %s", str(e))
+
+
+def _update_compiled_preference_profile(
+    category: str,
+    reason: str,
+    job: dict,
+) -> None:
+    """
+    Update compiled candidate preferences stored at job_id = 'pref:candidate_profile'
+    using structured evidence weighting (Layer B).
+    """
+    if category == "NONE":
+        return
+    try:
+        now = int(time.time())
+        item = table.get_item(Key={"job_id": "pref:candidate_profile"}).get("Item")
+        if not item:
+            item = {
+                "job_id": "pref:candidate_profile",
+                "entity_type": "preference_profile",
+                "updated_at": now,
+                "preferences": {},
+            }
+        prefs = item.get("preferences") or {}
+
+        feat_key = f"cat_{category.lower()}"
+        existing = prefs.get(feat_key, {"weight": Decimal("0.0"), "confidence": Decimal("0.0"), "description": ""})
+        weight = Decimal(str(existing.get("weight", 0.0))) - Decimal("0.2")
+        conf = min(Decimal("1.0"), Decimal(str(existing.get("confidence", 0.0))) + Decimal("0.25"))
+
+        desc_map = {
+            "SATURATION": "Saturated postings with 300+ applicants (timing/volume alert)",
+            "STALE": "Stale postings (>2 days old)",
+            "YOE": "Seniority or YOE requirement mismatch",
+            "TECH_STACK": "Non-AI tech stack or missing core ML skills",
+            "LOCATION": "Mandatory onsite or non-remote location requirements",
+        }
+        description = desc_map.get(category, f"Rejected due to {category.lower()}: {reason[:60]}")
+
+        prefs[feat_key] = {
+            "weight": weight,
+            "confidence": conf,
+            "description": description,
+            "last_updated": now,
+        }
+        item["preferences"] = prefs
+        item["updated_at"] = now
+        table.put_item(Item=item)
+        logger.info("PREFERENCE_PROFILE_UPDATED | category=%s", category)
+    except Exception as e:
+        logger.warning("PREFERENCE_PROFILE_UPDATE_ERROR | %s", str(e))
+
+
+def _extract_job_from_quoted_message(reply_message: dict) -> str | None:
+    """
+    Extract the referenced job_id from a quoted Telegram message (reply_to_message).
+    Checks inline keyboard tokens, explicit Ref tags, and URL/role patterns.
+    """
+    if not isinstance(reply_message, dict):
+        return None
+
+    # Check 1: Inline keyboard action tokens in the quoted message
+    reply_markup = reply_message.get("reply_markup") or {}
+    inline_keyboard = reply_markup.get("inline_keyboard") or []
+    for row in inline_keyboard:
+        if isinstance(row, list):
+            for btn in row:
+                if isinstance(btn, dict):
+                    cb_data = str(btn.get("callback_data") or "")
+                    token_match = re.search(r":([0-9a-f]{12})$", cb_data)
+                    if token_match:
+                        resolved = _resolve_action_token(token_match.group(1))
+                        if resolved:
+                            return resolved
+
+    # Check 2: Explicit Ref: <job_id> in message text
+    text = str(reply_message.get("text") or reply_message.get("caption") or "")
+    ref_match = re.search(r"Ref:\s*([a-zA-Z0-9_\-:]+)", text)
+    if ref_match:
+        ref_id = ref_match.group(1).strip()
+        try:
+            item = table.get_item(Key={"job_id": ref_id}).get("Item")
+            if item:
+                return ref_id
+        except Exception:
+            pass
+
+    # Check 3: Canonical URL in message text
+    urls = re.findall(r"https?://[^\s]+", text)
+    for url in urls:
+        clean_url = url.rstrip(".,;)>]")
+        try:
+            from boto3.dynamodb.conditions import Attr
+            resp = table.scan(
+                FilterExpression=Attr("url").eq(clean_url) | Attr("source_url").eq(clean_url),
+                Limit=10,
+            )
+            items = resp.get("Items", [])
+            if items:
+                return items[0]["job_id"]
+        except Exception:
+            pass
+
+    return None
 
 
 def _format_next_review_card(job: dict) -> str:
@@ -1862,34 +2079,85 @@ def _handle_application_outcome(
     outcome: str,
     index: int = 1,
     reason: str = "",
+    quoted_job_id: str | None = None,
 ) -> None:
-    """Record whether the user really applied after manual follow-up."""
-    jobs = _get_manual_followup_jobs(limit=10)
-    if not jobs:
+    """Record whether the user really applied after manual follow-up or from an alert/card."""
+    target_job = None
+
+    # Priority 1: Quoted job from reply_to_message
+    if quoted_job_id:
+        try:
+            item = table.get_item(Key={"job_id": quoted_job_id}).get("Item")
+            if item:
+                target_job = item
+                logger.info("OUTCOME_TARGET_FROM_QUOTE | job_id=%s", quoted_job_id)
+        except Exception as e:
+            logger.warning("FAILED_FETCH_QUOTED_JOB | %s", str(e))
+
+    # Priority 2: Active review card session
+    if not target_job:
+        active_id = _get_active_review_job_id(chat_id)
+        if active_id:
+            try:
+                item = table.get_item(Key={"job_id": active_id}).get("Item")
+                if item:
+                    target_job = item
+                    logger.info("OUTCOME_TARGET_FROM_ACTIVE_SESSION | job_id=%s", active_id)
+            except Exception as e:
+                logger.warning("FAILED_FETCH_ACTIVE_JOB | %s", str(e))
+
+    # Priority 3: Manual follow-up jobs queue
+    if not target_job:
+        followup_jobs = _get_manual_followup_jobs(limit=10)
+        if followup_jobs and 1 <= index <= len(followup_jobs):
+            target_job = followup_jobs[index - 1]
+            logger.info("OUTCOME_TARGET_FROM_MANUAL_FOLLOWUPS | job_id=%s", target_job["job_id"])
+
+    # Priority 4: Pending review jobs queue
+    if not target_job:
+        pending_jobs = _get_pending_jobs(limit=10)
+        if pending_jobs and 1 <= index <= len(pending_jobs):
+            target_job = pending_jobs[index - 1]
+            logger.info("OUTCOME_TARGET_FROM_PENDING_QUEUE | job_id=%s", target_job["job_id"])
+
+    if not target_job:
         _send_telegram(
             bot_token,
             chat_id,
-            "I do not have any manual follow-ups waiting for an outcome.\n\n"
-            "Use apply 1 first so I know which role you are acting on.",
+            "I do not have any active or waiting jobs for this action.\n\n"
+            "Use 'list' or 'next' to review current matches.",
         )
         return
 
-    if index < 1 or index > len(jobs):
-        _send_telegram(bot_token, chat_id, f"Invalid follow-up index. Use a number from 1 to {len(jobs)}.")
-        return
+    job_id = target_job["job_id"]
+    category, normalized_reason = _normalize_feedback_reason(reason) if reason else ("NONE", "")
+    final_reason = reason or normalized_reason
 
-    job = jobs[index - 1]
-    status = _record_application_outcome(job["job_id"], outcome, reason)
+    status = _record_application_outcome(
+        job_id=job_id,
+        outcome=outcome,
+        reason=final_reason,
+        category=category,
+    )
+
+    if outcome == "not_applied" and category != "NONE":
+        _record_append_only_feedback_event(job_id, target_job, category, final_reason)
+        _update_compiled_preference_profile(category, final_reason, target_job)
+
+    # Clear from active review session if it was the active card
+    if _get_active_review_job_id(chat_id) == job_id:
+        _clear_active_review_job(chat_id)
+
     label = "applied" if outcome == "applied" else "not applied"
-    reason_line = f"\nReason: {reason}" if reason else ""
+    reason_line = f"\nReason: {final_reason}" if final_reason else ""
     _send_telegram(
         bot_token,
         chat_id,
         f"Recorded: {label}.\n\n"
-        f"Role: {job.get('title', 'Unknown')}\n"
-        f"Company: {job.get('company', 'Unknown')}\n"
+        f"Role: {target_job.get('title', 'Unknown')}\n"
+        f"Company: {target_job.get('company', 'Unknown')}\n"
         f"Stored status: {status}{reason_line}\n\n"
-        "This outcome is now stored on the job row for future feedback/eval analysis.",
+        "Feedback recorded. This will condition future scoring and ranking.",
     )
 
 
@@ -1899,22 +2167,44 @@ def _handle_review_feedback(
     sentiment: str,
     index: int | None = None,
     reason: str = "",
+    quoted_job_id: str | None = None,
 ) -> None:
     """Record whether the user is interested in a reviewable job."""
-    jobs = _get_pending_jobs(limit=20)
-    if not jobs:
-        _send_telegram(bot_token, chat_id, "Your review queue is empty. Use search jobs to scan live sources.")
-        return
+    target_job = None
+    resolved_index = 1
 
-    if index is not None and (index < 1 or index > len(jobs)):
-        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
-        return
+    if quoted_job_id:
+        try:
+            target_job = table.get_item(Key={"job_id": quoted_job_id}).get("Item")
+        except Exception:
+            pass
 
-    job, resolved_index = _resolve_review_job(chat_id, jobs, index)
-    if not job or resolved_index is None:
-        _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
-        return
-    status = _record_review_feedback(job["job_id"], sentiment, reason)
+    if not target_job:
+        jobs = _get_pending_jobs(limit=20)
+        if not jobs:
+            _send_telegram(bot_token, chat_id, "Your review queue is empty. Use search jobs to scan live sources.")
+            return
+
+        if index is not None and (index < 1 or index > len(jobs)):
+            _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+            return
+
+        target_job, resolved_index = _resolve_review_job(chat_id, jobs, index)
+        if not target_job or resolved_index is None:
+            _send_telegram(bot_token, chat_id, f"Invalid index. Use a number from 1 to {len(jobs)}.")
+            return
+
+    job_id = target_job["job_id"]
+    category, normalized_reason = _normalize_feedback_reason(reason) if reason else ("NONE", "")
+    final_reason = reason or normalized_reason
+
+    status = _record_review_feedback(
+        job_id=job_id,
+        sentiment=sentiment,
+        reason=final_reason,
+        category=category,
+        allow_any_status=True,
+    )
     if not status:
         _send_telegram(
             bot_token,
@@ -1922,8 +2212,13 @@ def _handle_review_feedback(
             "Job was updated concurrently or already processed. Use 'list' to refresh.",
         )
         return
+
     if sentiment == "not_interested":
-        _set_active_review_job(chat_id, job["job_id"])
+        _set_active_review_job(chat_id, job_id)
+        if category != "NONE":
+            _record_append_only_feedback_event(job_id, target_job, category, final_reason)
+            _update_compiled_preference_profile(category, final_reason, target_job)
+
     label = {
         "interested": "interested",
         "not_interested": "not interested",
@@ -1934,13 +2229,13 @@ def _handle_review_feedback(
         if sentiment != "not_interested"
         else "I removed it from the active review queue. Use next to continue."
     )
-    reason_line = f"\nReason: {reason}" if reason else ""
+    reason_line = f"\nReason: {final_reason}" if final_reason else ""
     _send_telegram(
         bot_token,
         chat_id,
         f"Recorded: {label}.\n\n"
-        f"Role: {job.get('title', 'Unknown')}\n"
-        f"Company: {job.get('company', 'Unknown')}\n"
+        f"Role: {target_job.get('title', 'Unknown')}\n"
+        f"Company: {target_job.get('company', 'Unknown')}\n"
         f"Stored status: {status}{reason_line}\n\n"
         f"{next_step}",
     )
@@ -1999,6 +2294,82 @@ def _handle_explain(
         _format_job_explanation(job, resolved_index),
         reply_markup=_build_review_card_keyboard(job.get("job_id")),
     )
+
+
+def _handle_skip_prompt(
+    bot_token: str,
+    chat_id: str,
+    target_job_id: str | None = None,
+    message_id: int | None = None,
+    callback_query_id: str | None = None,
+) -> None:
+    """Prompt the user for a 1-tap rejection reason."""
+    if callback_query_id:
+        _answer_callback_query(bot_token, callback_query_id)
+
+    job_id = target_job_id or _get_active_review_job_id(chat_id)
+    keyboard = _build_skip_reasons_keyboard(job_id)
+    prompt_text = "Why are you passing on this role?\n\n1-tap a reason below so I can learn:"
+
+    delivered = False
+    if message_id:
+        delivered = _edit_telegram_message(bot_token, chat_id, message_id, prompt_text, reply_markup=keyboard)
+    if not delivered:
+        _send_telegram(bot_token, chat_id, prompt_text, reply_markup=keyboard)
+
+
+def _handle_skip_reason(
+    bot_token: str,
+    chat_id: str,
+    callback_query_id: str,
+    data: str,
+    message_id: int | None = None,
+    pinned_target: str | None = None,
+) -> None:
+    """Process a 1-tap rejection reason callback and advance the queue."""
+    _answer_callback_query(bot_token, callback_query_id, "Recording reason...")
+
+    parts = data.split(":")
+    if data.startswith("sr:"):
+        code_id = parts[1].strip().lower() if len(parts) > 1 else "none"
+        token = parts[2].strip() if len(parts) > 2 else ""
+    else:
+        code_id = parts[2].strip().lower() if len(parts) > 2 else "none"
+        token = parts[3].strip() if len(parts) > 3 else (parts[2].strip() if len(parts) > 2 else "")
+
+    target_job_id = pinned_target or (_resolve_action_token(token) if token else None) or _get_active_review_job_id(chat_id)
+    if not target_job_id:
+        jobs = _get_pending_jobs(limit=1)
+        target_job_id = jobs[0]["job_id"] if jobs else None
+
+    category, desc = REASON_CODE_MAP.get(code_id, ("NONE", "Skipped without specific reason"))
+    job = table.get_item(Key={"job_id": target_job_id}).get("Item") if target_job_id else {}
+
+    if target_job_id:
+        _record_review_feedback(
+            job_id=target_job_id,
+            sentiment="not_interested",
+            reason=desc if category != "NONE" else "Skipped without specific reason",
+            category=category,
+            allow_any_status=True,
+        )
+        if category != "NONE" and job:
+            _record_append_only_feedback_event(target_job_id, job, category, desc)
+            _update_compiled_preference_profile(category, desc, job)
+
+    confirmation = (
+        f"Recorded: not interested ({desc}).\n"
+        "Removed from review queue."
+        if category != "NONE"
+        else "Recorded: skipped without reason.\nRemoved from review queue."
+    )
+    delivered = False
+    if message_id:
+        delivered = _edit_telegram_message(bot_token, chat_id, message_id, confirmation)
+    if not delivered:
+        _send_telegram(bot_token, chat_id, confirmation)
+
+    _handle_next(bot_token, chat_id)
 
 
 def _handle_skip(
@@ -2498,7 +2869,7 @@ SEND_PATTERN = re.compile(r"^send\s*(\d+)?$", re.IGNORECASE)
 CONFIRM_SEND_PATTERN = re.compile(r"^confirm\s+send\s+(\d+)$", re.IGNORECASE)
 
 
-def _route_command(command: str, bot_token: str, chat_id: str) -> None:
+def _route_command(command: str, bot_token: str, chat_id: str, quoted_job_id: str | None = None) -> None:
     """Parse user input and route to a command handler."""
     raw = command.strip()
     cmd = raw.lower()
@@ -2570,13 +2941,15 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
     if daily_skip:
         reason = (daily_skip.group(1) or "").strip()
         if not reason:
+            active_id = quoted_job_id or _get_active_review_job_id(chat_id)
             _send_telegram(
                 bot_token,
                 chat_id,
                 "Tell me why you want to skip it so I can learn.\n\nExample: skip too senior",
+                reply_markup=_build_skip_reasons_keyboard(active_id),
             )
             return
-        _handle_review_feedback(bot_token, chat_id, "not_interested", None, reason)
+        _handle_review_feedback(bot_token, chat_id, "not_interested", None, reason, quoted_job_id=quoted_job_id)
         return
 
     match = APPLICATION_OUTCOME_PATTERN.match(raw)
@@ -2587,7 +2960,7 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
         reason = (match.group(3) or "").strip()
         if outcome == "not_applied" and not reason:
             reason = "No reason provided"
-        _handle_application_outcome(bot_token, chat_id, outcome, index, reason)
+        _handle_application_outcome(bot_token, chat_id, outcome, index, reason, quoted_job_id=quoted_job_id)
         return
 
     match = REVIEW_FEEDBACK_PATTERN.match(raw)
@@ -2603,7 +2976,7 @@ def _route_command(command: str, bot_token: str, chat_id: str) -> None:
         reason = (match.group(3) or "").strip()
         if sentiment == "not_interested" and not reason:
             reason = "No reason provided"
-        _handle_review_feedback(bot_token, chat_id, sentiment, index, reason)
+        _handle_review_feedback(bot_token, chat_id, sentiment, index, reason, quoted_job_id=quoted_job_id)
         return
 
     match = APPLY_PATTERN.match(cmd)
@@ -2669,6 +3042,17 @@ def _handle_callback_command(bot_token: str, chat_id: str, callback_query_id: st
         _answer_callback_query(bot_token, callback_query_id)
         return
 
+    if data.startswith("sr:") or (data.startswith("cmd:") and len(data.split(":")) > 1 and data.split(":")[1] == "skip_r"):
+        _handle_skip_reason(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            callback_query_id=callback_query_id,
+            data=data,
+            message_id=message_id,
+            pinned_target=pinned_target,
+        )
+        return
+
     if data.startswith("cmd:"):
         parts = data.split(":")
         action = parts[1].strip().lower() if len(parts) > 1 else ""
@@ -2705,6 +3089,15 @@ def _handle_callback_command(bot_token: str, chat_id: str, callback_query_id: st
                 bot_token,
                 chat_id,
                 target_job_id=target_job_id,
+                callback_query_id=callback_query_id,
+            )
+            return
+        if action == "skip_prompt":
+            _handle_skip_prompt(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                target_job_id=target_job_id,
+                message_id=message_id,
                 callback_query_id=callback_query_id,
             )
             return
@@ -2797,9 +3190,23 @@ def lambda_handler(event, context):
     if "Records" in event:
         for record in event["Records"]:
             try:
-                message_text = record["Sns"]["Message"]
-                _send_telegram(bot_token, chat_id, message_text)
-                logger.info("SNS_FORWARDED: %s", message_text[:100])
+                sns_data = record.get("Sns") or {}
+                message_text = sns_data.get("Message", "")
+                msg_attributes = sns_data.get("MessageAttributes") or {}
+
+                job_id = ""
+                if "job_id" in msg_attributes and isinstance(msg_attributes["job_id"], dict):
+                    job_id = str(msg_attributes["job_id"].get("Value") or "").strip()
+                if not job_id:
+                    ref_match = re.search(r"Ref:\s*([a-zA-Z0-9_\-:]+)", message_text)
+                    if ref_match:
+                        job_id = ref_match.group(1).strip()
+
+                reply_markup = _build_review_card_keyboard(job_id) if job_id else None
+                _send_telegram(bot_token, chat_id, message_text, reply_markup=reply_markup)
+                if job_id:
+                    _set_active_review_job(chat_id, job_id)
+                logger.info("SNS_FORWARDED: %s | job_id=%s", message_text[:100], job_id)
             except (KeyError, TypeError) as e:
                 logger.error("SNS_PARSE_ERROR: %s", str(e))
         return {"statusCode": 200, "body": "Alerts processed"}
@@ -2883,9 +3290,9 @@ def lambda_handler(event, context):
                                                  pinned_target=claimed.get("target_job_id") if claimed else None,
                                                  retrying=previous is not None)
                         if _CALLBACK_DELIVERY_FAILED.get():
-                            action = data.split(":")[1].strip().lower() if data.startswith("cmd:") else ""
-                            retryable = data.startswith("help:") or action in {
-                                "list", "status", "backlog", "followups", "why", "draft", "apply", "skip", "next",
+                            action = data.split(":")[1].strip().lower() if data.startswith("cmd:") else ("skip_r" if data.startswith("sr:") else "")
+                            retryable = data.startswith("help:") or data.startswith("sr:") or action in {
+                                "list", "status", "backlog", "followups", "why", "draft", "apply", "skip", "skip_r", "next",
                             }
                             if retryable:
                                 raise RuntimeError("Telegram callback reply delivery failed")
@@ -2926,9 +3333,12 @@ def lambda_handler(event, context):
                     logger.warning("UNAUTHORIZED_CHAT: %s (expected %s)", incoming_chat_id, chat_id)
                     return {"statusCode": 200, "body": "Unauthorized"}
 
+                reply_to_message = message.get("reply_to_message")
+                quoted_job_id = _extract_job_from_quoted_message(reply_to_message) if reply_to_message else None
+
                 if user_text:
-                    logger.info("TELEGRAM_CMD: '%s' from chat %s", user_text, incoming_chat_id)
-                    _route_command(user_text, bot_token, chat_id)
+                    logger.info("TELEGRAM_CMD: '%s' from chat %s | quoted_job=%s", user_text, incoming_chat_id, quoted_job_id)
+                    _route_command(user_text, bot_token, chat_id, quoted_job_id=quoted_job_id)
 
         except (KeyError, TypeError, AttributeError) as e:
             logger.error("WEBHOOK_PARSE_ERROR: %s", str(e))

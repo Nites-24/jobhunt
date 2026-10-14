@@ -53,7 +53,7 @@ JSEARCH_API_KEY = os.environ.get("JSEARCH_API_KEY", "")
 DYNAMODB_TABLE = "Jobsearch"
 S3_BUCKET = "job-search-pipeline-memory"
 RESUME_KEY = os.environ.get("RESUME_KEY", "data/resume/resume.txt")
-BEDROCK_MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
 SCORE_THRESHOLD = 80
 
 # Verify credentials exist
