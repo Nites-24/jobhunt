@@ -29,8 +29,11 @@ session = boto3.Session(
 client = session.client("lambda")
 
 LAMBDA_MAP = {
+    "job_ingestor": "job-ingestor",
+    "job_deduplicator": "job-deduplicator",
     "job_processor": "job-processor",
     "job_router": "job-router",
+    "job_sender": "job-sender",
 }
 
 SHARED_DIR = "shared"
