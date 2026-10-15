@@ -32,12 +32,14 @@ TARGET_ENV = {
     "job-ingestor": {
         "HN_MAX_JOB_AGE_DAYS": "3",
         "FILTER_CITIZENSHIP_RESTRICTIONS": "true",
+        "JSEARCH_DATE_POSTED": "today",
+        "JSEARCH_MAX_QUERIES_PER_RUN": "3",
     },
     "job-processor": {
         "BEDROCK_MODEL_ID": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
         "FILTER_CITIZENSHIP_RESTRICTIONS": "true",
         "SCORE_THRESHOLD": "80",
-        "MAX_JOB_AGE_DAYS": "2",
+        "MAX_JOB_AGE_DAYS": "1",
         "STALE_SCORE_CAP": "55",
         "MISSING_DATE_SCORE_CAP": "70",
         "REMOTE_SCORE_CAP": "80",

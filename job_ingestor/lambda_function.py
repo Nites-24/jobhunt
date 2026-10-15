@@ -189,6 +189,8 @@ QUEUE_URL = os.environ.get("RAW_QUEUE_URL")
 JSEARCH_SECRET_NAME = os.environ.get("JSEARCH_SECRET_NAME", "jobserch/jsearch")
 JSEARCH_ENABLED = os.environ.get("JSEARCH_ENABLED", "true").strip().lower() == "true"
 JSEARCH_MAX_PER_QUERY = int(os.environ.get("JSEARCH_MAX_PER_QUERY", "10"))
+JSEARCH_DATE_POSTED = os.environ.get("JSEARCH_DATE_POSTED", "today").strip()
+JSEARCH_MAX_QUERIES_PER_RUN = int(os.environ.get("JSEARCH_MAX_QUERIES_PER_RUN", "3"))
 JSEARCH_QUERIES = [
     q.strip()
     for q in os.environ.get(
@@ -1266,11 +1268,12 @@ def fetch_jsearch_jobs() -> list:
         return []
 
     jobs = []
-    for query in JSEARCH_QUERIES:
+    queries_to_run = JSEARCH_QUERIES[:JSEARCH_MAX_QUERIES_PER_RUN]
+    for query in queries_to_run:
         url = (
             "https://jsearch.p.rapidapi.com/search"
             f"?query={urllib.request.quote(query)}"
-            "&num_pages=1&date_posted=week&country=us"
+            f"&num_pages=1&date_posted={JSEARCH_DATE_POSTED}&country=us"
         )
         req = urllib.request.Request(
             url,

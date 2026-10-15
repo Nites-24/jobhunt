@@ -99,17 +99,17 @@ RESUME_KEY = os.environ.get("RESUME_KEY", "data/resume/resume.txt")
 SCORE_THRESHOLD = int(os.environ.get("SCORE_THRESHOLD", "80"))
 DEFAULT_EVAL_PROFILE_VERSION = f"2026-05-13-th{SCORE_THRESHOLD}"
 JOB_EVAL_PROFILE_VERSION = os.environ.get("JOB_EVAL_PROFILE_VERSION", DEFAULT_EVAL_PROFILE_VERSION)
-MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "2"))
+MAX_JOB_AGE_DAYS = int(os.environ.get("MAX_JOB_AGE_DAYS", "1"))
 HN_MAX_JOB_AGE_DAYS = int(os.environ.get("HN_MAX_JOB_AGE_DAYS", "3"))
 DEFAULT_SOURCE_FRESHNESS_DAYS = {
-    "linkedin": 2,
-    "randstad": 2,
-    "generic": 2,
+    "linkedin": 1,
+    "randstad": 1,
+    "generic": 1,
     "hackernews": 3,
     "hn": 3,
-    "greenhouse": 3,
-    "lever": 3,
-    "ashby": 3,
+    "greenhouse": 1,
+    "lever": 1,
+    "ashby": 1,
 }
 STALE_SCORE_CAP = int(os.environ.get("STALE_SCORE_CAP", "55"))
 MISSING_DATE_SCORE_CAP = int(os.environ.get("MISSING_DATE_SCORE_CAP", "70"))
