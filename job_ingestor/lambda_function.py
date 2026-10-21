@@ -1453,6 +1453,10 @@ def lambda_handler(event, context):
     ashby_jobs = fetch_ashby_jobs()
     google_cse_jobs = fetch_google_cse_jobs()
     jsearch_jobs = fetch_jsearch_jobs()
+    freehire_jobs = []
+    if os.environ.get("FREEHIRE_ENABLED", "false").lower() == "true":
+        from freehire import fetch_jobs as fetch_freehire_jobs
+        freehire_jobs = fetch_freehire_jobs(max_jobs=int(os.environ.get("FREEHIRE_MAX_JOBS_PER_RUN", "100")))
     all_jobs = _dedupe_batch(
         hn_jobs
         + greenhouse_jobs
@@ -1460,6 +1464,7 @@ def lambda_handler(event, context):
         + ashby_jobs
         + google_cse_jobs
         + jsearch_jobs
+        + freehire_jobs
     )
     logger.info("INGESTOR_YIELD_BY_SOURCE_QUERY | %s", json.dumps(_source_query_summary(all_jobs)))
 
@@ -1479,6 +1484,7 @@ def lambda_handler(event, context):
                 "ashby": len(ashby_jobs),
                 "google_cse": len(google_cse_jobs),
                 "jsearch": len(jsearch_jobs),
+                "freehire": len(freehire_jobs),
             },
         }
 
