@@ -1,0 +1,37 @@
+name: Weekly Skill Demand Telegram Digest
+
+on:
+  schedule:
+    # Sunday 13:00 UTC; GitHub scheduling can be delayed.
+    - cron: "0 13 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  weekly-skills:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - name: Compile and test extractor
+        run: |
+          python -m py_compile tools/ops/skill_demand.py job_ingestor/freehire.py
+          python -m unittest discover -s tests -p test_skill_demand.py -v
+      - name: Weekly Telegram learning digest
+        env:
+          AWS_REGION: us-east-1
+          DYNAMODB_TABLE: Jobsearch
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python tools/ops/skill_demand.py
