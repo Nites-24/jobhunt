@@ -1455,7 +1455,7 @@ def lambda_handler(event, context):
     jsearch_jobs = fetch_jsearch_jobs()
     freehire_jobs = []
     if os.environ.get("FREEHIRE_ENABLED", "false").lower() == "true":
-        from job_ingestor.freehire import fetch_jobs as fetch_freehire_jobs
+        from freehire import fetch_jobs as fetch_freehire_jobs
         freehire_jobs = fetch_freehire_jobs(max_jobs=int(os.environ.get("FREEHIRE_MAX_JOBS_PER_RUN", "100")))
     all_jobs = _dedupe_batch(
         hn_jobs
